@@ -39,7 +39,7 @@ from psyre.common import (
     validate_non_negative_int,
     when,
 )
-from psyre.equations import psyre_equations
+from equations import psyre_equations
 from examples.src.systolic import (
     ARRAY_SIZE,
     DRAIN_CYCLES,

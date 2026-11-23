@@ -43,7 +43,7 @@ from psyre.common import (
     when,
     whennot,
 )
-from psyre.equations import psyre_equations
+from equations import psyre_equations
 from examples.src.rnn import (
     DEFAULT_LEARNING_RATE,
     DEFAULT_MAX_STEPS,

@@ -60,7 +60,7 @@ from psyre.common_payload import (
     register_pytree_node,
     unregister_pytree_node,
 )
-from psyre.equations import psyre_equations
+from equations import psyre_equations
 from psyre.match import case, default, match
 from psyre.optimization import optimize_graph
 from psyre.scheduler import Scheduler

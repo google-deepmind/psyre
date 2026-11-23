@@ -42,7 +42,7 @@ from psyre.common import (
     reset,
     when,
 )
-from psyre.equations import psyre_equations
+from equations import psyre_equations
 from equations.examples.src import rnn_equations
 from examples.src.gmoe import (
     ChainedGmoeParamStreams,

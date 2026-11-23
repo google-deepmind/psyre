@@ -60,13 +60,12 @@ reactive stream programs.
 - **Tests** (`tests/` and `examples/tests/`): Unit test suites covering
   semantics, lowering, static analyses, optimization, visualization, and all
   examples.
-- **Equations** (`equations/` — *highly experimental, work in progress*):
-  Everything under the `equations/` subdirectory (including the
-  `psyre_equations` / `Equations` metaclass prototype, `equations/tests/`,
-  `equations/examples/src/`, and `equations/examples/tests/`) is **highly
-  experimental and a work in progress**. It explores an opt-in, lambda-free
-  declarative syntax for recursive stream equations; APIs, semantics, and
-  internals may change or be removed without notice.
+- **Equations** (`equations/` — *experimental*): An opt-in, lambda-free
+  declarative syntax for recursive stream equations (`equations.py`,
+  `equations/tests/`, `equations/examples/src/`, and
+  `equations/examples/tests/`). Everything under the `equations/` subdirectory
+  is experimental (APIs, semantics, and internals may change without notice)
+  and kept separate from the core package.
 
 ## Installation
 

@@ -16,7 +16,7 @@
 from absl.testing import absltest
 
 # pylint: disable=g-importing-member,g-multiple-import
-from psyre.equations import psyre_equations
+from equations import psyre_equations
 from equations.examples.src import rnn_equations
 from examples.tests import rnn_test
 from psyre.scheduler import Scheduler

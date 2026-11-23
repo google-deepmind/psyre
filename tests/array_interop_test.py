@@ -55,7 +55,7 @@ from psyre.common_payload import (
     is_numpy_bool,
     is_numpy_scalar,
 )
-from psyre.equations import psyre_equations
+from equations import psyre_equations
 from psyre.match import case, default, match
 from psyre.scheduler import Scheduler
 from psyre.static_stream import same_const_value

@@ -41,7 +41,7 @@ from psyre.common import (
     reset,
     scan,
 )
-from psyre.equations import (
+from equations import (
     CircularEquationError,
     Equations,
     Thunk,

@@ -20,7 +20,7 @@ Pouzet, 1996; Pouzet, 2006).
 """
 
 # pylint: disable=g-importing-member,g-multiple-import
-from psyre.equations.equations import (
+from equations.equations import (
     CircularEquationError,
     EquationScope,
     Equations,
