@@ -11,7 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Psyre hierarchical state-machine (automaton) context managers."""
+"""Psyre hierarchical state-machine (automaton) context managers.
+
+Lowers hierarchical mode automata with strong (`unless`) and weak (`until`)
+guarded transitions and reset vs. history re-entry (`reset=True`/`False`) into
+core synchronous dataflow operators (`fby`, `switch`, `merge`, `when`, `reset`):
+
+  * Mode automata and strong/weak transitions: Maraninchi & Rémond, *Mode-
+    automata: About modes and states for reactive systems*, ESOP 1998 / *SCP*
+    46(3), 2003.
+  * Conservative extension with shared `last` memory: Colaço, Pagano & Pouzet,
+    *A conservative extension of synchronous data-flow with state machines*,
+    EMSOFT 2005.
+  * Modular reset compilation: Hamon & Pouzet, PPDP 2000; mechanized compilation
+    of automata and resets in Bourke, Brun & Pouzet (POPL 2020) and Bourke,
+    Pesin & Pouzet (*ACM TECS*, 2023).
+"""
 
 from collections.abc import Iterator, Sequence
 import contextlib
@@ -27,6 +42,8 @@ from psyre.common import (
     BlockHandle,
     CapturedEnv,
     MatchArm,
+    MergeSelector,
+    TagKey,
     UNSET,
     active_block,
     fby,
@@ -36,24 +53,22 @@ from psyre.common import (
     push_arm,
     push_prefix,
     push_reset,
+    require_builder,
     require_open_arm_context,
-    require_sync_semantics,
     switch,
+    tag_key,
     when,
 )
-from psyre.istructure import (
-    Absent,
-    IStruct,
-    as_istruct,
-    is_one_periodic,
-)
+from psyre.common_payload import is_array_object
 from psyre.match import (
+    bind_thunk_env,
     finalize_named_outputs,
     make_arm_selector,
     merge_arm_outputs,
     validate_discrete_tag,
     validate_exhaustiveness,
 )
+from psyre.static_stream import StaticSequence
 from psyre.stream import Stream
 
 # pylint: enable=g-importing-member,g-multiple-import
@@ -66,6 +81,7 @@ class _Transition:
   cond: Any
   target: Any
   reset: Any
+  env: CapturedEnv = dataclasses.field(default_factory=CapturedEnv.capture)
   consumed: bool = False
 
 
@@ -73,7 +89,6 @@ def until(
     cond: Any, target: Any, *, reset: Any = True  # pylint: disable=redefined-outer-name
 ) -> None:
   """Registers a weak transition evaluated after the current state step."""
-  require_sync_semantics('until')
   ctx = active_block.get()
   if ctx is None or ctx.kind != 'automaton' or ctx.active_arm is None:
     raise RuntimeError(
@@ -89,7 +104,6 @@ def unless(
     cond: Any, target: Any, *, reset: Any = True  # pylint: disable=redefined-outer-name
 ) -> _Transition:
   """Creates a strong transition clause for `state(tag, unless(...), ...)`."""
-  require_sync_semantics('unless')
   ctx = active_block.get()
   if ctx is None or ctx.kind != 'automaton':
     raise RuntimeError(
@@ -113,15 +127,10 @@ def _validate_tag_in_arms(
     role: str = 'Transition target',
 ) -> None:
   """Validates that a discrete state tag matches at least one arm."""
-  if (
-      isinstance(target_tag, Stream)
-      or is_thunk(target_tag)
-      or any(arm.is_wildcard for arm in arms)
-  ):
+  if isinstance(target_tag, Stream) or is_thunk(target_tag):
     return
-  for arm in arms:
-    if any(matches_tag(target_tag, tag) for tag in arm.values):
-      return
+  if any(matches_tag(target_tag, arm.values[0]) for arm in arms):
+    return
   raise ValueError(
       f'{role} {target_tag!r} does not match any state in automaton().'
   )
@@ -129,42 +138,28 @@ def _validate_tag_in_arms(
 
 def _static_const_value(val: Any) -> tuple[bool, Any]:
   """Returns (True, scalar) if val is a static constant, else (False, None)."""
-  if val is Absent:
-    raise TypeError('Periodic stream cannot contain Absent.')
-  if isinstance(val, list):
-    if any(item is Absent for item in val):
-      raise TypeError('Periodic stream cannot contain Absent.')
-    if len(val) == 1:
-      return True, val[0]
-    return False, None
   if is_thunk(val):
     return False, None
-  if isinstance(val, (IStruct, Stream)):
-    istruct = as_istruct(val)
-    if is_one_periodic(istruct):
-      return True, istruct.period[0]
-    return False, None
-  return True, val
+  if isinstance(val, Stream):
+    return (True, val.const_value) if val.is_one_periodic else (False, None)
+  spec = StaticSequence.from_value(val)
+  return (True, spec.const_value) if spec.is_one_periodic else (False, None)
+
+
+def _scalar_bool(val: Any, role: str) -> bool:
+  """Converts a scalar constant to `bool`, rejecting array objects."""
+  if is_array_object(val):
+    raise TypeError(
+        f'automaton() {role} must be a scalar truth value, got '
+        f'{type(val).__name__}.'
+    )
+  return bool(val)
 
 
 def _is_static_false(val: Any) -> bool:
-  """Returns True when val is statically constant and falsy."""
+  """Returns True when val is a statically constant, falsy reset."""
   is_const, c_val = _static_const_value(val)
-  return is_const and not c_val
-
-
-def _same_static_value(a: Any, b: Any) -> bool:
-  """Returns True when a and b are identical streams or equal static tags."""
-  if a is b:
-    return True
-  if isinstance(a, (IStruct, Stream)) and isinstance(
-      b, (IStruct, Stream)
-  ):
-    if as_istruct(a) is as_istruct(b):
-      return True
-  a_const, a_val = _static_const_value(a)
-  b_const, b_val = _static_const_value(b)
-  return a_const and b_const and matches_tag(a_val, b_val)
+  return is_const and not _scalar_bool(c_val, 'reset')
 
 
 def _select_transition_value(
@@ -175,22 +170,41 @@ def _select_transition_value(
     is_reset: bool = False,
 ) -> Any:
   """Selects between then_val and else_val under cond with constant folding."""
-  if _same_static_value(then_val, else_val):
+  if then_val is else_val:
     return then_val
-  if is_reset:
-    t_const, t_val = _static_const_value(then_val)
-    e_const, e_val = _static_const_value(else_val)
-    if t_const and e_const:
-      t_b, e_b = bool(t_val), bool(e_val)
+  t_const, t_val = _static_const_value(then_val)
+  e_const, e_val = _static_const_value(else_val)
+  if t_const and e_const:
+    if matches_tag(t_val, e_val):
+      return then_val
+    if is_reset:
+      t_b = _scalar_bool(t_val, 'reset')
+      e_b = _scalar_bool(e_val, 'reset')
       if t_b == e_b:
         return t_b
       if (
-          isinstance(cond, (IStruct, Stream))
+          isinstance(cond, Stream)
           and (curr_builder := GraphBuilder.current()) is not None
           and curr_builder.is_bool_stream(cond)
       ):
         return cond if t_b else ~cond
   return ifthenelse(cond, then_val, else_val)
+
+
+def _bind_transition_value(val: Any, env: CapturedEnv) -> Any:
+  """Binds a transition target/reset to `env` so `reset(...)` scopes apply."""
+  if is_thunk(val):
+    return bind_thunk_env(val, env)
+  if isinstance(val, Stream) or not env.resets:
+    return val
+  is_const, _ = _static_const_value(val)
+  if is_const:
+    # Keep 1-periodic constants raw so `_is_static_false` can fold them.
+    return val
+  # Non-1-periodic literals (e.g. `[False, True, False]`) must be wrapped inside
+  # `env.restore()` so enclosing `with reset(r):` scopes make them resettable.
+  with env.restore():
+    return Stream(val)
 
 
 def _fold_transitions(
@@ -207,20 +221,30 @@ def _fold_transitions(
   for trans in transitions:
     _validate_tag_in_arms(trans.target, arms)
     is_const, c_val = _static_const_value(trans.cond)
-    _static_const_value(trans.reset)
+    # Validate `trans.reset` eagerly even for unreachable clauses after a
+    # constant-True guard (rejects sentinels, callables, empty lists, arrays).
+    r_const, r_val = _static_const_value(trans.reset)
+    if r_const:
+      _scalar_bool(r_val, 'reset')
+    if is_const:
+      cond_bool = _scalar_bool(c_val, 'transition condition')
+    else:
+      cond_bool = False
     if reached_const_true:
       continue
     if is_const:
-      if c_val:
-        mode_acc, reset_acc = trans.target, trans.reset
+      if cond_bool:
+        mode_acc = _bind_transition_value(trans.target, trans.env)
+        reset_acc = _bind_transition_value(trans.reset, trans.env)
         reached_const_true = True
     else:
       guarded.append(trans)
   for trans in reversed(guarded):
-    mode_acc = _select_transition_value(trans.cond, trans.target, mode_acc)
-    reset_acc = _select_transition_value(
-        trans.cond, trans.reset, reset_acc, is_reset=True
-    )
+    with trans.env.restore():
+      mode_acc = _select_transition_value(trans.cond, trans.target, mode_acc)
+      reset_acc = _select_transition_value(
+          trans.cond, trans.reset, reset_acc, is_reset=True
+      )
   return mode_acc, reset_acc
 
 
@@ -230,16 +254,13 @@ def automaton(
     name: str = '',
 ) -> Iterator[BlockHandle]:
   """Context manager for stateful hierarchical automata with transitions."""
-  require_sync_semantics('automaton')
   if not isinstance(name, str):
     raise TypeError(
         f'automaton(name=...) must be a str, got {type(name).__name__}.'
     )
   if init is not UNSET and not isinstance(init, Stream):
     validate_discrete_tag(init, 'automaton(init=...)')
-  curr_builder = GraphBuilder.current()
-  if curr_builder is None:
-    raise RuntimeError('Psyre nodes can only be instantiated during Stage 1.')
+  curr_builder = require_builder()
   fsm_prefix = name if name else f'fsm_{curr_builder.next_fsm_id()}'
   with push_prefix(fsm_prefix):
     enclosing_env = CapturedEnv.capture()
@@ -268,8 +289,13 @@ def automaton(
     else:
       init_state = ctx.init
       _validate_tag_in_arms(init_state, arms, role='Initial state')
-    validate_exhaustiveness(arms, init_state, construct='automaton')
+    validate_exhaustiveness(arms, construct='automaton')
 
+    # Two-phase Moore/Mealy encoding (Colaço, Pagano & Pouzet, EMSOFT 2005):
+    #   pns = fby(init, ns)   pnr = fby(False, nr)   (prev next-state / reset)
+    #   s_stream / r_stream = strong `unless` switch on `pns` (this tick)
+    #   state bodies + `last()` run on `(s_stream == tag)` reset by `r_stream`
+    #   ns_stream / nr_stream = weak `until` merge on `s_stream` (next tick)
     has_strong = any(rec.strong_transitions for rec in ctx.arm_records)
     has_weak = any(rec.weak_transitions for rec in ctx.arm_records)
     has_weak_reset = any(
@@ -285,25 +311,35 @@ def automaton(
     )
 
     if has_strong:
-      strong_states: dict[Any, Any] = {}
-      strong_resets: dict[Any, Any] = {}
-      for rec in ctx.arm_records:
+      strong_arms: dict[TagKey, int] = {}
+      strong_states: list[Any] = []
+      strong_resets: list[Any] = []
+      for idx, rec in enumerate(ctx.arm_records):
         tag = rec.arm.values[0]
-        strong_states[tag], strong_resets[tag] = _fold_transitions(
+        strong_arms[tag_key(tag)] = idx
+        st_val, rst_val = _fold_transitions(
             rec.strong_transitions, tag, pnr_stream, arms
         )
-      s_stream = switch(pns_stream, strong_states, name='state_s')
-      if all(_is_static_false(v) for v in strong_resets.values()):
+        strong_states.append(st_val)
+        strong_resets.append(rst_val)
+      strong_lookup = MergeSelector(is_boolean=False, arms=strong_arms)
+      s_stream = switch(
+          pns_stream, *strong_states, lookup=strong_lookup, name='state_s'
+      )
+      if all(_is_static_false(v) for v in strong_resets):
         r_stream: Any = False
       else:
-        r_stream = switch(pns_stream, strong_resets, name='state_r')
+        r_stream = switch(
+            pns_stream, *strong_resets, lookup=strong_lookup, name='state_r'
+        )
     else:
       s_stream, r_stream = pns_stream, pnr_stream
 
     ctx.s_stream = s_stream
-    ctx.r_stream = r_stream
+    ctx.r_stream = Stream(r_stream)
 
     weak_scopes: list[ArmScope] = []
+    weak_envs: list[CapturedEnv] = []
     weak_states: list[Any] = []
     weak_resets: list[Any] = []
     for rec in ctx.arm_records:
@@ -311,24 +347,34 @@ def automaton(
       weak_scopes.append(rec.arm_scope)
       if has_weak:
         with push_arm(rec.arm_scope):
-          ns_next, nr_next = _fold_transitions(
-              rec.weak_transitions, rec.arm.values[0], False, arms
-          )
+          with push_reset(lambda: ctx.r_stream):
+            weak_envs.append(CapturedEnv.capture())
+            ns_next, nr_next = _fold_transitions(
+                rec.weak_transitions, rec.arm.values[0], False, arms
+            )
         weak_states.append(ns_next)
         weak_resets.append(nr_next)
 
     if has_weak:
       ctx.ns_stream = merge_arm_outputs(
-          s_stream, arms, weak_states, name='state_ns', arm_scopes=weak_scopes
+          s_stream,
+          arms,
+          weak_states,
+          name='state_ns',
+          arm_scopes=weak_scopes,
+          arm_envs=weak_envs,
       )
     else:
       ctx.ns_stream = s_stream
     if has_weak_reset:
       ctx.nr_stream = merge_arm_outputs(
-          s_stream, arms, weak_resets, name='state_nr', arm_scopes=weak_scopes
+          s_stream,
+          arms,
+          weak_resets,
+          name='state_nr',
+          arm_scopes=weak_scopes,
+          arm_envs=weak_envs,
       )
-    else:
-      ctx.nr_stream = False
     finalize_named_outputs(ctx, s_stream, arms)
 
 
@@ -338,7 +384,6 @@ def state(
     *unless_clauses: _Transition,
 ) -> Iterator[Stream]:
   """Context manager declaring a discrete state inside `with automaton(...)`."""
-  require_sync_semantics('state')
   ctx = require_open_arm_context('automaton', 'state()')
   validate_discrete_tag(tag, 'state()')
   if any(matches_tag(tag, existing) for existing in ctx.claimed_tags):

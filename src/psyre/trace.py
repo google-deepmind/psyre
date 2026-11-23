@@ -14,14 +14,16 @@
 """Post-run trace inspection helpers for Psyre stream outputs."""
 
 from collections.abc import Sequence
+import operator
 from typing import Any
 
 # pylint: disable=g-importing-member,g-multiple-import
 from psyre.common import (
+    Absent,
+    Bottom,
     active_builder,
     active_scheduler,
 )
-from psyre.istructure import Absent
 
 # pylint: enable=g-importing-member,g-multiple-import
 
@@ -44,6 +46,15 @@ def _validate_post_run_trace(trace: Any, caller: str) -> Sequence[Any]:
   return trace
 
 
+def _validate_trace_index(index: Any, caller: str) -> int:
+  """Normalizes an integer trace index, rejecting booleans and slices."""
+  if isinstance(index, bool):
+    raise TypeError(
+        f'{caller}() index must be an integer, got {type(index).__name__}.'
+    )
+  return operator.index(index)
+
+
 def is_present(trace: Sequence[Any], index: int) -> bool:
   """Checks whether element `index` of a post-run trace is present.
 
@@ -52,15 +63,18 @@ def is_present(trace: Sequence[Any], index: int) -> bool:
     index: Tick index in `trace` (supports standard Python indexing).
 
   Returns:
-    `True` if `trace[index]` is not `Absent`, `False` otherwise.
+    `True` if `trace[index]` is neither `Absent` nor `Bottom`, `False`
+    otherwise.
 
   Raises:
     RuntimeError: If called during a Scheduler Stage-1 build or Stage-2 run.
-    TypeError: If `trace` is a Psyre `Stream`/`IStruct` or not a `Sequence`.
+    TypeError: If `trace` is a Psyre `Stream` or not a `Sequence`, or if
+      `index` is a `bool`, `slice`, or non-integer.
     IndexError: If `index` is out of range for `trace`.
   """
   validated = _validate_post_run_trace(trace, 'is_present')
-  return validated[index] is not Absent
+  val = validated[_validate_trace_index(index, 'is_present')]
+  return val is not Absent and val is not Bottom
 
 
 def is_absent(trace: Sequence[Any], index: int) -> bool:
@@ -75,25 +89,49 @@ def is_absent(trace: Sequence[Any], index: int) -> bool:
 
   Raises:
     RuntimeError: If called during a Scheduler Stage-1 build or Stage-2 run.
-    TypeError: If `trace` is a Psyre `Stream`/`IStruct` or not a `Sequence`.
+    TypeError: If `trace` is a Psyre `Stream` or not a `Sequence`, or if
+      `index` is a `bool`, `slice`, or non-integer.
     IndexError: If `index` is out of range for `trace`.
   """
   validated = _validate_post_run_trace(trace, 'is_absent')
-  return validated[index] is Absent
+  return validated[_validate_trace_index(index, 'is_absent')] is Absent
+
+
+def is_bottom(trace: Sequence[Any], index: int) -> bool:
+  """Checks whether element `index` of a post-run trace is `Bottom`.
+
+  Args:
+    trace: Completed trace `Sequence` returned after a Scheduler run.
+    index: Tick index in `trace` (supports standard Python indexing).
+
+  Returns:
+    `True` if `trace[index]` is `Bottom`, `False` otherwise.
+
+  Raises:
+    RuntimeError: If called during a Scheduler Stage-1 build or Stage-2 run.
+    TypeError: If `trace` is a Psyre `Stream` or not a `Sequence`, or if
+      `index` is a `bool`, `slice`, or non-integer.
+    IndexError: If `index` is out of range for `trace`.
+  """
+  validated = _validate_post_run_trace(trace, 'is_bottom')
+  return validated[_validate_trace_index(index, 'is_bottom')] is Bottom
 
 
 def present_values(trace: Sequence[Any]) -> list[Any]:
-  """Extracts all present (non-`Absent`) elements from a post-run trace.
+  """Extracts all present (non-`Absent`, non-`Bottom`) elements from a trace.
 
   Args:
     trace: Completed trace `Sequence` returned after a Scheduler run.
 
   Returns:
-    A list of all elements `v` in `trace` such that `v is not Absent`.
+    A list of all elements `v` in `trace` such that `v is not Absent` and
+    `v is not Bottom`.
 
   Raises:
     RuntimeError: If called during a Scheduler Stage-1 build or Stage-2 run.
-    TypeError: If `trace` is a Psyre `Stream`/`IStruct` or not a `Sequence`.
+    TypeError: If `trace` is a Psyre `Stream` or not a `Sequence`.
   """
   validated = _validate_post_run_trace(trace, 'present_values')
-  return [item for item in validated if item is not Absent]
+  return [
+      item for item in validated if item is not Absent and item is not Bottom
+  ]

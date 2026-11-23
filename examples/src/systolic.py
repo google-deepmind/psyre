@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""4x4 systolic array in Psyre with weight-stationary and output-stationary modes.
+"""4x4 systolic array in Psyre with WS and OS execution modes.
 
-Implements a 4x4 systolic array processing bf16 inputs and multiplying and
-accumulating in fp32 across pipelined 4x4 matrix products. Control is
-distributed across the processing elements with a minimal global orchestrator:
+Implements a 4x4 systolic array (Kung & Leiserson, 1979; Kung, 1982) processing
+bf16 inputs and multiplying and accumulating in IEEE-754 fp32 (`fp32_mul` /
+`fp32_add`) across pipelined 4x4 matrix products. Control uses hierarchical
+mode automata (Colaço, Pagano & Pouzet, EMSOFT '05), distributed across the
+processing elements with a minimal global orchestrator:
 - Global phase orchestrator (`systolic_control`, `mode_ctrl`) sequencing global
   weight-loading, WS compute, and OS mode switching (`GlobalControl`).
 - Per-PE local control automaton (`pe_ctrl` inside `systolic_pe`) cycling
@@ -40,18 +42,18 @@ from psyre.automaton import (
     until,
 )
 from psyre.common import (
+    buffer,
     counter,
-    delay,
     fby,
     ifthenelse,
     merge,
+    psyre_comb,
     psyre_node,
-    require_sync_semantics,
     reset,
     validate_non_negative_int,
     when,
-    whennot,
 )
+from psyre.static_stream import EMPTY_WORD, StaticWord, repeat
 from psyre.stream import Stream
 from psyre.trace import present_values
 
@@ -166,15 +168,29 @@ class SystolicOutputs(NamedTuple):
 
 def to_fp32(value: Any) -> Any:
   """Rounds a numeric value or nested sequence of values to IEEE-754 fp32."""
+  if isinstance(value, (str, bytes, bytearray)):
+    raise TypeError(
+        'to_fp32 expects a number or sequence of numbers, not '
+        f'{type(value).__name__}.'
+    )
   if isinstance(value, Sequence):
     return [to_fp32(item) for item in value]
+  if isinstance(value, bool):
+    raise TypeError(f'to_fp32 expects a numeric value, not bool ({value!r}).')
   return struct.unpack('<f', struct.pack('<f', float(value)))[0]
 
 
 def to_bf16(value: Any) -> Any:
   """Rounds a numeric value or nested sequence of values to IEEE-754 bf16."""
+  if isinstance(value, (str, bytes, bytearray)):
+    raise TypeError(
+        'to_bf16 expects a number or sequence of numbers, not '
+        f'{type(value).__name__}.'
+    )
   if isinstance(value, Sequence):
     return [to_bf16(item) for item in value]
+  if isinstance(value, bool):
+    raise TypeError(f'to_bf16 expects a numeric value, not bool ({value!r}).')
   bits = struct.unpack('<I', struct.pack('<f', float(value)))[0]
   if (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0:
     bf16_bits = (bits | 0x00400000) & 0xFFFF0000
@@ -184,6 +200,18 @@ def to_bf16(value: Any) -> Any:
   return struct.unpack('<f', struct.pack('<I', bf16_bits))[0]
 
 
+@psyre_comb(pure=True)
+def fp32_mul(lhs: float, rhs: float) -> float:
+  """Multiplies two floats with IEEE-754 fp32 rounding."""
+  return struct.unpack('<f', struct.pack('<f', float(lhs) * float(rhs)))[0]
+
+
+@psyre_comb(pure=True)
+def fp32_add(lhs: float, rhs: float) -> float:
+  """Adds two floats with IEEE-754 fp32 rounding."""
+  return struct.unpack('<f', struct.pack('<f', float(lhs) + float(rhs)))[0]
+
+
 def _build_grid(fn: Callable[[int, int], Stream]) -> StreamGrid:
   """Builds an ARRAY_SIZE x ARRAY_SIZE tuple grid by calling fn(i, j)."""
   return tuple(
@@ -191,17 +219,22 @@ def _build_grid(fn: Callable[[int, int], Stream]) -> StreamGrid:
   )
 
 
-def _validate_matrix(
-    matrix: Matrix, label: str = 'matrix'
-) -> list[list[float]]:
-  """Validates a 4x4 matrix and quantizes its entries to bf16."""
-  if len(matrix) != ARRAY_SIZE:
-    raise ValueError(f'{label} must have {ARRAY_SIZE} rows, got {len(matrix)}.')
-  for i, row in enumerate(matrix):
+def _validate_grid_shape(grid: Sequence[Sequence[Any]], label: str) -> None:
+  """Verifies `grid` is an `ARRAY_SIZE x ARRAY_SIZE` rectangular grid."""
+  if len(grid) != ARRAY_SIZE:
+    raise ValueError(f'{label} must have {ARRAY_SIZE} rows, got {len(grid)}.')
+  for i, row in enumerate(grid):
     if len(row) != ARRAY_SIZE:
       raise ValueError(
           f'{label} row {i} must have {ARRAY_SIZE} columns, got {len(row)}.'
       )
+
+
+def _validate_matrix(
+    matrix: Matrix, label: str = 'matrix'
+) -> list[list[float]]:
+  """Validates a 4x4 matrix and quantizes its entries to bf16."""
+  _validate_grid_shape(matrix, label)
   return to_bf16(matrix)
 
 
@@ -236,20 +269,21 @@ def reference_matmul_bf16_fp32(
 def delay_padded(
     input_stream: Stream,
     k: int,
-    pad: Stream = Stream(0.0),
+    pad: Stream | None = None,
     *,
     tick: Stream | None = None,
     name: str = 'delay_padded',
 ) -> Stream:
   """Delays `input_stream` by `k` local ticks, emitting `pad` for the first `k`.
 
-  Uses the synchronous `delay` primitive and replaces its initial `k` `Absent`
-  ticks with `pad` so downstream hardware registers receive dense inputs.
+  Uses a bounded ring `buffer` gated by the resettable warmup schedule so the
+  output is dense and well-clocked in both `SYNC` and `KAHN` semantics.
 
   Args:
     input_stream: Stream to delay.
     k: Non-negative integer tick delay.
-    pad: Stream emitted during local ticks `0 .. k - 1`.
+    pad: Optional padding stream emitted during local ticks `0 .. k - 1`
+      (defaults to `Stream(0.0)` when `None`).
     tick: Optional shared local tick counter stream (saturated at `>= k`).
       When `None`, instantiates a dedicated `counter(max_val=k)`.
     name: Debug name prefix for created nodes.
@@ -264,13 +298,20 @@ def delay_padded(
   validate_non_negative_int(k, 'Delay k')
   if k == 0:
     return input_stream
-  delayed = delay(input_stream, k, name=f'{name}_delay')
+  pad_s = Stream(0.0) if pad is None else pad
   cnt = counter(max_val=k, name=f'{name}_cnt') if tick is None else tick
   warmup = cnt < k
+  delayed = buffer(
+      input_stream,
+      Stream(True),
+      ~warmup,
+      size=k + 2,
+      name=f'{name}_delay',
+  )
   return merge(
       warmup,
-      pad,
-      whennot(warmup, delayed, name=f'{name}_after'),
+      pad_s,
+      delayed,
       name=name,
   )
 
@@ -278,18 +319,19 @@ def delay_padded(
 def skew_streams(
     streams: Sequence[Stream],
     *,
-    pad: Stream = Stream(0.0),
+    pad: Stream | None = None,
     tick: Stream | None = None,
     prefix: str = 'skew',
 ) -> StreamRow:
-  """Skews 4 row or column streams by `0, 1, 2, 3` local ticks using `delay`.
+  """Skews 4 row or column streams by `0, 1, 2, 3` local ticks.
 
   All delayed lanes share a single saturated tick counter compared against
   different constant streams (`1`, `2`, `3`).
 
   Args:
     streams: Sequence of `ARRAY_SIZE` streams to skew.
-    pad: Padding stream emitted during the initial skew ticks of each stream.
+    pad: Optional padding stream emitted during the initial skew ticks of each
+      stream (defaults to `Stream(0.0)` when `None`).
     tick: Optional shared local tick counter stream (saturated at
       `>= ARRAY_SIZE - 1`). When `None`, instantiates one shared counter.
     prefix: Debug name prefix for the skewing nodes.
@@ -320,14 +362,18 @@ def skew_streams(
 def deskew_streams(
     col_streams: Sequence[Stream],
     *,
-    valid: Stream = Stream(True),
+    valid: Stream | None = None,
+    tick: Stream | None = None,
     prefix: str = 'deskew',
 ) -> StreamRow:
-  """Deskews 4 column streams by `3, 2, 1, 0` local ticks using `delay`.
+  """Deskews 4 column streams by `3, 2, 1, 0` local ticks.
 
   Args:
     col_streams: Sequence of `ARRAY_SIZE` column output streams.
-    valid: Boolean `Stream` gating the deskewed outputs via `when`.
+    valid: Optional boolean `Stream` gating the deskewed outputs via `when`
+      (defaults to `Stream(True)` when `None`).
+    tick: Optional shared local tick counter stream (saturated at
+      `>= ARRAY_SIZE - 1`). When `None`, instantiates one shared counter.
     prefix: Debug name prefix for the deskewing nodes.
 
   Returns:
@@ -340,14 +386,19 @@ def deskew_streams(
     raise ValueError(
         f'deskew_streams expects {ARRAY_SIZE} streams, got {len(col_streams)}.'
     )
+  valid_s = Stream(True) if valid is None else valid
+  cnt = (
+      counter(max_val=ARRAY_SIZE - 1, name=f'{prefix}_cnt')
+      if tick is None
+      else tick
+  )
   deskewed: list[Stream] = []
   for j in range(ARRAY_SIZE):
     shift = ARRAY_SIZE - 1 - j
-    if shift == 0:
-      aligned = col_streams[j]
-    else:
-      aligned = delay(col_streams[j], shift, name=f'{prefix}_{j}')
-    aligned = when(valid, aligned, name=f'{prefix}_valid_{j}')
+    aligned = delay_padded(
+        col_streams[j], shift, tick=cnt, name=f'{prefix}_{j}'
+    )
+    aligned = when(valid_s, aligned, name=f'{prefix}_valid_{j}')
     deskewed.append(aligned)
   return tuple(deskewed)
 
@@ -355,22 +406,24 @@ def deskew_streams(
 def systolic_control(
     *,
     initial_mode: SystolicMode = SystolicMode.WEIGHT_STATIONARY,
-    switch_mode: Stream = Stream(False),
-    reload_weights: Stream = Stream(False),
+    switch_mode: Stream | None = None,
+    reload_weights: Stream | None = None,
 ) -> GlobalControl:
   """Minimal global orchestrator sequencing WS load/compute and OS mode.
 
   Args:
     initial_mode: Initial top-level `SystolicMode`.
-    switch_mode: Boolean `Stream` toggling between `WEIGHT_STATIONARY` and
-      `OUTPUT_STATIONARY` at the end of a tick.
-    reload_weights: Boolean `Stream` returning WS execution from compute back
-      to the 4-cycle weight-load phase.
+    switch_mode: Optional boolean `Stream` toggling between `WEIGHT_STATIONARY`
+      and `OUTPUT_STATIONARY` at tick end (defaults to `Stream(False)`).
+    reload_weights: Optional boolean `Stream` returning WS execution from
+      compute back to the 4-cycle weight-load phase (defaults to
+      `Stream(False)`).
 
   Returns:
     `GlobalControl(mode, load_weights, datapath_reset)` broadcast to all PEs.
   """
-  require_sync_semantics('systolic_control')
+  switch_s = Stream(False) if switch_mode is None else switch_mode
+  reload_s = Stream(False) if reload_weights is None else reload_weights
   init_phase = (
       _GlobalPhase.WS_LOAD
       if initial_mode == SystolicMode.WEIGHT_STATIONARY
@@ -379,19 +432,19 @@ def systolic_control(
   with automaton(init=init_phase, name='mode_ctrl') as top:
     with state(_GlobalPhase.WS_LOAD):
       load_done = Stream.once(ARRAY_SIZE - 1, name='load_done')
-      until(switch_mode, _GlobalPhase.OUTPUT_STATIONARY)
+      until(switch_s, _GlobalPhase.OUTPUT_STATIONARY)
       until(load_done, _GlobalPhase.WS_COMPUTE)
       top.mode = SystolicMode.WEIGHT_STATIONARY
       top.load_weights = True
       top.datapath_reset = Stream.once(0, name='load_entry')
     with state(_GlobalPhase.WS_COMPUTE):
-      until(switch_mode, _GlobalPhase.OUTPUT_STATIONARY)
-      until(reload_weights, _GlobalPhase.WS_LOAD)
+      until(switch_s, _GlobalPhase.OUTPUT_STATIONARY)
+      until(reload_s, _GlobalPhase.WS_LOAD)
       top.mode = SystolicMode.WEIGHT_STATIONARY
       top.load_weights = False
       top.datapath_reset = Stream.once(0, name='comp_entry')
     with state(_GlobalPhase.OUTPUT_STATIONARY):
-      until(switch_mode, _GlobalPhase.WS_LOAD)
+      until(switch_s, _GlobalPhase.WS_LOAD)
       top.mode = SystolicMode.OUTPUT_STATIONARY
       top.load_weights = False
       top.datapath_reset = Stream.once(0, name='os_entry')
@@ -407,12 +460,12 @@ def systolic_pe(
     row_in: Stream,
     col_in: Stream,
     *,
-    mode: Stream = Stream(SystolicMode.WEIGHT_STATIONARY),
-    load_weights: Stream = Stream(False),
-    datapath_reset: Stream = Stream(False),
-    accumulate: Stream = Stream(True),
-    wave_west: Stream = Stream(True),
-    wave_north: Stream = Stream(True),
+    mode: Stream | None = None,
+    load_weights: Stream | None = None,
+    datapath_reset: Stream | None = None,
+    accumulate: Stream | None = None,
+    wave_west: Stream | None = None,
+    wave_north: Stream | None = None,
     is_top_row: bool = False,
 ) -> PEOutputs:
   """Instantiates one Processing Element (PE) with a 1-register local FSM.
@@ -443,14 +496,25 @@ def systolic_pe(
     `PEOutputs` carrying `row_out`, `col_out`, `ps_out`, `acc`, `state`,
     `valid`, and `wave_out`.
   """
-  is_ws = mode == SystolicMode.WEIGHT_STATIONARY
+  mode_s = Stream(SystolicMode.WEIGHT_STATIONARY) if mode is None else mode
+  load_s = Stream(False) if load_weights is None else load_weights
+  dp_rst_s = Stream(False) if datapath_reset is None else datapath_reset
+  acc_s = Stream(True) if accumulate is None else accumulate
+  ww_s = Stream(True) if wave_west is None else wave_west
+  wn_s = Stream(True) if wave_north is None else wave_north
+
+  is_ws = mode_s == SystolicMode.WEIGHT_STATIONARY
   is_os = ~is_ws
-  is_ws_compute = is_ws & ~load_weights
-  wave_in = wave_west & wave_north
+  is_ws_compute = is_ws & ~load_s
+  wave_in = ww_s & wn_s
   ws_active = wave_in & is_ws_compute
   os_start = wave_in & is_os
 
-  with reset(datapath_reset):
+  # 1-register local FSM (`reset=False` avoids emitting a `pnr` reset bit):
+  # On the arrival tick (`IDLE` + `os_start`), this PE directly stores the `k=0`
+  # product (no accumulation) and enters `OS_ACC1` on the *next* tick, skipping
+  # `OS_INIT` until wrapping around from `OS_ACC3` for back-to-back tiles.
+  with reset(dp_rst_s):
     with automaton(init=PEState.IDLE, name='pe_ctrl') as ctrl:
       with state(PEState.IDLE) as s:
         until(ws_active, PEState.WS_ACTIVE, reset=False)
@@ -477,23 +541,28 @@ def systolic_pe(
         ctrl.state = s
         ctrl.os_acc = True
 
+  # Reuses `pe_ctrl` state register as the registered 1-bit wavefront token
+  # propagated East/South one cycle after this PE becomes active.
   wave_out = ctrl.state != PEState.IDLE
   can_accumulate = ifthenelse(is_ws, Stream(not is_top_row), ctrl.os_acc)
-  pe_accumulate = can_accumulate & accumulate
+  pe_accumulate = can_accumulate & acc_s
   pe_valid = ifthenelse(is_ws, ws_active, ctrl.state == PEState.OS_ACC3)
 
-  with reset(datapath_reset & is_os):
+  # Reset `acc_reg` only in OS mode so stationary weights shifted during
+  # `WS_LOAD` survive the `WS_LOAD -> WS_COMPUTE` `datapath_reset` pulse.
+  with reset(dp_rst_s & is_os):
     acc_prev = fby(0.0, lambda: acc_curr, name='acc_reg')
 
-  with reset(datapath_reset):
+  with reset(dp_rst_s):
     row_out = fby(0.0, row_in, name='row_reg')
     mul_rhs = ifthenelse(is_ws, acc_prev, col_in, name='rhs_mux')
-    prod = row_in * mul_rhs
+    # True IEEE-754 fp32 MAC rounding matching `reference_matmul_bf16_fp32`.
+    prod = fp32_mul(row_in, mul_rhs)
     acc_base = ifthenelse(is_ws, col_in, acc_prev, name='base_mux')
-    acc_sum = acc_base + prod
+    acc_sum = fp32_add(acc_base, prod)
     mac_out = ifthenelse(pe_accumulate, acc_sum, prod, name='acc_mux')
-    ws_acc = ifthenelse(load_weights, col_in, acc_prev, name='ws_acc_mux')
-    ws_col = ifthenelse(load_weights, col_in, mac_out, name='ws_col_mux')
+    ws_acc = ifthenelse(load_s, col_in, acc_prev, name='ws_acc_mux')
+    ws_col = ifthenelse(load_s, col_in, mac_out, name='ws_col_mux')
     acc_curr = ifthenelse(is_ws, ws_acc, mac_out, name='mode_acc_mux')
     col_next = ifthenelse(is_ws, ws_col, col_in, name='mode_col_mux')
     col_out = fby(0.0, col_next, name='col_reg')
@@ -514,10 +583,10 @@ def systolic_array(
     col_inputs: Sequence[Stream],
     *,
     initial_mode: SystolicMode = SystolicMode.WEIGHT_STATIONARY,
-    switch_mode: Stream = Stream(False),
-    reload_weights: Stream = Stream(False),
-    accumulate: Stream = Stream(True),
-    reset_stream: Stream = Stream(False),
+    switch_mode: Stream | None = None,
+    reload_weights: Stream | None = None,
+    accumulate: Stream | None = None,
+    reset_stream: Stream | None = None,
 ) -> SystolicOutputs:
   """Builds the 4x4 systolic array with distributed per-PE control.
 
@@ -542,7 +611,6 @@ def systolic_array(
   Raises:
     ValueError: If `row_inputs` or `col_inputs` does not have length 4.
   """
-  require_sync_semantics('systolic_array')
   if len(row_inputs) != ARRAY_SIZE:
     raise ValueError(
         f'row_inputs must have length {ARRAY_SIZE}, got {len(row_inputs)}.'
@@ -552,7 +620,9 @@ def systolic_array(
         f'col_inputs must have length {ARRAY_SIZE}, got {len(col_inputs)}.'
     )
 
-  with reset(reset_stream):
+  acc_s = Stream(True) if accumulate is None else accumulate
+  rst_s = Stream(False) if reset_stream is None else reset_stream
+  with reset(rst_s):
     ctrl = systolic_control(
         initial_mode=initial_mode,
         switch_mode=switch_mode,
@@ -574,7 +644,7 @@ def systolic_array(
             mode=ctrl.mode,
             load_weights=ctrl.load_weights,
             datapath_reset=ctrl.datapath_reset,
-            accumulate=accumulate,
+            accumulate=acc_s,
             wave_west=wave_west,
             wave_north=wave_north,
             is_top_row=(i == 0),
@@ -632,8 +702,8 @@ def build_ws_schedule(
     epochs: Sequence[tuple[Matrix, Sequence[Matrix]]],
     *,
     drain_cycles: int = DRAIN_CYCLES,
-) -> tuple[list[list[float]], list[list[float]], list[bool], int]:
-  """Builds unskewed row/col sequences and reload_weights schedule for WS mode.
+) -> tuple[list[StaticWord], list[StaticWord], StaticWord, int]:
+  """Builds unskewed row/col `StaticWord`s and reload schedule for WS mode.
 
   Each epoch `(weight_matrix, activation_matrices)` consists of:
   1. `ARRAY_SIZE` (4) weight-loading cycles where `col_seqs[j]` shifts in
@@ -645,6 +715,9 @@ def build_ws_schedule(
      `reload_seq` asserts `True` on the final drain cycle to transition the
      global orchestrator back to weight loading.
 
+  Zero-padding and `False` stretches are encoded symbolically via `repeat(...)`
+  so memory scales only with the matrix payloads, not `drain_cycles`.
+
   Args:
     epochs: Non-empty sequence of `(weight_matrix, activation_matrices)` pairs.
     drain_cycles: Pipeline drain cycles appended at the end of each epoch's
@@ -652,18 +725,26 @@ def build_ws_schedule(
 
   Returns:
     Tuple `(row_seqs, col_seqs, reload_seq, horizon)` where `row_seqs` and
-    `col_seqs` each contain 4 lists of floats of length `horizon`, `reload_seq`
-    is a boolean list of length `horizon`, and `horizon` is the total tick
-    count.
+    `col_seqs` each contain 4 `StaticWord`s of length `horizon`, `reload_seq`
+    is a boolean `StaticWord` of length `horizon`, and `horizon` is the total
+    tick count.
 
   Raises:
     ValueError: If `epochs` is empty or any epoch has no activation matrices.
   """
   if not epochs:
     raise ValueError('epochs must be non-empty.')
-  row_seqs: list[list[float]] = [[] for _ in range(ARRAY_SIZE)]
-  col_seqs: list[list[float]] = [[] for _ in range(ARRAY_SIZE)]
-  reload_seq: list[bool] = []
+  validate_non_negative_int(drain_cycles, 'drain_cycles')
+  if len(epochs) > 1 and drain_cycles < 1:
+    raise ValueError(
+        'drain_cycles must be >= 1 when scheduling multiple WS epochs so the '
+        'reload_weights pulse can trigger between epochs.'
+    )
+  row_seqs: list[StaticWord] = [EMPTY_WORD] * ARRAY_SIZE
+  col_seqs: list[StaticWord] = [EMPTY_WORD] * ARRAY_SIZE
+  reload_seq: StaticWord = EMPTY_WORD
+  load_zeros = repeat(0.0, ARRAY_SIZE)
+  drain_zeros = repeat(0.0, drain_cycles)
 
   for epoch_idx, (w_mat, a_mats) in enumerate(epochs):
     if not a_mats:
@@ -675,78 +756,77 @@ def build_ws_schedule(
     ]
 
     # 1. Weight load phase (ARRAY_SIZE cycles, bottom row first).
-    for step in range(ARRAY_SIZE):
-      src_row = ARRAY_SIZE - 1 - step
-      for i in range(ARRAY_SIZE):
-        row_seqs[i].append(0.0)
-      for j in range(ARRAY_SIZE):
-        col_seqs[j].append(w_bf16[src_row][j])
-      reload_seq.append(False)
+    for i in range(ARRAY_SIZE):
+      row_seqs[i] += load_zeros
+    for j in range(ARRAY_SIZE):
+      col_seqs[j] += [
+          w_bf16[ARRAY_SIZE - 1 - step][j] for step in range(ARRAY_SIZE)
+      ]
 
     # 2. Streaming compute phase (pipelined 4x4 matrices + drain_cycles).
-    for a_bf16 in a_bf16_list:
-      for m_row in range(ARRAY_SIZE):
-        for k in range(ARRAY_SIZE):
-          row_seqs[k].append(a_bf16[m_row][k])
-        for j in range(ARRAY_SIZE):
-          col_seqs[j].append(0.0)
-        reload_seq.append(False)
+    compute_cycles = ARRAY_SIZE * len(a_bf16_list)
+    for k in range(ARRAY_SIZE):
+      col_vals: list[float] = []
+      for a_bf16 in a_bf16_list:
+        for m_row in range(ARRAY_SIZE):
+          col_vals.append(a_bf16[m_row][k])
+      row_seqs[k] += col_vals
+      row_seqs[k] += drain_zeros
+    idle_cols = repeat(0.0, compute_cycles + drain_cycles)
+    for j in range(ARRAY_SIZE):
+      col_seqs[j] += idle_cols
 
-    for d_step in range(drain_cycles):
-      for i in range(ARRAY_SIZE):
-        row_seqs[i].append(0.0)
-      for j in range(ARRAY_SIZE):
-        col_seqs[j].append(0.0)
-      is_last_drain = d_step == drain_cycles - 1
-      has_next_epoch = epoch_idx < len(epochs) - 1
-      reload_seq.append(is_last_drain and has_next_epoch)
+    epoch_cycles = ARRAY_SIZE + compute_cycles + drain_cycles
+    has_next_epoch = epoch_idx < len(epochs) - 1
+    if has_next_epoch:
+      reload_seq += repeat(False, epoch_cycles - 1) + True
+    else:
+      reload_seq += repeat(False, epoch_cycles)
 
-  return row_seqs, col_seqs, reload_seq, len(reload_seq)
+  return row_seqs, col_seqs, reload_seq, reload_seq.length
 
 
 def build_os_schedule(
     matrix_pairs: Sequence[tuple[Matrix, Matrix]],
     *,
     drain_cycles: int = DRAIN_CYCLES,
-) -> tuple[list[list[float]], list[list[float]], int]:
-  """Builds unskewed row and column sequences for pipelined OS matrix products.
+) -> tuple[list[StaticWord], list[StaticWord], int]:
+  """Builds unskewed row and column `StaticWord`s for pipelined OS matmuls.
 
   Streams each 4x4 pair `(A^{(m)}, B^{(m)})` back-to-back every 4 cycles with
-  zero bubbles between pairs, followed by `drain_cycles` of `0.0` so all
-  deskewed outputs complete.
+  zero bubbles between pairs, followed by `drain_cycles` of `0.0` (encoded via
+  `repeat(0.0, drain_cycles)`) so all deskewed outputs complete.
 
   Args:
     matrix_pairs: Non-empty sequence of `(mat_a, mat_b)` 4x4 matrix pairs.
     drain_cycles: Pipeline drain cycles appended after the final pair.
 
   Returns:
-    Tuple `(row_seqs, col_seqs, horizon)` of 4 row sequences, 4 column
-    sequences, and total tick count `horizon`.
+    Tuple `(row_seqs, col_seqs, horizon)` of 4 row `StaticWord`s, 4 column
+    `StaticWord`s, and total tick count `horizon`.
 
   Raises:
     ValueError: If `matrix_pairs` is empty.
   """
   if not matrix_pairs:
     raise ValueError('matrix_pairs must be non-empty.')
-  row_seqs: list[list[float]] = [[] for _ in range(ARRAY_SIZE)]
-  col_seqs: list[list[float]] = [[] for _ in range(ARRAY_SIZE)]
+  validate_non_negative_int(drain_cycles, 'drain_cycles')
+  raw_rows: list[list[float]] = [[] for _ in range(ARRAY_SIZE)]
+  raw_cols: list[list[float]] = [[] for _ in range(ARRAY_SIZE)]
 
   for pair_idx, (mat_a, mat_b) in enumerate(matrix_pairs):
     a_bf16 = _validate_matrix(mat_a, f'matrix_pairs[{pair_idx}].a')
     b_bf16 = _validate_matrix(mat_b, f'matrix_pairs[{pair_idx}].b')
     for k in range(ARRAY_SIZE):
       for i in range(ARRAY_SIZE):
-        row_seqs[i].append(a_bf16[i][k])
+        raw_rows[i].append(a_bf16[i][k])
       for j in range(ARRAY_SIZE):
-        col_seqs[j].append(b_bf16[k][j])
+        raw_cols[j].append(b_bf16[k][j])
 
-  for _ in range(drain_cycles):
-    for i in range(ARRAY_SIZE):
-      row_seqs[i].append(0.0)
-    for j in range(ARRAY_SIZE):
-      col_seqs[j].append(0.0)
-
-  return row_seqs, col_seqs, len(row_seqs[0])
+  drain_zeros = repeat(0.0, drain_cycles)
+  row_seqs = [StaticWord(lane) + drain_zeros for lane in raw_rows]
+  col_seqs = [StaticWord(lane) + drain_zeros for lane in raw_cols]
+  return row_seqs, col_seqs, row_seqs[0].length
 
 
 def extract_matrices(
@@ -816,8 +896,13 @@ def extract_os_pe_matrices(
     List of 4x4 fp32 matrices `[C^{(0)}, C^{(1)}, ...]`.
 
   Raises:
-    ValueError: If any PE has fewer completed tiles than required.
+    ValueError: If the grid is not `4x4`, `num_matrices` is negative, or any PE
+      has fewer completed tiles than required.
   """
+  _validate_grid_shape(acc_traces, 'acc_traces')
+  _validate_grid_shape(pe_valid_traces, 'pe_valid_traces')
+  if num_matrices is not None:
+    validate_non_negative_int(num_matrices, 'num_matrices')
   per_pe_samples: list[list[list[float]]] = []
   for i in range(ARRAY_SIZE):
     row_samples: list[list[float]] = []

@@ -11,7 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-program instantaneous causality analysis for Psyre dataflow Graphs."""
+"""Whole-program instantaneous causality analysis for Psyre dataflow Graphs.
+
+Verifies that every feedback loop contains at least one unit delay (`fby` /
+`pre`) by peeling the instantaneous dependency graph with Kahn's topological
+sort algorithm (A. B. Kahn, *Comm. ACM*, 1962 — distinct from Gilles Kahn's
+1974 process networks), following the static causality discipline of Lustre
+(Caspi et al., POPL 1987; Halbwachs et al., *Proc. IEEE*, 1991).
+"""
 
 import collections
 from collections.abc import Sequence
@@ -39,10 +46,12 @@ class CausalityError(RuntimeError):
     super().__init__(f'Instantaneous causality cycle detected: {chain}')
 
 
-def _instantaneous_graph(
+def _peel_causal_prefix(
     graph: Graph,
-) -> tuple[tuple[Node, ...], list[list[Node]], list[list[Node]], list[int]]:
-  """Builds instantaneous predecessor, successor, and in-degree tables."""
+) -> tuple[
+    tuple[Node, ...], list[Node], list[list[Node]], list[list[Node]], list[int]
+]:
+  """Runs A. B. Kahn's (1962) topological sort on instantaneous edges."""
   graph.require_finalized()
   nodes = graph.nodes
   num_nodes = len(nodes)
@@ -50,22 +59,12 @@ def _instantaneous_graph(
   succs: list[list[Node]] = [[] for _ in range(num_nodes)]
   in_deg = [0] * num_nodes
   for node in nodes:
-    for istruct in node.instantaneous_input_streams():
-      prod = graph.producer(istruct)
+    for stream in node.instantaneous_input_streams():
+      prod = graph.producer(stream)
       if prod is not None:
         preds[node.id].append(prod)
         succs[prod.id].append(node)
     in_deg[node.id] = len(preds[node.id])
-  return nodes, preds, succs, in_deg
-
-
-def _peel_causal_prefix(
-    graph: Graph,
-) -> tuple[
-    tuple[Node, ...], list[Node], list[list[Node]], list[list[Node]], list[int]
-]:
-  """Runs Kahn's algorithm on instantaneous edges."""
-  nodes, preds, succs, in_deg = _instantaneous_graph(graph)
   queue: collections.deque[Node] = collections.deque(
       node for node in nodes if in_deg[node.id] == 0
   )
@@ -86,7 +85,11 @@ def _extract_shortest_cycle(
     succs: Sequence[Sequence[Node]],
     in_deg: Sequence[int],
 ) -> tuple[Node, ...]:
-  """Extracts a canonical shortest elementary instantaneous cycle."""
+  """Extracts a shortest elementary cycle through a deterministic seed node."""
+  # Walks backward from the lowest-ID remaining node to locate `seed_id` on a
+  # cycle, then runs forward BFS from `seed_id` for the shortest elementary
+  # cycle containing `seed_id` (not necessarily globally shortest across
+  # disconnected cycles), rotated to start at its minimum node ID.
   remaining_ids = {node.id for node in nodes if in_deg[node.id] > 0}
   curr_id = min(remaining_ids)
   visited: set[int] = set()
@@ -121,7 +124,12 @@ def _extract_shortest_cycle(
 
 
 def find_instantaneous_cycle(graph: Graph) -> tuple[Node, ...] | None:
-  """Finds a canonical shortest instantaneous dependency cycle if present.
+  """Finds a deterministic elementary instantaneous cycle if present.
+
+  Locates the shortest elementary instantaneous cycle passing through a
+  deterministic seed node (`seed_id` reached by walking backward from the
+  lowest-ID node remaining after peeling). Note that if `graph` contains
+  multiple disconnected cycles, this need not be the globally shortest cycle.
 
   Args:
     graph: Finalized Psyre `Graph` to inspect.

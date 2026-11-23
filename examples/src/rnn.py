@@ -11,11 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Psyre recurrent neural network, perceptron layer, and loss model."""
+"""Psyre recurrent neural network, perceptron layer, and loss model.
+
+Implements an unrolled RNN + ReLU perceptron with bidirectional reverse-mode
+automatic differentiation (via `post` and `backfill`; see Potop-Butucaru,
+Cohen, Plotkin & Pompougnac, 2023, arXiv:2311.16977) and hierarchical
+training/inference mode automata (Colaço, Pagano & Pouzet, EMSOFT '05).
+"""
 
 from collections.abc import Callable, Sequence
+import dataclasses
 import enum
-from typing import Any, Generic, NamedTuple, TypeVar
+from typing import Any, NamedTuple
 
 # pylint: disable=g-importing-member,g-multiple-import
 from psyre.automaton import (
@@ -33,7 +40,6 @@ from psyre.common import (
     post,
     prefix_sum,
     psyre_node,
-    require_sync_semantics,
     reset,
     switch,
     when,
@@ -41,6 +47,11 @@ from psyre.common import (
 )
 from psyre.match import last
 from psyre.math import tanh
+from psyre.static_stream import (
+    StaticWord,
+    concat,
+    repeat,
+)
 from psyre.stream import Stream
 from psyre.trace import present_values
 
@@ -49,11 +60,6 @@ from psyre.trace import present_values
 DIMENSION = 5
 DEFAULT_LEARNING_RATE = 0.01
 DEFAULT_MAX_STEPS = 3
-
-_T = TypeVar('_T')
-_U = TypeVar('_U')
-_RnnT = TypeVar('_RnnT')
-_PerT = TypeVar('_PerT')
 
 
 class Mode(enum.Enum):
@@ -78,55 +84,68 @@ class TrainingState(enum.Enum):
   GRAD_DESCENT = enum.auto()
 
 
-class RnnParams(NamedTuple, Generic[_T]):
+@dataclasses.dataclass(frozen=True)
+class HyperParams:
+  """Training hyperparameters for the RNN + perceptron model."""
+
+  lr: float = DEFAULT_LEARNING_RATE
+  max_steps: int = DEFAULT_MAX_STEPS
+  holdout_index: int = 0
+
+  def __post_init__(self) -> None:
+    if self.max_steps < 1:
+      raise ValueError(f'max_steps must be >= 1, got {self.max_steps}.')
+
+
+class RnnParams[T](NamedTuple):
   """Parameters (wxh, whh, bh) of the 1-layer recurrent neural network."""
 
-  wxh: _T
-  whh: _T
-  bh: _T
+  wxh: T
+  whh: T
+  bh: T
 
   @classmethod
-  def build(cls, fn: Callable[[], _U]) -> 'RnnParams[_U]':
+  def build[U](cls, fn: Callable[[], U]) -> 'RnnParams[U]':
     """Constructs RnnParams by evaluating fn() for each field."""
     return cls(wxh=fn(), whh=fn(), bh=fn())
 
-  def map(
-      self, fn: Callable[..., _U], *others: 'RnnParams[Any]'
-  ) -> 'RnnParams[_U]':
+  def map[U](
+      self, fn: Callable[..., U], *others: 'RnnParams[Any]'
+  ) -> 'RnnParams[U]':
     """Applies fn field-wise across self and any parallel RnnParams."""
     return RnnParams(*(fn(*col) for col in zip(self, *others)))
 
 
-class PerceptronParams(NamedTuple, Generic[_T]):
+class PerceptronParams[T](NamedTuple):
   """Parameters (wxh, bh) of the perceptron readout layer."""
 
-  wxh: _T
-  bh: _T
+  wxh: T
+  bh: T
 
   @classmethod
-  def build(cls, fn: Callable[[], _U]) -> 'PerceptronParams[_U]':
+  def build[U](cls, fn: Callable[[], U]) -> 'PerceptronParams[U]':
     """Constructs PerceptronParams by evaluating fn() per field."""
     return cls(wxh=fn(), bh=fn())
 
-  def map(
-      self, fn: Callable[..., _U], *others: 'PerceptronParams[Any]'
-  ) -> 'PerceptronParams[_U]':
+  def map[U](
+      self, fn: Callable[..., U], *others: 'PerceptronParams[Any]'
+  ) -> 'PerceptronParams[U]':
     """Applies fn field-wise across self and any parallel PerceptronParams."""
     return PerceptronParams(*(fn(*col) for col in zip(self, *others)))
 
 
-class ModelParams(NamedTuple, Generic[_RnnT, _PerT]):
+class ModelParams[RnnT, PerT](NamedTuple):
   """Composite parameters bundling the RNN and perceptron readout layers."""
 
-  rnn: RnnParams[_RnnT]
-  per: PerceptronParams[_PerT]
+  rnn: RnnParams[RnnT]
+  per: PerceptronParams[PerT]
 
   @classmethod
   def build(
       cls,
-      rnn_fn: Callable[[], _RnnT],
-      per_fn: Callable[[], _PerT] | None = None,
-  ) -> 'ModelParams[_RnnT, _PerT]':
+      rnn_fn: Callable[[], RnnT],
+      per_fn: Callable[[], PerT] | None = None,
+  ) -> 'ModelParams[RnnT, PerT]':
     """Constructs ModelParams by evaluating rnn_fn() and per_fn() per field."""
     actual_per_fn: Any = rnn_fn if per_fn is None else per_fn
     return cls(
@@ -192,18 +211,19 @@ def _pass_final(dimension: int = DIMENSION) -> Stream:
   return Stream.once(dimension - 1)
 
 
-def _pass_indices(
-    dimension: int = DIMENSION,
-) -> tuple[Stream, Stream, Stream, Stream]:
-  """Returns (pass_index, in_pass, pass_reset, pass_final) index streams."""
-  tick = counter()
-  in_pass = tick % dimension
-  return tick // dimension, in_pass, in_pass == 0, in_pass == (dimension - 1)
+def _pass_reset_word(dimension: int = DIMENSION) -> StaticWord:
+  """Returns the periodic `dimension`-cycle pass-start reset pattern."""
+  return StaticWord(True) + repeat(False, dimension - 1)
+
+
+def _pass_end_word(dimension: int = DIMENSION) -> StaticWord:
+  """Returns the periodic `dimension`-cycle pass-end pulse pattern."""
+  return repeat(False, dimension - 1) + True
 
 
 def relu(v) -> Stream:
-  """Pointwise rectified linear unit over a Stream or scalar."""
-  return Stream(v).max(0.0)
+  """Pointwise rectified linear unit over a Stream, LazyThunk, or scalar."""
+  return Stream.max(v, 0.0)
 
 
 def biased_dot_product(x, w, b):
@@ -217,13 +237,15 @@ def backfill(
     end: Stream,
     *,
     max_span: int,
-    shift_back: Callable[[Stream], Stream] | None = None,
+    shift_back: Callable[[Stream], Stream] = post,
 ) -> Stream:
   """Broadcasts values at `end` ticks backward up to `max_span` steps."""
-  shift = post if shift_back is None else shift_back
+  # Unrolling the reverse-time recurrence `out = i if end else post(out)` into
+  # `max_span` distinct pipeline stages breaks the single-node causality cycle
+  # so each upstream stage can look ahead one tick at a time.
   out = stream
   for _ in range(max_span):
-    out = merge(end, when(end, stream), whennot(end, shift(out)))
+    out = merge(end, when(end, stream), whennot(end, shift_back(out)))
   return out
 
 
@@ -232,7 +254,7 @@ def sum_stream(
     *,
     dimension: int = DIMENSION,
     end: Stream | None = None,
-    shift_back: Callable[[Stream], Stream] | None = None,
+    shift_back: Callable[[Stream], Stream] = post,
 ):
   """Broadcasts the sum of one pass of x as a constant stream."""
   if dimension < 1:
@@ -259,6 +281,24 @@ def _cell_mask(in_pass: Stream, cell_idx: int, num_cells: int) -> Stream:
   )
 
 
+def _unroll_rnn_cells(
+    x,
+    rnn: RnnParams[Any],
+    pos: Stream,
+    num_cells: int,
+) -> tuple[Stream, list[tuple[Stream, Stream, Stream]]]:
+  """Unrolls `num_cells` forward RNN stages and collects `(now, h, h_prev)`."""
+  cells: list[tuple[Stream, Stream, Stream]] = []
+  h: Any = None
+  y: Any = 0.0
+  for k in range(num_cells):
+    h, h_prev = rnn_cell(x, rnn, h)
+    now = _cell_mask(pos, k, num_cells)
+    y = h if k == 0 and num_cells == 1 else ifthenelse(now, h, y)
+    cells.append((now, h, h_prev))
+  return y, cells
+
+
 @psyre_node('rnn_layer')
 def rnn_layer(
     x,
@@ -271,12 +311,7 @@ def rnn_layer(
   if num_cells < 1:
     raise ValueError(f'num_cells must be >= 1, got {num_cells}.')
   pos = counter() if in_pass is None else in_pass
-  h: Any = None
-  y: Any = 0.0
-  for k in range(num_cells):
-    h, _ = rnn_cell(x, rnn, h)
-    now = _cell_mask(pos, k, num_cells)
-    y = h if k == 0 and num_cells == 1 else ifthenelse(now, h, y)
+  y, _ = _unroll_rnn_cells(x, rnn, pos, num_cells)
   return y
 
 
@@ -289,7 +324,7 @@ def grad_rnn_layer(
     num_cells: int = DIMENSION,
     dimension: int = DIMENSION,
     in_pass: Stream | None = None,
-    shift_back: Callable[[Stream], Stream] | None = None,
+    shift_back: Callable[[Stream], Stream] = post,
 ) -> tuple[Stream, Any, RnnParams[Any]]:
   """Computes the forward and reverse-mode backward pass of the RNN layer."""
   if num_cells < 1:
@@ -300,16 +335,10 @@ def grad_rnn_layer(
     )
   pos = counter() if in_pass is None else in_pass
   final = pos == (dimension - 1)
-  shift = post if shift_back is None else shift_back
-  cells: list[tuple[Stream, Stream, Stream]] = []
-  h: Any = None
-  y: Any = 0.0
-  for k in range(num_cells):
-    h, h_prev = rnn_cell(x, rnn, h)
-    now = _cell_mask(pos, k, num_cells)
-    y = h if k == 0 and num_cells == 1 else ifthenelse(now, h, y)
-    cells.append((now, h, h_prev))
+  y, cells = _unroll_rnn_cells(x, rnn, pos, num_cells)
 
+  # Reverse-mode BPTT sweeps unrolled cells back-to-front; `shift_back` moves
+  # each `whh` adjoint one tick earlier in time (zeroed at pass end `final`).
   dh_next: Any = 0.0
   dz_terms: list[Stream] = []
   dwhh_terms: list[Stream] = []
@@ -320,7 +349,7 @@ def grad_rnn_layer(
     dz_terms.append(dz_k)
     dwhh_terms.append(dz_k * h_prev)
     if idx < num_cells - 1:
-      dh_next = merge(final, 0.0, whennot(final, shift(dz_k * rnn.whh)))
+      dh_next = merge(final, 0.0, whennot(final, shift_back(dz_k * rnn.whh)))
   if len(dz_terms) == 1:
     dz, dwhh = dz_terms[0], dwhh_terms[0]
   elif len(dz_terms) == 2:
@@ -346,12 +375,15 @@ def grad_per_layer(
     *,
     dimension: int = DIMENSION,
     final: Stream | None = None,
-    shift_back: Callable[[Stream], Stream] | None = None,
+    shift_back: Callable[[Stream], Stream] = post,
 ) -> tuple[Stream, Any, PerceptronParams[Any]]:
   """Computes the forward and backward pass of the perceptron layer."""
   z = biased_dot_product(x, per.wxh, per.bh)
   y = relu(z)
   dz = ifthenelse(z > 0.0, dy, 0.0)
+  # Adjoint of `prefix_sum` is the suffix sum `dp[t] = sum_{j>=t} dz[j]`,
+  # obtained as `total - prefix_sum_prev`. Only bias `bh[0]` seeds `prefix_sum`,
+  # so `morph(dp, 0.0)` emits `dp[0]` at tick 0 and `0.0` afterward.
   ps = prefix_sum(dz)
   end = _pass_final(dimension) if final is None else final
   total = backfill(ps, end, max_span=dimension - 1, shift_back=shift_back)
@@ -394,7 +426,7 @@ def grad_rnn_perceptron(
     num_cells: int = DIMENSION,
     dimension: int = DIMENSION,
     in_pass: Stream | None = None,
-    shift_back: Callable[[Stream], Stream] | None = None,
+    shift_back: Callable[[Stream], Stream] = post,
 ) -> tuple[Stream, Any, ParamStreams]:
   """Computes forward and reverse-mode backward pass of RNN + perceptron."""
   pos = counter() if in_pass is None else in_pass
@@ -467,9 +499,11 @@ def _random_param_streams() -> ParamStreams:
   )
 
 
-def simple_model() -> SimpleModelOutput:
+def simple_model(
+    *,
+    hyperparams: HyperParams = HyperParams(lr=0.1),
+) -> SimpleModelOutput:
   """Runs the forward pass and one iteration of gradient descent."""
-  lr = 0.1
   x = Stream.periodic([], [1.0, 2.0, -1.0, 0.0, 1.0])
   y_true = 42.0
   params = _random_param_streams()
@@ -481,7 +515,7 @@ def simple_model() -> SimpleModelOutput:
   y_pred, loss_bwd, grads = grad_model(x, y_true, params)
   y_pred.name = 'y_pred'
   loss_bwd.name = 'loss_bwd'
-  next_params = apply_grads(params, grads, lr)
+  next_params = apply_grads(params, grads, hyperparams.lr)
   return SimpleModelOutput(
       y_pred_fwd=y_pred_fwd,
       loss_fwd=loss_fwd,
@@ -491,11 +525,50 @@ def simple_model() -> SimpleModelOutput:
   )
 
 
+def _to_param_float(raw_value: Any, field_name: str) -> float:
+  """Converts a non-bool numeric parameter value to float."""
+  if isinstance(raw_value, bool):
+    raise TypeError(
+        f'Parameter {field_name!r} must be numeric, not bool ({raw_value!r}).'
+    )
+  return float(raw_value)
+
+
+def _validate_dimension(dimension: int) -> None:
+  """Validates a pass dimension is a positive integer."""
+  if isinstance(dimension, bool) or not isinstance(dimension, int):
+    raise TypeError(
+        f'dimension must be an int >= 1, got {type(dimension).__name__}.'
+    )
+  if dimension < 1:
+    raise ValueError(f'dimension must be >= 1, got {dimension}.')
+
+
+def _normalize_param_values(
+    raw_value: Any,
+    field_name: str,
+    *,
+    label: str,
+    expected: str,
+) -> list[float]:
+  """Validates a raw parameter entry and returns normalized float value(s)."""
+  if isinstance(raw_value, bool):
+    raise TypeError(f'{label} {field_name!r} must be numeric, not bool.')
+  if isinstance(raw_value, (int, float)):
+    return [float(raw_value)]
+  if isinstance(raw_value, (str, bytes, bytearray)):
+    raise TypeError(
+        f'{label} {field_name!r} must be {expected}, not '
+        f'{type(raw_value).__name__}.'
+    )
+  return [_to_param_float(item, field_name) for item in raw_value]
+
+
 def _normalize_param_scalar(raw_value: Any, field_name: str) -> float:
   """Normalizes a shared scalar parameter entry (float or length-1 sequence)."""
-  if isinstance(raw_value, (int, float)):
-    return float(raw_value)
-  values = [float(item) for item in raw_value]
+  values = _normalize_param_values(
+      raw_value, field_name, label='Shared parameter', expected='numeric'
+  )
   if len(values) != 1:
     raise ValueError(
         f'Shared parameter {field_name!r} has length {len(values)}, expected '
@@ -504,43 +577,73 @@ def _normalize_param_scalar(raw_value: Any, field_name: str) -> float:
   return values[0]
 
 
-def _normalize_param_vector(raw_value: Any, field_name: str) -> list[float]:
+def _normalize_param_vector(
+    raw_value: Any,
+    field_name: str,
+    *,
+    dimension: int = DIMENSION,
+) -> list[float]:
   """Normalizes a scalar or sequence parameter entry to a pass-length vector."""
-  if isinstance(raw_value, (int, float)):
-    return [float(raw_value)] * DIMENSION
-  values = [float(item) for item in raw_value]
+  _validate_dimension(dimension)
+  values = _normalize_param_values(
+      raw_value,
+      field_name,
+      label='Parameter',
+      expected='numeric or a sequence of numbers',
+  )
   if len(values) == 1:
-    return values * DIMENSION
-  if len(values) != DIMENSION:
+    return values * dimension
+  if len(values) != dimension:
     raise ValueError(
         f'Parameter {field_name!r} has length {len(values)}, expected 1 or '
-        f'{DIMENSION}.'
+        f'{dimension}.'
     )
   return values
 
 
-def normalize_params(params: ModelParams[Any, Any]) -> ParamValues:
+def normalize_params(
+    params: ModelParams[Any, Any],
+    *,
+    dimension: int = DIMENSION,
+) -> ParamValues:
   """Validates and normalizes model parameters into `ParamValues`."""
+  _validate_dimension(dimension)
   return ModelParams(
       rnn=params.rnn.map(_normalize_param_scalar, _PARAM_LABELS.rnn),
-      per=params.per.map(_normalize_param_vector, _PARAM_LABELS.per),
+      per=params.per.map(
+          lambda val, lbl: _normalize_param_vector(
+              val, lbl, dimension=dimension
+          ),
+          _PARAM_LABELS.per,
+      ),
   )
 
 
-def _extract_present_window(values: Sequence[Any], label: str) -> list[float]:
+def _extract_present_window(
+    values: Sequence[Any],
+    label: str,
+    *,
+    dimension: int = DIMENSION,
+) -> list[float]:
   """Returns the trailing pass of present float values from a trace."""
+  _validate_dimension(dimension)
   extracted = [float(val) for val in present_values(values)]
-  if len(extracted) < DIMENSION:
+  if len(extracted) < dimension:
     raise ValueError(
         f'Trace {label!r} has {len(extracted)} present values, expected '
-        f'at least {DIMENSION}.'
+        f'at least {dimension}.'
     )
-  return extracted[-DIMENSION:]
+  return extracted[-dimension:]
 
 
-def _extract_shared_scalar(values: Sequence[Any], label: str) -> float:
+def _extract_shared_scalar(
+    values: Sequence[Any],
+    label: str,
+    *,
+    dimension: int = DIMENSION,
+) -> float:
   """Extracts and validates a pass-constant scalar parameter from a trace."""
-  window = _extract_present_window(values, label)
+  window = _extract_present_window(values, label, dimension=dimension)
   if any(val != window[0] for val in window):
     raise ValueError(
         f'Shared parameter {label!r} is not constant across pass: {window!r}.'
@@ -548,11 +651,26 @@ def _extract_shared_scalar(values: Sequence[Any], label: str) -> float:
   return window[-1]
 
 
-def extract_params(traces: ParamTraces) -> ParamValues:
+def extract_params(
+    traces: ParamTraces,
+    *,
+    dimension: int = DIMENSION,
+) -> ParamValues:
   """Extracts the latest full pass of ModelParams from recorded traces."""
+  _validate_dimension(dimension)
   return ModelParams(
-      rnn=traces.rnn.map(_extract_shared_scalar, _PARAM_LABELS.rnn),
-      per=traces.per.map(_extract_present_window, _PARAM_LABELS.per),
+      rnn=traces.rnn.map(
+          lambda seq, lbl: _extract_shared_scalar(
+              seq, lbl, dimension=dimension
+          ),
+          _PARAM_LABELS.rnn,
+      ),
+      per=traces.per.map(
+          lambda seq, lbl: _extract_present_window(
+              seq, lbl, dimension=dimension
+          ),
+          _PARAM_LABELS.per,
+      ),
   )
 
 
@@ -565,18 +683,66 @@ def _vector_stream(in_pass: Stream, values: Sequence[float]) -> Stream:
   )
 
 
+def _parse_pass_values(
+    raw_values: Sequence[Any],
+    label: str,
+    *,
+    dimension: int = DIMENSION,
+) -> list[float]:
+  """Validates a pass-length sequence of floats and returns it as a list."""
+  if isinstance(raw_values, (str, bytes, bytearray)):
+    raise TypeError(
+        f'{label} must be a numeric sequence, not {type(raw_values).__name__}.'
+    )
+  values = [_to_param_float(item, label) for item in raw_values]
+  if len(values) != dimension:
+    raise ValueError(f'{label} has length {len(values)}, expected {dimension}.')
+  return values
+
+
 def _parse_pass_stream(
     raw_values: Sequence[Any],
     in_pass: Stream | None,
     label: str,
 ) -> Stream:
   """Validates a pass-length sequence and converts it to a Psyre Stream."""
-  values = [float(item) for item in raw_values]
-  if len(values) != DIMENSION:
-    raise ValueError(f'{label} has length {len(values)}, expected {DIMENSION}.')
+  values = _parse_pass_values(raw_values, label)
   if in_pass is None:
     return Stream.periodic([], values)
   return _vector_stream(in_pass, values)
+
+
+def _dataset_words(
+    samples: Sequence[tuple[Sequence[float], float | Sequence[float]]],
+    *,
+    dimension: int = DIMENSION,
+) -> tuple[StaticWord, StaticWord]:
+  """Encodes `(x_seq, y_target)` examples as concatenated `StaticWord`s."""
+  x_parts: list[StaticWord] = []
+  y_parts: list[StaticWord] = []
+  for idx, (x_seq, raw_y) in enumerate(samples):
+    x_parts.append(
+        StaticWord(
+            _parse_pass_values(
+                x_seq, f'Dataset item {idx}', dimension=dimension
+            )
+        )
+    )
+    if isinstance(raw_y, Sequence) and not isinstance(
+        raw_y, (str, bytes, bytearray)
+    ):
+      y_parts.append(
+          StaticWord(
+              _parse_pass_values(
+                  raw_y, f'Dataset target {idx}', dimension=dimension
+              )
+          )
+      )
+    else:
+      y_parts.append(
+          repeat(_to_param_float(raw_y, f'Dataset target {idx}'), dimension)
+      )
+  return concat(*x_parts), concat(*y_parts)
 
 
 def dataset_streams(
@@ -588,10 +754,12 @@ def dataset_streams(
   streams: list[LabeledStream] = []
   for idx, (x_seq, raw_y) in enumerate(samples):
     x_stream = _parse_pass_stream(x_seq, in_pass, f'Dataset item {idx}')
-    if isinstance(raw_y, Sequence):
+    if isinstance(raw_y, Sequence) and not isinstance(
+        raw_y, (str, bytes, bytearray)
+    ):
       y_stream = _parse_pass_stream(raw_y, in_pass, f'Dataset target {idx}')
     else:
-      y_stream = Stream(float(raw_y))
+      y_stream = Stream(_to_param_float(raw_y, f'Dataset target {idx}'))
     streams.append(LabeledStream(x=x_stream, y=y_stream))
   return streams
 
@@ -617,25 +785,23 @@ def _delay_params(get_params: Callable[[], ParamStreams]) -> ParamStreams:
 
 
 def _zero_param_streams() -> ParamStreams:
-  """Returns constant zero ParamStreams for unreachable states."""
+  """Returns placeholder zero `ParamStreams` for `Mode.INFERENCE`."""
   return ModelParams.build(lambda: Stream(0.0))
 
 
-def _param_streams(
-    in_pass: Stream, params: ModelParams[Any, Any]
-) -> ParamStreams:
-  """Streams the shared RNN scalars and perceptron vectors from `params`."""
+def _periodic_param_streams(params: ModelParams[Any, Any]) -> ParamStreams:
+  """Streams shared RNN scalars and periodic perceptron vectors."""
   normalized = normalize_params(params)
   return ModelParams(
       rnn=normalized.rnn.map(Stream),
-      per=normalized.per.map(lambda vec: _vector_stream(in_pass, vec)),
+      per=normalized.per.map(lambda vec: Stream.periodic([], vec)),
   )
 
 
-def _leave_one_out_samples(
-    samples: Sequence[_T],
+def _leave_one_out_samples[T](
+    samples: Sequence[T],
     holdout_index: int,
-) -> list[_T]:
+) -> list[T]:
   """Excludes holdout_index from samples under the leave-one-out policy."""
   if len(samples) < 2:
     raise ValueError(
@@ -649,33 +815,14 @@ def _leave_one_out_samples(
   return [sample for idx, sample in enumerate(samples) if idx != holdout_index]
 
 
-def _select_sample(
-    index_stream: Stream,
-    samples: Sequence[LabeledStream],
-) -> LabeledStream:
-  """Multiplexes a sequence of LabeledStreams by index_stream."""
-  return LabeledStream(
-      x=switch(
-          index_stream,
-          {idx: sample.x for idx, sample in enumerate(samples)},
-          default=0.0,
-      ),
-      y=switch(
-          index_stream,
-          {idx: sample.y for idx, sample in enumerate(samples)},
-          default=0.0,
-      ),
-  )
-
-
 def _inference_streams(
     dataset: Sequence[tuple[Sequence[float], float | Sequence[float]]],
     params: ModelParams[Any, Any] | None = None,
 ) -> tuple[Stream, Stream]:
   """Returns `(loss, emit_loss)` streams from the nested inference automaton."""
-  require_sync_semantics('inference_machine')
   if params is None:
     raise ValueError('params is required for inference_machine.')
+  x_word, y_word = _dataset_words(dataset)
 
   with automaton(name='infer') as infer:
     with state(InferenceState.INIT):
@@ -683,13 +830,15 @@ def _inference_streams(
       infer.loss = 0.0
       infer.emit_loss = False
     with state(InferenceState.EVAL):
-      eval_idx, in_pass, pass_reset, pass_final = _pass_indices()
-      samples = dataset_streams(dataset, in_pass=in_pass)
-      sample = _select_sample(eval_idx, samples)
-      eval_params = _param_streams(in_pass, params)
+      pass_reset = Stream.periodic([], _pass_reset_word())
+      sample_x = Stream.periodic(x_word, [0.0])
+      sample_y = Stream.periodic(y_word, [0.0])
+      eval_params = _periodic_param_streams(params)
       with reset(pass_reset):
-        infer.loss = loss(forward(sample.x, eval_params), sample.y)
-      infer.emit_loss = pass_final & (eval_idx < len(samples))
+        infer.loss = loss(forward(sample_x, eval_params), sample_y)
+      infer.emit_loss = Stream.periodic(
+          repeat(_pass_end_word(), len(dataset)), [False]
+      )
 
   return infer.loss, infer.emit_loss
 
@@ -716,14 +865,9 @@ def _training_streams(
     params: ModelParams[Any, Any] | None = None,
     *,
     init_state: TrainingState = TrainingState.INIT_RANDOM,
-    max_steps: int = DEFAULT_MAX_STEPS,
-    holdout_index: int = 0,
-    lr: float = DEFAULT_LEARNING_RATE,
+    hyperparams: HyperParams = HyperParams(),
 ) -> tuple[ParamStreams, Stream, Stream]:
   """Returns `(params, loss, emit_loss)` streams from the training automaton."""
-  require_sync_semantics('training_machine')
-  if max_steps < 1:
-    raise ValueError(f'max_steps must be >= 1, got {max_steps}.')
   if init_state == TrainingState.GRAD_DESCENT:
     raise ValueError(
         'init_state must be TrainingState.INIT_RANDOM or '
@@ -731,7 +875,8 @@ def _training_streams(
     )
   if init_state == TrainingState.INIT_LOAD and params is None:
     raise ValueError('params is required for TrainingState.INIT_LOAD.')
-  train_dataset = _leave_one_out_samples(dataset, holdout_index)
+  train_dataset = _leave_one_out_samples(dataset, hyperparams.holdout_index)
+  x_word, y_word = _dataset_words(train_dataset)
 
   with automaton(init=init_state.name, name='train') as train:
     prev = _delay_params(lambda: train.params)
@@ -741,18 +886,22 @@ def _training_streams(
         train.params = _random_param_streams()
       else:
         assert params is not None
-        train.params = _param_streams(counter(), params)
+        train.params = _periodic_param_streams(params)
       train.loss = 0.0
       train.emit_loss = False
     with state(TrainingState.GRAD_DESCENT.name):
-      step, in_pass, pass_reset, pass_final = _pass_indices()
-      train_samples = dataset_streams(train_dataset, in_pass=in_pass)
-      sample = _select_sample(step % len(train_samples), train_samples)
-      active_step = step < max_steps
+      pass_reset = Stream.periodic([], _pass_reset_word())
+      sample_x = Stream.periodic([], x_word)
+      sample_y = Stream.periodic([], y_word)
+      active_step = Stream.periodic(
+          repeat(True, hyperparams.max_steps * DIMENSION), [False]
+      )
       with reset(pass_reset):
-        _, train.loss, grads = grad_model(sample.x, sample.y, prev)
-        updated = apply_grads(prev, grads, lr)
-      train.emit_loss = pass_final & active_step
+        _, train.loss, grads = grad_model(sample_x, sample_y, prev)
+        updated = apply_grads(prev, grads, hyperparams.lr)
+      train.emit_loss = Stream.periodic(
+          repeat(_pass_end_word(), hyperparams.max_steps), [False]
+      )
       train.params = updated.map(
           lambda upd, old: ifthenelse(active_step, upd, old), prev
       )
@@ -765,9 +914,7 @@ def training_machine(
     params: ModelParams[Any, Any] | None = None,
     *,
     init_state: TrainingState = TrainingState.INIT_RANDOM,
-    max_steps: int = DEFAULT_MAX_STEPS,
-    holdout_index: int = 0,
-    lr: float = DEFAULT_LEARNING_RATE,
+    hyperparams: HyperParams = HyperParams(),
 ) -> TrainingOutput:
   """Nested automaton state machine for training mode (init and BPTT).
 
@@ -776,10 +923,7 @@ def training_machine(
     params: Initial model parameters loaded in `TrainingState.INIT_LOAD`.
     init_state: Initial state (`TrainingState.INIT_RANDOM` or
       `TrainingState.INIT_LOAD`).
-    max_steps: Upper bound on the number of BPTT learning steps.
-    holdout_index: Index of the dataset stream excluded from BPTT updates under
-      the leave-one-out policy.
-    lr: Gradient descent learning rate.
+    hyperparams: Training hyperparameters (`lr`, `max_steps`, `holdout_index`).
 
   Returns:
     `TrainingOutput(params, train_loss)`.
@@ -788,9 +932,7 @@ def training_machine(
       dataset,
       params,
       init_state=init_state,
-      max_steps=max_steps,
-      holdout_index=holdout_index,
-      lr=lr,
+      hyperparams=hyperparams,
   )
   return TrainingOutput(
       params=train_params,
@@ -805,9 +947,7 @@ def hierarchical_model(
     initial_mode: Mode = Mode.TRAINING,
     switch_mode: Stream | None = None,
     train_init_state: TrainingState = TrainingState.INIT_RANDOM,
-    max_steps: int = DEFAULT_MAX_STEPS,
-    holdout_index: int = 0,
-    lr: float = DEFAULT_LEARNING_RATE,
+    hyperparams: HyperParams = HyperParams(),
 ) -> HierarchicalOutput:
   """High-level automaton machine orchestrating training and inference modes.
 
@@ -821,23 +961,18 @@ def hierarchical_model(
       mode switch occurs.
     train_init_state: Initial nested training state (`TrainingState.INIT_RANDOM`
       or `TrainingState.INIT_LOAD`).
-    max_steps: Bounded number of BPTT learning steps in `Mode.TRAINING`.
-    holdout_index: Dataset index held out during leave-one-out BPTT training.
-    lr: Gradient descent learning rate.
+    hyperparams: Training hyperparameters (`lr`, `max_steps`, `holdout_index`).
 
   Returns:
     `HierarchicalOutput(mode, params, train_loss, eval_loss)`.
   """
-  require_sync_semantics('hierarchical_model')
   if switch_mode is None:
     if initial_mode == Mode.TRAINING:
       train_out = training_machine(
           dataset=dataset,
           params=params,
           init_state=train_init_state,
-          max_steps=max_steps,
-          holdout_index=holdout_index,
-          lr=lr,
+          hyperparams=hyperparams,
       )
       return HierarchicalOutput(
           mode=Stream(Mode.TRAINING),
@@ -865,9 +1000,7 @@ def hierarchical_model(
           dataset=dataset,
           params=params,
           init_state=train_init_state,
-          max_steps=max_steps,
-          holdout_index=holdout_index,
-          lr=lr,
+          hyperparams=hyperparams,
       )
     with state(Mode.INFERENCE) as mode:
       until(switch_mode, Mode.TRAINING)

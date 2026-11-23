@@ -11,10 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Common Psyre definitions, decorators, primitives, and scope stacks."""
+"""Common Psyre definitions, decorators, primitives, and scope stacks.
+
+Defines the two execution semantics (`Semantics.SYNC` following Lustre —
+Halbwachs et al., *Proc. IEEE* 1991 — and `Semantics.KAHN` following Kahn
+Process Networks — Kahn, *IFIP* 1974), the two non-value sentinels (`Absent`
+for synchronous clock absence and `Bottom` for undefined/uninitialized slots
+or horizon-truncated traces), combinational/sequential node wrappers, and
+shared Stage-1 scope stacks (`reset`, `prefix`, `match`/`automaton` arms).
+"""
 
 from __future__ import annotations
 
+import abc
 from collections.abc import (
     AsyncGenerator,
     Callable,
@@ -28,26 +37,93 @@ import contextvars
 import dataclasses
 import enum
 import functools
+import inspect
 import logging
 import operator
 import sys
 import types
-from typing import Any
+from typing import Any, Protocol
 
 # pylint: disable=g-importing-member,g-multiple-import
-from psyre.istructure import (
-    Absent,
-    IStruct,
-    IStructHandle,
-    as_istruct,
-    is_one_periodic,
+from psyre.common_payload import (
+    CALL_PLAN_KWARG,
+    PlanNode,
+    is_array_object,
+    is_int_ge,
+    is_numpy_bool,
+    is_zero_arg_function,
+    normalize_static_argnames,
+    normalize_static_argnums,
+    partition_comb_args,
+    reject_callable,
+    safe_scalar_eq,
+    validate_positive_int,
+)
+# Re-exported for internal/downstream modules (`graph`, `match`, `visualize`,
+# `static_stream`, `scheduler`, examples).
+from psyre.common_payload import (  # pylint: disable=unused-import
+    is_namedtuple,
+    validate_non_negative_int,
 )
 
 # pylint: enable=g-importing-member,g-multiple-import
 
-logging.basicConfig(level=logging.WARNING)
+
+class _Sentinel:
+  """Singleton sentinel for non-value stream entries (`Absent`, `Bottom`).
+
+  Both sentinels return `False` from `__eq__` (which also leaves them
+  unhashable via `__hash__ = None`), forcing callers to use identity checks
+  (`x is Absent` / `x is Bottom`) rather than `==` so sentinels can never
+  accidentally match arbitrary payload values or act as mapping keys. Note that
+  Python's `list.__eq__` compares element identity before calling `__eq__`, so
+  `[Absent] == [Absent]` remains `True` in unit-test assertions.
+  """
+
+  _psyre_is_sentinel: bool = True
+  __slots__ = ('_name',)
+
+  def __init__(self, name: str):
+    self._name = name
+
+  def __bool__(self) -> bool:
+    return False
+
+  def __eq__(self, _) -> bool:
+    # Always False (even for self): enforce `is Absent` / `is Bottom`.
+    return False
+
+  def __repr__(self) -> str:
+    return self._name
+
+
+Absent = _Sentinel('Absent')  # pylint: disable=invalid-name
+Bottom = _Sentinel('Bottom')  # pylint: disable=invalid-name
+
+
+def reject_sentinel(value: Any, *, label: str = 'Stream value') -> None:
+  """Raises TypeError if `value` is the `Absent` or `Bottom` sentinel.
+
+  Psyre stores references to stream values without defensively copying them or
+  enforcing runtime immutability; the behavior of mutating values carried on
+  streams in place is unspecified.
+
+  Args:
+    value: Candidate payload value to check.
+    label: Subject label prefix used in `TypeError` messages.
+
+  Raises:
+    TypeError: If `value` is `Absent` or `Bottom`.
+  """
+  if value is Absent:
+    raise TypeError(f'{label} cannot contain Absent.')
+  if value is Bottom:
+    raise TypeError(f'{label} cannot contain Bottom.')
+
+
 logger = logging.getLogger('psyre')
 logger.setLevel(logging.WARNING)
+logger.propagate = False
 
 # Clear existing handlers to prevent duplicate or conflicting logs
 for _handler in logger.handlers[:]:
@@ -61,6 +137,8 @@ _stdout_handler.setFormatter(
 logger.addHandler(_stdout_handler)
 
 UNSET = object()
+UNREADY = object()
+_DEBUG = logging.DEBUG
 
 
 class Semantics(enum.Enum):
@@ -70,20 +148,6 @@ class Semantics(enum.Enum):
   SYNC = enum.auto()
 
 
-STATEFUL_PRIMITIVE_OPS = frozenset({
-    'fby',
-    'pre',
-    'morph',
-    'current',
-    'counter',
-    'prefix_sum',
-    'scan',
-    'once_stream',
-    'buffer',
-    'delay',
-    'post',
-})
-
 BOOL_PRODUCER_OPS = frozenset({
     '__eq__',
     '__ne__',
@@ -91,7 +155,6 @@ BOOL_PRODUCER_OPS = frozenset({
     '__le__',
     '__gt__',
     '__ge__',
-    'once_stream',
 })
 
 BOOL_BINARY_OPS = frozenset({
@@ -109,25 +172,33 @@ BOOL_DOMAIN: frozenset[TagKey] = frozenset({(True, True), (True, False)})
 
 def tag_key(tag: Any) -> TagKey:
   """Returns a type-disambiguated key separating bools from ints."""
+  if is_numpy_bool(tag):
+    return (True, bool(tag))
   return (isinstance(tag, bool), tag)
 
 
 def matches_tag(selector_value: Any, target_tag: Any) -> bool:
   """Checks whether selector_value matches target_tag without bool/int mixup."""
+  if is_numpy_bool(target_tag):
+    target_tag = bool(target_tag)
+  if is_numpy_bool(selector_value):
+    selector_value = bool(selector_value)
   if isinstance(target_tag, bool) or target_tag is None:
     return selector_value is target_tag
   if isinstance(selector_value, bool) or selector_value is None:
     return False
-  return bool(selector_value == target_tag)
+  return safe_scalar_eq(selector_value, target_tag)
 
 
 def format_tag(value: Any, max_len: int | None = None) -> str:
-  """Formats a scalar or Enum tag value concisely for diagnostics and labels."""
-  text = (
-      f'{type(value).__name__}.{value.name}'
-      if isinstance(value, enum.Enum)
-      else repr(value)
-  )
+  """Formats a scalar, Enum, or array descriptor concisely for diagnostics."""
+  if isinstance(value, enum.Enum):
+    text = f'{type(value).__name__}.{value.name}'
+  elif is_array_object(value):
+    dims = ','.join(str(d) for d in value.shape)
+    text = f'{value.dtype}[{dims}]'
+  else:
+    text = repr(value)
   if max_len is not None and len(text) > max_len:
     return f'{text[: max_len - 1]}…'
   return text
@@ -139,28 +210,68 @@ def tag_sort_key(item: TagKey) -> tuple[str, str]:
   return ('0' if is_bool else '1', format_tag(val))
 
 
-def same_stream_or_const(
-    a: IStruct | IStructHandle, b: IStruct | IStructHandle
-) -> bool:
-  """Returns True when a and b are identical streams or equal constants."""
-  sa, sb = as_istruct(a), as_istruct(b)
-  if sa is sb:
-    return True
-  if is_one_periodic(sa) and is_one_periodic(sb):
-    av, bv = sa.period[0], sb.period[0]
-    if av is bv:
-      return True
-    if type(av) is type(bv):
-      try:
-        return bool(av == bv)
-      except (TypeError, ValueError):
-        return False
-  return False
+class _StreamPort(Protocol):
+  """Structural protocol for Stage-2 `StreamPort` cursors used by primitives."""
+
+  def try_pull_ready(self) -> Any:
+    ...
+
+  def push(self, value: Any) -> None:
+    ...
+
+  def skip_absent(self) -> None:
+    ...
+
+
+class LazyThunk(abc.ABC):
+  """Abstract base class for non-lambda deferred Stage-1 expression proxies."""
+
+  _psyre_is_lazy_thunk: bool = True
+  __slots__ = ()
+
+  @abc.abstractmethod
+  def __psyre_force__(self) -> Any:
+    """Evaluates and returns the concrete Stage-1 value of this thunk."""
 
 
 def is_thunk(val: Any) -> bool:
-  """Returns True when val is a zero-argument Python function."""
-  return isinstance(val, types.FunctionType) and val.__code__.co_argcount == 0
+  """Returns True when val is a zero-argument Python function or LazyThunk."""
+  return isinstance(val, LazyThunk) or is_zero_arg_function(val)
+
+
+def force_thunk(val: Any) -> Any:
+  """Forces a zero-arg function thunk or LazyThunk to a non-callable value.
+
+  Args:
+    val: Deferred `LazyThunk` proxy or zero-argument Python function.
+
+  Returns:
+    The non-callable, non-`LazyThunk` value produced by forcing `val`.
+
+  Raises:
+    TypeError: If `val` is not a thunk, or if forcing it yields a callable or
+      another `LazyThunk`.
+  """
+  if isinstance(val, LazyThunk):
+    result = val.__psyre_force__()
+  elif is_zero_arg_function(val):
+    result = val()
+  else:
+    raise TypeError(
+        'Expected a LazyThunk or zero-argument function, got '
+        f'{type(val).__name__}.'
+    )
+  if is_thunk(result):
+    raise TypeError(
+        'Nested Stage-1 thunks are not allowed; thunk must evaluate to a '
+        f'non-callable value, got {type(result).__name__}.'
+    )
+  if callable(result):
+    raise TypeError(
+        'Thunk must evaluate to a non-callable value, got '
+        f'{type(result).__name__}.'
+    )
+  return result
 
 
 def callable_name(fn: Callable[..., Any], default: str = '') -> str:
@@ -168,18 +279,9 @@ def callable_name(fn: Callable[..., Any], default: str = '') -> str:
   return getattr(fn, '__name__', default)
 
 
-def validate_non_negative_int(k: int, op_name: str = 'delay k') -> int:
-  """Validates that `k` is a non-negative integer (rejecting booleans)."""
-  if isinstance(k, bool) or not isinstance(k, int) or k < 0:
-    raise ValueError(f'{op_name} must be a non-negative integer, got {k!r}.')
-  return k
-
-
 def prepare_iterated_n(n: int, op_name: str = 'iterated op') -> int:
   """Validates that iteration count `n` is an integer >= 1."""
-  if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-    raise ValueError(f'{op_name} n must be an integer >= 1, got {n!r}.')
-  return n
+  return validate_positive_int(n, f'{op_name} n')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,16 +308,34 @@ def normalize_when_selector(
 ) -> tuple[bool, frozenset[TagKey], bool]:
   """Returns canonical (is_boolean, values, negated) for a when/whennot."""
   if op == 'whennot':
-    return (is_bool, frozenset({(True, False)}), False)
+    return (True, frozenset({(True, False)}), False)
   if selector is None:
-    return (is_bool, frozenset({(True, True)}), False)
+    return (True, frozenset({(True, True)}), False)
   if selector.is_boolean:
-    return (is_bool, frozenset({(True, not selector.negated)}), False)
+    return (True, frozenset({(True, not selector.negated)}), False)
   if is_bool:
     relevant = selector.values & BOOL_DOMAIN
     effective = (BOOL_DOMAIN - relevant) if selector.negated else relevant
-    return (True, effective, False)
+    if effective:
+      return (True, effective, False)
+    return (False, frozenset(), False)
   return (False, selector.values, selector.negated)
+
+
+def selector_from_norm(
+    norm_sel: tuple[bool, frozenset[TagKey], bool],
+    fallback: WhenSelector | None = None,
+) -> WhenSelector | None:
+  """Converts a normalized `when` selector tuple into a canonical `WhenSelector`."""
+  is_bool, vals, neg = norm_sel
+  if is_bool and not neg:
+    if vals == frozenset({(True, True)}):
+      return None
+    if vals == frozenset({(True, False)}):
+      return WhenSelector(is_boolean=True, negated=True)
+  if fallback is not None:
+    return fallback
+  return WhenSelector(is_boolean=False, values=vals, negated=neg)
 
 
 def is_tautological_selector(
@@ -224,6 +344,37 @@ def is_tautological_selector(
   """Returns True when a canonicalized selector matches every possible tag."""
   is_bool, vals, neg = norm_sel
   return (vals == BOOL_DOMAIN and not neg) if is_bool else (not vals and neg)
+
+
+def when_selector_matches_const(
+    selector: WhenSelector | None,
+    value: Any,
+    *,
+    op: str = 'when',
+) -> bool | None:
+  """Returns whether `when`/`whennot` selects constant `value`, or `None`.
+
+  Returns `None` if `value` cannot safely be evaluated for truthiness or
+  hashed for tag lookup (e.g. ambiguous array `__bool__` or unhashable payload).
+
+  Args:
+    selector: Optional `WhenSelector` predicate (`None` for plain boolean).
+    value: Constant scalar/tag value from a 1-periodic static `Stream`.
+    op: Operator name (`'when'` or `'whennot'`).
+
+  Returns:
+    `True` or `False` if statically decidable, otherwise `None`.
+  """
+  if is_array_object(value):
+    return None
+  try:
+    if op == 'whennot':
+      return not bool(value)
+    if selector is None:
+      return bool(value)
+    return bool(selector(value))
+  except (TypeError, ValueError):
+    return None
 
 
 def prepare_when(
@@ -260,6 +411,9 @@ def prepare_when(
     raw_tags = (values,)
   else:
     raw_tags = tuple(values)
+  for tag in raw_tags:
+    reject_sentinel(tag, label='when selector value')
+    reject_callable(tag, label='when selector value')
   tag_keys = frozenset(tag_key(v) for v in raw_tags)
   return (c_stream, i_stream), {
       'selector': WhenSelector(
@@ -268,13 +422,21 @@ def prepare_when(
   }
 
 
+_EMPTY_TAG_MAP: Mapping[TagKey, int] = types.MappingProxyType({})
+
+
 @dataclasses.dataclass(frozen=True)
 class MergeSelector:
   """Callable branch-index selector with inspectable arm tags."""
 
   is_boolean: bool
-  arms: Mapping[TagKey, int] = dataclasses.field(default_factory=dict)
+  arms: Mapping[TagKey, int] = _EMPTY_TAG_MAP
   default_index: int | None = None
+
+  def __post_init__(self) -> None:
+    if not isinstance(self.arms, types.MappingProxyType):
+      frozen = types.MappingProxyType(dict(self.arms))
+      object.__setattr__(self, 'arms', frozen)
 
   def __call__(self, tag: Any) -> int:
     """Returns the zero-based arm stream index selected by tag."""
@@ -282,7 +444,7 @@ class MergeSelector:
       return 0 if tag else 1
     idx = self.arms.get(tag_key(tag), self.default_index)
     if idx is None:
-      raise KeyError(f'Unhandled merge selector value: {tag!r}')
+      raise KeyError(f'Unhandled merge selector value: {format_tag(tag)}')
     return idx
 
   def arm_selector(self, arm_index: int) -> WhenSelector:
@@ -299,10 +461,50 @@ class MergeSelector:
 
 
 def _prepare_mux(
-    op_name: str, selector: Any, *branches: Any, default: Any = None
+    op_name: str,
+    selector: Any,
+    *branches: Any,
+    default: Any = UNSET,
+    lookup: MergeSelector | None = None,
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
   """Validates merge/switch args and returns ((selector, *arms), kwargs)."""
+  if lookup is not None:
+    if default is not UNSET:
+      raise ValueError(
+          f'{op_name} accepts either lookup or default, not both.'
+      )
+    if not isinstance(lookup, MergeSelector):
+      raise TypeError(
+          f'{op_name} lookup must be a MergeSelector, got '
+          f'{type(lookup).__name__}.'
+      )
+    if not branches:
+      raise ValueError(
+          f'{op_name} with lookup requires at least one branch stream.'
+      )
+    if lookup.is_boolean:
+      if len(branches) != 2:
+        raise ValueError(
+            f'Boolean {op_name} lookup expects 2 branch streams, got '
+            f'{len(branches)}.'
+        )
+    else:
+      n_branches = len(branches)
+      indices = list(lookup.arms.values())
+      if lookup.default_index is not None:
+        indices.append(lookup.default_index)
+      if any(idx < 0 or idx >= n_branches for idx in indices):
+        raise ValueError(
+            f'{op_name} lookup arm index out of range for {n_branches} '
+            'branch streams.'
+        )
+    return (selector, *branches), {'lookup': lookup}
   if len(branches) == 2:
+    if default is not UNSET:
+      raise ValueError(
+          f'Boolean {op_name}(c_stream, t_stream, f_stream) does not accept '
+          'default=.'
+      )
     return (selector, *branches), {'lookup': MergeSelector(is_boolean=True)}
   if len(branches) != 1 or not isinstance(branches[0], Mapping):
     raise TypeError(
@@ -314,55 +516,62 @@ def _prepare_mux(
   def add_arm(arm: Any) -> int:
     return unique.setdefault(id(arm), (len(unique), arm))[0]
 
-  arms = {tag_key(key): add_arm(arm) for key, arm in branches[0].items()}
-  default_idx = None if default is None else add_arm(default)
+  arms: dict[TagKey, int] = {}
+  for key, arm in branches[0].items():
+    reject_sentinel(key, label=f'{op_name} branch tag')
+    reject_callable(key, label=f'{op_name} branch tag')
+    arms[tag_key(key)] = add_arm(arm)
+  default_idx = None if default is UNSET else add_arm(default)
   arm_streams = tuple(arm for _, arm in unique.values())
-  lookup = MergeSelector(
+  if not arm_streams:
+    raise ValueError(f'{op_name} requires at least one branch stream.')
+  resolved_lookup = MergeSelector(
       is_boolean=False, arms=arms, default_index=default_idx
   )
-  return (selector, *arm_streams), {'lookup': lookup}
+  return (selector, *arm_streams), {'lookup': resolved_lookup}
 
 
-def prepare_merge(
-    selector: Any, *branches: Any, default: Any = None
+prepare_merge = functools.partial(_prepare_mux, 'merge')
+prepare_switch = functools.partial(_prepare_mux, 'switch')
+
+
+def _make_iterated_prepare(
+    op_name: str, arity: int
+) -> Callable[..., tuple[tuple[Any, ...], dict[str, Any]]]:
+  """Builds a `prepare` helper validating positional args and iteration `n`."""
+  if arity == 1:
+
+    def prepare_unary(
+        i_stream: Any, n: int = 1
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+      return (i_stream,), {'n': prepare_iterated_n(n, op_name)}
+
+    return prepare_unary
+
+  def prepare_binary(
+      i_stream: Any, j_stream: Any, n: int = 1
+  ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    return (i_stream, j_stream), {'n': prepare_iterated_n(n, op_name)}
+
+  return prepare_binary
+
+
+prepare_fby = _make_iterated_prepare('fby', 2)
+prepare_pre = _make_iterated_prepare('pre', 1)
+prepare_morph = _make_iterated_prepare('morph', 2)
+prepare_post = _make_iterated_prepare('post', 1)
+
+
+def prepare_buffer(
+    i_stream: Any,
+    i_p_stream: Any,
+    o_p_stream: Any,
+    size: int = 1,
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-  """Validates merge arguments and returns ((selector, *arm_streams), kwargs)."""
-  return _prepare_mux('merge', selector, *branches, default=default)
-
-
-def prepare_switch(
-    selector: Any, *branches: Any, default: Any = None
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
-  """Validates switch arguments and returns ((selector, *arms), kwargs)."""
-  return _prepare_mux('switch', selector, *branches, default=default)
-
-
-def prepare_fby(
-    i_stream: Any, j_stream: Any, n: int = 1
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
-  """Validates fby arguments and returns ((i_stream, j_stream), {'n': n})."""
-  return (i_stream, j_stream), {'n': prepare_iterated_n(n, 'fby')}
-
-
-def prepare_pre(
-    i_stream: Any, n: int = 1
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
-  """Validates pre arguments and returns ((i_stream,), {'n': n})."""
-  return (i_stream,), {'n': prepare_iterated_n(n, 'pre')}
-
-
-def prepare_morph(
-    i_stream: Any, j_stream: Any, n: int = 1
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
-  """Validates morph arguments and returns ((i_stream, j_stream), {'n': n})."""
-  return (i_stream, j_stream), {'n': prepare_iterated_n(n, 'morph')}
-
-
-def prepare_post(
-    i_stream: Any, n: int = 1
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
-  """Validates post arguments and returns ((i_stream,), {'n': n})."""
-  return (i_stream,), {'n': prepare_iterated_n(n, 'post')}
+  """Validates `buffer` arguments and returns positional stream ports."""
+  if not is_int_ge(size, 1):
+    raise ValueError(f'buffer size must be >= 1, got {size!r}.')
+  return (i_stream, i_p_stream, o_p_stream), {'size': size}
 
 
 def prepare_current(
@@ -373,10 +582,12 @@ def prepare_current(
 
 
 def prepare_counter(
-    start: Any = 0, max_val: Any = None
+    start: Any = 0, max_val: Any = None, tick: Any = True
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
   """Normalizes counter arguments, omitting max_val when None."""
-  return ((start,) if max_val is None else (start, max_val)), {}
+  if max_val is None:
+    return (start, tick), {}
+  return (start, tick, max_val), {}
 
 
 def prepare_prefix_sum(
@@ -386,72 +597,69 @@ def prepare_prefix_sum(
   return (data, start), {}
 
 
-_INST_FUNCS: dict[Callable[..., Any], Callable[..., Any]] = {}
-
-
-def register_inst_func(
-    wrapper: Callable[..., Any], raw_func: Callable[..., Any]
-) -> None:
-  """Associates a `@psyre_comb` wrapper with its underlying Python function."""
-  _INST_FUNCS[wrapper] = raw_func
-
-
 def unwrap_inst_func(fn: Callable[..., Any]) -> Callable[..., Any]:
   """Returns the underlying Python function for a `@psyre_comb` wrapper."""
-  return _INST_FUNCS.get(fn, fn)
-
-
-def prepare_delay(
-    i_stream: Any, k: int | None = None, *, period: Any = None
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
-  """Validates delay arguments and returns ((i_stream,), kwargs)."""
-  if period is not None and k is not None:
-    raise ValueError('delay accepts either k or period, not both.')
-  if period is None:
-    steps = validate_non_negative_int(1 if k is None else k, 'delay k')
-    sched = IStruct([False] * steps, period=[True])
-    return (i_stream,), {'p_stream': sched, 'size': steps + 2}
-  if not isinstance(period, (IStruct, IStructHandle)):
-    raise TypeError(
-        'delay period must be a static periodic Stream or IStruct, got '
-        f'{type(period).__name__}.'
-    )
-  sched = as_istruct(period)
-  if not sched.static or not sched.period:
-    raise ValueError('delay period must be a non-empty static periodic stream.')
-  if not all(isinstance(v, bool) for v in (*sched.prefix, *sched.period)):
-    raise ValueError('delay period stream must contain only boolean values.')
-  size = len(sched.prefix) + len(sched.period) + 1
-  return (i_stream,), {'p_stream': sched, 'size': size}
+  return getattr(fn, '_psyre_inst_func', fn)
 
 
 def prepare_scan(
     data: Any, op: Callable[..., Any] = operator.add
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
   """Normalizes scan arguments into ((data,), {'bin_op': raw_op})."""
-  return (data,), {'bin_op': unwrap_inst_func(op)}
+  raw_op = unwrap_inst_func(op)
+  if isinstance(raw_op, LazyThunk) or not callable(raw_op):
+    raise TypeError(
+        f'scan op must be callable, got {type(op).__name__}.'
+    )
+  return (data,), {'bin_op': raw_op}
 
 
 class RingBuffer:
-  """Fixed-capacity ring buffer for buffer and delay primitives."""
+  """Strict fixed-capacity ring buffer for the `buffer` primitive.
+
+  Circular-slice invariant: live buffered items (`slot is not Bottom`) always
+  occupy the contiguous modular range `[push_idx, pull_idx) mod size`. Storing
+  `Bottom` in empty/drained slots separates an empty slot from a valid buffered
+  `None` payload *and* distinguishes empty (`slots[push_idx] is Bottom`) from
+  full (`slots[pull_idx] is not Bottom`) when `pull_idx == push_idx` without a
+  separate occupancy counter.
+
+  Both `sync_primitives.buffer` and `kahn_primitives.buffer` execute `pull`
+  *before* `push` on each active tick, so a full buffer of capacity `size`
+  cannot accept a simultaneous `pull` and `push` (raises `BufferError`).
+  `pull()` rejects `Absent`/`Bottom` and raises `BufferError` on overflow;
+  `push()` resets the popped slot to `Bottom` and raises `BufferError` on
+  underflow so `Bottom` never escapes the buffer.
+  """
 
   def __init__(self, size: int = 1):
-    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+    if not is_int_ge(size, 1):
       raise ValueError(f'RingBuffer size must be >= 1, got {size!r}.')
     self.size: int = size
-    self.slots: list[Any] = [None] * size
+    self.slots: list[Any] = [Bottom] * size
     self.pull_idx: int = 0
     self.push_idx: int = 0
 
   def pull(self, val: Any) -> None:
     """Writes `val` at `pull_idx` and advances `pull_idx`."""
+    reject_sentinel(val, label='RingBuffer value')
+    if self.slots[self.pull_idx] is not Bottom:
+      raise BufferError(
+          f'RingBuffer overflow: pull into occupied slot {self.pull_idx} '
+          f'(size={self.size}).'
+      )
     self.slots[self.pull_idx] = val
     self.pull_idx = (self.pull_idx + 1) % self.size
 
   def push(self) -> Any:
-    """Reads and clears the slot at `push_idx` and advances `push_idx`."""
+    """Reads `push_idx`, resets it to `Bottom`, and advances `push_idx`."""
     val = self.slots[self.push_idx]
-    self.slots[self.push_idx] = None
+    if val is Bottom:
+      raise BufferError(
+          f'RingBuffer underflow: push from empty slot {self.push_idx} '
+          'before matching pull.'
+      )
+    self.slots[self.push_idx] = Bottom
     self.push_idx = (self.push_idx + 1) % self.size
     return val
 
@@ -464,14 +672,36 @@ active_scheduler: contextvars.ContextVar[Any] = contextvars.ContextVar(
 )
 
 
-async def pull(stream: IStructHandle) -> Any:
+def _require_scheduler(caller: str = 'pull()') -> Any:
+  """Returns the active Stage-2 Scheduler or raises RuntimeError."""
+  sched = active_scheduler.get()
+  if sched is None:
+    raise RuntimeError(f'{caller} requires an active Scheduler run.')
+  return sched
+
+
+async def pull(stream: _StreamPort) -> Any:
   """Pulls the next value from a stream via the active Scheduler."""
-  return await active_scheduler.get().pull(stream)
+  val = stream.try_pull_ready()
+  if val is not UNREADY:
+    return val
+  return await _require_scheduler('pull()').pull(stream)
 
 
-async def pull_all(*args: IStructHandle) -> tuple[Any, ...]:
+async def pull_all(*args: _StreamPort) -> tuple[Any, ...]:
   """Pulls one value from each input stream via the active Scheduler."""
-  return await active_scheduler.get().pull_all(*args)
+  if not args:
+    return ()
+  sched = None
+  out: list[Any] = []
+  for port in args:
+    val = port.try_pull_ready()
+    if val is UNREADY:
+      if sched is None:
+        sched = _require_scheduler('pull_all()')
+      val = await sched.pull(port)
+    out.append(val)
+  return tuple(out)
 
 
 reset_stack: contextvars.ContextVar[tuple[Any, ...]] = contextvars.ContextVar(
@@ -533,34 +763,30 @@ class CapturedEnv:
 
 
 @contextlib.contextmanager
-def push_reset(r_stream: Any) -> Generator[None, None, None]:
+def _push_stack(
+    var: contextvars.ContextVar[tuple[Any, ...]], item: Any
+) -> Generator[None, None, None]:
+  """Temporarily pushes `item` onto a tuple-valued `ContextVar` stack."""
+  token = var.set(var.get() + (item,))
+  try:
+    yield
+  finally:
+    var.reset(token)
+
+
+def push_reset(r_stream: Any) -> contextlib.AbstractContextManager[None]:
   """Context manager resetting enclosed stateful nodes on `r_stream`."""
-  token = reset_stack.set(reset_stack.get() + (r_stream,))
-  try:
-    yield
-  finally:
-    reset_stack.reset(token)
+  return _push_stack(reset_stack, r_stream)
 
 
-@contextlib.contextmanager
-def push_prefix(prefix: str) -> Generator[None, None, None]:
+def push_prefix(prefix: str) -> contextlib.AbstractContextManager[None]:
   """Pushes a hierarchical node name prefix segment onto the active stack."""
-  entry = (prefix, len(reset_stack.get()))
-  token = prefix_stack.set(prefix_stack.get() + (entry,))
-  try:
-    yield
-  finally:
-    prefix_stack.reset(token)
+  return _push_stack(prefix_stack, (prefix, len(reset_stack.get())))
 
 
-@contextlib.contextmanager
-def push_arm(arm: ArmScope) -> Generator[None, None, None]:
+def push_arm(arm: ArmScope) -> contextlib.AbstractContextManager[None]:
   """Pushes an ArmScope onto the active Stage-1 arm stack."""
-  token = arm_stack.set(arm_stack.get() + (arm,))
-  try:
-    yield
-  finally:
-    arm_stack.reset(token)
+  return _push_stack(arm_stack, arm)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -580,6 +806,7 @@ class ArmRecord:
   strong_transitions: list[Any] = dataclasses.field(default_factory=list)
   weak_transitions: list[Any] = dataclasses.field(default_factory=list)
   outputs: dict[str, Any] = dataclasses.field(default_factory=dict)
+  output_envs: dict[str, CapturedEnv] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -622,8 +849,6 @@ class BlockHandle(Mapping[str, Any]):
       if name in ctx.merged_outputs:
         return ctx.merged_outputs[name]
       raise AttributeError(f'{ctx.kind}() handle has no output {name!r}.')
-    if ctx.active_arm is not None and name in ctx.active_arm.outputs:
-      return ctx.active_arm.outputs[name]
     raise AttributeError(
         f'Output {name!r} is not finalized until the {ctx.kind}() block exits; '
         'wrap forward references in lambda: ...'
@@ -651,6 +876,7 @@ class BlockHandle(Mapping[str, Any]):
           f'{ctx.kind}().'
       )
     ctx.active_arm.outputs[name] = value
+    ctx.active_arm.output_envs[name] = CapturedEnv.capture()
 
   def _finalized_outputs(self) -> dict[str, Any]:
     ctx = self._ctx
@@ -694,13 +920,49 @@ def require_open_arm_context(expected_kind: str, caller: str) -> BlockContext:
 reset = push_reset
 
 PrepareFn = Callable[..., tuple[tuple[Any, ...], dict[str, Any]]]
-_STATEFUL_STEP_FUNCS: set[Callable[..., Any]] = set()
 primitives_registry: dict[Semantics, dict[str, Any]] = {}
 
 
+def is_pure_step_func(step_func: Callable[..., Any]) -> bool:
+  """Returns True if `step_func` was marked pure via `@psyre_comb`."""
+  return bool(getattr(step_func, '_psyre_pure', False))
+
+
+def is_builtin_scalar_step_func(step_func: Callable[..., Any]) -> bool:
+  """Returns True if `step_func` is guaranteed to return a scalar."""
+  return bool(getattr(step_func, '_psyre_returns_scalar', False))
+
+
+def mark_builtin_scalar_op(wrapper: Any) -> None:
+  """Marks a `@psyre_comb` wrapper's `step_func` as scalar-returning."""
+  step_func = getattr(wrapper, '_psyre_step_func', None)
+  if step_func is not None:
+    setattr(step_func, '_psyre_returns_scalar', True)
+
+
 def is_stateful_step_func(step_func: Callable[..., Any]) -> bool:
-  """Returns True if `step_func` was registered via `@psyre_sequ`."""
-  return step_func in _STATEFUL_STEP_FUNCS
+  """Returns True if `step_func` produces a stateful async generator."""
+  return bool(
+      getattr(step_func, '_psyre_stateful', False)
+      or inspect.isasyncgenfunction(step_func)
+  )
+
+
+def is_step_of(owner: Any, op: str, step_func: Callable[..., Any]) -> bool:
+  """Returns True if `step_func` matches the `@psyre_loop` wrapper `owner.<op>`."""
+  return step_func is getattr(
+      getattr(owner, op, None), '_psyre_step_func', None
+  )
+
+
+def is_builtin_primitive_step(
+    op: str, step_func: Callable[..., Any]
+) -> bool:
+  """Returns True if `step_func` matches a registered builtin primitive `op`."""
+  return any(
+      step_func is getattr(mod.get(op), '_psyre_step_func', None)
+      for mod in primitives_registry.values()
+  )
 
 
 def register_primitives(semantics: Semantics, module: Any) -> None:
@@ -728,41 +990,134 @@ def require_sync_semantics(construct: str = '') -> None:
 
 async def _comb(
     inst_func: Callable[..., Any],
-    o_stream: IStructHandle,
-    *args: IStructHandle,
+    o_stream: _StreamPort,
+    *args: _StreamPort,
     **kwargs: Any,
 ) -> None:
   """Executes a combinational (stateless) step from a pure function."""
-  logger.debug('comb %s, %s, %s', callable_name(inst_func), args, kwargs)
-  i_vals = await pull_all(*args) if args else ()
-  o_val = Absent if Absent in i_vals else inst_func(*i_vals, **kwargs)
+  if logger.level <= _DEBUG and logger.isEnabledFor(_DEBUG):
+    logger.debug(
+        'comb %s, arity=%d, kwargs=%s',
+        callable_name(inst_func),
+        len(args),
+        tuple(kwargs),
+    )
+  # Materialized-template slow path (nested PyTrees / dynamic kwargs /
+  # static_argnums / static_literals): handled once up front before the
+  # arity-specialized flat fast path.
+  if kwargs and (plan := kwargs.get(CALL_PLAN_KWARG)) is not None:
+    i_vals = await pull_all(*args) if args else ()
+    if any(val is Absent for val in i_vals):
+      o_stream.push(Absent)
+      return
+    call_args, call_kwargs = plan.materialize(i_vals)
+    o_val = (
+        inst_func(*call_args, **call_kwargs)
+        if call_kwargs
+        else inst_func(*call_args)
+    )
+  else:
+    # Fast flat-positional path: arities 0, 1, and 2 are unrolled inline to
+    # avoid per-tick coroutine/list/tuple allocation from `pull_all` on hot
+    # scalar/array operators. Under `Semantics.SYNC`, every port is still
+    # pulled before checking `Absent` so port cursors and EOF barriers align.
+    n = len(args)
+    if n == 0:
+      o_val = inst_func(**kwargs) if kwargs else inst_func()
+    elif n == 1:
+      v0 = args[0].try_pull_ready()
+      if v0 is UNREADY:
+        v0 = await _require_scheduler('_comb()').pull(args[0])
+      if v0 is Absent:
+        o_stream.push(Absent)
+        return
+      o_val = inst_func(v0, **kwargs) if kwargs else inst_func(v0)
+    elif n == 2:
+      p0, p1 = args
+      v0 = p0.try_pull_ready()
+      if v0 is UNREADY:
+        v0 = await _require_scheduler('_comb()').pull(p0)
+      v1 = p1.try_pull_ready()
+      if v1 is UNREADY:
+        v1 = await _require_scheduler('_comb()').pull(p1)
+      if v0 is Absent or v1 is Absent:
+        o_stream.push(Absent)
+        return
+      o_val = inst_func(v0, v1, **kwargs) if kwargs else inst_func(v0, v1)
+    else:
+      i_vals = await pull_all(*args)
+      if any(val is Absent for val in i_vals):
+        o_stream.push(Absent)
+        return
+      o_val = inst_func(*i_vals, **kwargs) if kwargs else inst_func(*i_vals)
+  if o_val is Absent:
+    reject_sentinel(
+        o_val, label=f'@psyre_comb {callable_name(inst_func, "<callable>")}'
+    )
   o_stream.push(o_val)
 
 
 async def _sequ(
     inst_func: Callable[..., Any],
-    o_stream: IStructHandle,
-    *args: IStructHandle,
+    o_stream: _StreamPort,
+    *args: _StreamPort,
     **kwargs: Any,
 ) -> AsyncGenerator[None, Any]:
   """Executes a sequential (stateful) generator function across ticks."""
+  # Generator protocol:
+  # - Initial/reset ticks construct `inst_func(*call_args, **call_kwargs)` and
+  #   call `next(gen)`; later ticks call `gen.send(call_args[0])` for 1
+  #   positional arg, `gen.send(call_args)` for 2+ args, or `gen.send(())` for
+  #   0 args (with nested PyTree args reconstructed via `CombCallPlan` when
+  #   active). Static kwargs stay unchanged in the generator frame across ticks.
+  # - Under mandatory `SYNC` clock analysis (`lower_resets`), every subclocked
+  #   inactive tick delivers `start is Absent`, skipping inputs via
+  #   `skip_absent()` and keeping the generator paused (`Scheduler` latches any
+  #   pending reset). On active ticks all inputs are present (`not Absent`).
+  plan = kwargs.get(CALL_PLAN_KWARG) if kwargs else None
   gen = None
-  while True:
-    start = yield
-    logger.debug('sequ %s, %s, %s', callable_name(inst_func), args, kwargs)
-    i_vals = await pull_all(*args) if args else ()
-    if start is Absent:
-      o_stream.push(Absent)
-      continue
-    if gen is None or (start and (not i_vals or i_vals[0] is not Absent)):
-      gen = inst_func(*i_vals, **kwargs)
-      o_val = next(gen)
-    else:
-      o_val = gen.send(i_vals[0] if len(i_vals) == 1 else i_vals)
-    o_stream.push(o_val)
+  try:
+    while True:
+      start = yield
+      if logger.level <= _DEBUG and logger.isEnabledFor(_DEBUG):
+        logger.debug(
+            'sequ %s, arity=%d, kwargs=%s',
+            callable_name(inst_func),
+            len(args),
+            tuple(kwargs),
+        )
+      if start is Absent:
+        for stream in args:
+          stream.skip_absent()
+        o_stream.push(Absent)
+        continue
+      i_vals = await pull_all(*args) if args else ()
+      if plan is not None:
+        call_args, call_kwargs = plan.materialize(i_vals)
+      else:
+        call_args, call_kwargs = i_vals, kwargs
+      if start or gen is None:
+        if gen is not None:
+          gen.close()
+        gen = (
+            inst_func(*call_args, **call_kwargs)
+            if call_kwargs
+            else inst_func(*call_args)
+        )
+        o_val = next(gen)
+      else:
+        o_val = gen.send(call_args[0] if len(call_args) == 1 else call_args)
+      if o_val is Absent:
+        reject_sentinel(
+            o_val, label=f'@psyre_sequ {callable_name(inst_func, "<callable>")}'
+        )
+      o_stream.push(o_val)
+  finally:
+    if gen is not None:
+      gen.close()
 
 
-def _require_builder() -> Any:
+def require_builder() -> Any:
   """Returns the active Stage-1 GraphBuilder or raises RuntimeError."""
   builder = active_builder.get()
   if builder is None:
@@ -770,53 +1125,252 @@ def _require_builder() -> Any:
   return builder
 
 
+def _require_callable_target(target: Any, decorator_name: str) -> None:
+  """Rejects non-callable targets passed to `@psyre_*` decorators."""
+  if not callable(target):
+    raise TypeError(
+        f'{decorator_name} expects a callable target, got '
+        f'{type(target).__name__}.'
+    )
+
+
 def psyre_loop(
     step_func: Callable[..., Any] | None = None,
     *,
     prepare: PrepareFn | None = None,
+    stateful: bool = False,
 ) -> Any:
   """@psyre_loop decorator for nodes."""
 
   def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-      builder = _require_builder()
-      return builder.add_loop_node(fn, *args, _prepare=prepare, **kwargs)
+    _require_callable_target(fn, 'psyre_loop')
+    if stateful:
+      setattr(fn, '_psyre_stateful', True)
 
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+      return require_builder().add_loop_node(
+          fn, *args, _prepare=prepare, **kwargs
+      )
+
+    setattr(wrapper, '_psyre_step_func', fn)
     return wrapper
 
   return decorate if step_func is None else decorate(step_func)
 
 
-def psyre_comb(inst_func: Callable[..., Any]) -> Callable[..., Any]:
-  """@psyre_comb decorator to define a node from a stateless function."""
-
+def make_comb_step_func(
+    inst_func: Callable[..., Any],
+    *,
+    name: str = '',
+    pure: bool = False,
+) -> Callable[..., Any]:
+  """Builds a combinational `step_func` closure wrapping `inst_func`."""
+  # Keep closure freevar named `inst_func` for downstream tooling inspection.
   def step_func(
-      o_stream: IStructHandle, *args: IStructHandle, **kwargs: Any
+      o_stream: _StreamPort, *args: _StreamPort, **kwargs: Any
   ) -> Any:
     return _comb(inst_func, o_stream, *args, **kwargs)
 
-  step_func.__name__ = callable_name(inst_func)
-  wrapper = psyre_loop(step_func)
-  register_inst_func(wrapper, inst_func)
+  step_func.__name__ = name or callable_name(inst_func)
+  if pure:
+    setattr(step_func, '_psyre_pure', True)
+  setattr(step_func, '_psyre_inst_func', inst_func)
+  return step_func
+
+
+def _wrap_partitioned_step(
+    step_func: Callable[..., Any],
+    *,
+    prepare: PrepareFn | None,
+    argnums: frozenset[int],
+    argnames: frozenset[str],
+    static_literals: bool,
+    nout: int | None,
+    decorator_name: str,
+    reject_dynamic_kwargs: bool = False,
+) -> Callable[..., Any]:
+  """Wraps `step_func` with `CombCallPlan` arg partitioning and `nout` unpack."""
+
+  def partitioned_prepare(
+      *args: Any, **kwargs: Any
+  ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    if prepare is not None:
+      args, kwargs = prepare(*args, **kwargs)
+    dyn_inputs, node_kwargs = partition_comb_args(
+        args,
+        kwargs,
+        static_argnums=argnums,
+        static_argnames=argnames,
+        static_literals=static_literals,
+    )
+    if reject_dynamic_kwargs and (
+        (plan := node_kwargs.get(CALL_PLAN_KWARG)) is not None
+    ):
+      for key, tmpl in plan.kwargs_template:
+        if isinstance(tmpl, PlanNode):
+          raise TypeError(
+              f'@{decorator_name} does not support dynamic Stream/thunk '
+              f'values in keyword argument {key!r} (generator.send() only '
+              'accepts positional values); pass dynamic streams positionally '
+              'or normalize them with prepare=.'
+          )
+    return dyn_inputs, node_kwargs
+
+  base = psyre_loop(step_func, prepare=partitioned_prepare)
+  if nout is None:
+    return base
+
+  def wrapper(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+    if 'o_stream' in kwargs and kwargs['o_stream'] is not None:
+      raise ValueError(
+          f'o_stream= is not supported on multi-output '
+          f'@{decorator_name}(nout=...).'
+      )
+    raw_out = base(*args, **kwargs)
+    return tuple(raw_out[i] for i in range(nout))
+
+  setattr(wrapper, '_psyre_step_func', step_func)
   return wrapper
+
+
+def psyre_comb(
+    func: Callable[..., Any] | None = None,
+    *,
+    prepare: PrepareFn | None = None,
+    pure: bool = False,
+    nout: int | None = None,
+    static_argnums: int | Iterable[int] = (),
+    static_argnames: str | Iterable[str] = (),
+    static_literals: bool = False,
+) -> Any:
+  """`@psyre_comb` decorator defining a stateless node from a pure function.
+
+  Supports both bare `@psyre_comb` and parameterized
+  `@psyre_comb(pure=True, nout=..., static_argnums=..., ...)` usage. Dynamic
+  `Stream` and Stage-1 thunk leaves passed via keyword arguments or nested
+  inside PyTrees (`tuple`, `NamedTuple`, `list`, `dict`/`Mapping`, `slice`,
+  and types registered via `register_pytree_node`) are automatically extracted
+  into the node's `inputs` and reconstructed at each Stage-2 tick.
+
+  Args:
+    func: Instantaneous callable to wrap (omitted when called with keyword
+      options as a decorator factory).
+    prepare: Optional Stage-1 argument normalizer `(args, kwargs) -> (args,
+      kwargs)` run before dynamic-vs.-static partitioning.
+    pure: When True, marks the node as referentially transparent so
+      `optimize_graph` may apply clock-preserving CSE across identical inputs
+      and static `kwargs`. Defaults to `False` (safe for impure functions such
+      as `random_stream`).
+    nout: Optional positive integer output arity. When set, calling the wrapped
+      function unpacks its tuple-valued output stream into an `nout`-tuple of
+      projected `Stream`s via pointwise indexing (`raw[0], ..., raw[nout - 1]`).
+    static_argnums: Positional argument index or iterable of non-negative
+      indices kept verbatim as static per-tick arguments (never converted to
+      `Stream`s or rejected for being callable).
+    static_argnames: Keyword argument name or iterable of names kept verbatim
+      as static per-tick arguments.
+    static_literals: When True, positional arguments containing no `Stream` or
+      Stage-1 thunk stay verbatim inside the static call template instead of
+      being promoted to constant/periodic `Stream`s via `resolve_stream`.
+
+  Returns:
+    A wrapped callable (or decorator) that emits a Stage-1 `Node` and returns a
+    `Stream` (or an `nout`-tuple of `Stream`s when `nout` is specified).
+  """
+  if nout is not None:
+    validate_positive_int(nout, 'psyre_comb nout')
+  argnums = normalize_static_argnums(static_argnums)
+  argnames = normalize_static_argnames(static_argnames)
+
+  def decorate(inst_func: Callable[..., Any]) -> Callable[..., Any]:
+    _require_callable_target(inst_func, 'psyre_comb')
+    step_func = make_comb_step_func(inst_func, pure=pure)
+    wrapper = _wrap_partitioned_step(
+        step_func,
+        prepare=prepare,
+        argnums=argnums,
+        argnames=argnames,
+        static_literals=static_literals,
+        nout=nout,
+        decorator_name='psyre_comb',
+    )
+    if pure:
+      setattr(wrapper, '_psyre_pure', True)
+    setattr(wrapper, '_psyre_inst_func', inst_func)
+    return wrapper
+
+  return decorate if func is None else decorate(func)
 
 
 def psyre_sequ(
     inst_func: Callable[..., Any] | None = None,
     *,
     prepare: PrepareFn | None = None,
+    nout: int | None = None,
+    static_argnums: int | Iterable[int] = (),
+    static_argnames: str | Iterable[str] = (),
+    static_literals: bool = False,
 ) -> Any:
-  """@psyre_sequ decorator to define a node from a stateful function."""
+  """`@psyre_sequ` decorator defining a stateful node from a generator function.
+
+  Supports both bare `@psyre_sequ` and parameterized
+  `@psyre_sequ(nout=..., static_argnums=..., ...)` usage. Dynamic `Stream` and
+  Stage-1 thunk leaves nested inside positional PyTree arguments (`tuple`,
+  `NamedTuple`, `list`, `dict`/`Mapping`, `slice`, and types registered via
+  `register_pytree_node`) are extracted into the node's `inputs` and
+  reconstructed on each tick (passed to `fn(*args, **kwargs)` on start/reset
+  and delivered via `gen.send(arg)` or `gen.send(args)` on later ticks).
+
+  Because Python's `generator.send()` carries a single positional value rather
+  than keyword arguments, dynamic `Stream`/thunk leaves inside keyword arguments
+  are rejected with `TypeError` unless converted to positional slots via
+  `prepare=` or kept verbatim via `static_argnames=`.
+
+  Args:
+    inst_func: Generator callable to wrap (omitted when called with keyword
+      options as a decorator factory).
+    prepare: Optional Stage-1 argument normalizer `(args, kwargs) -> (args,
+      kwargs)` run before dynamic-vs.-static partitioning.
+    nout: Optional positive integer output arity unpacking tuple-valued outputs
+      into an `nout`-tuple of `Stream`s via pointwise indexing.
+    static_argnums: Positional argument index or iterable of non-negative
+      indices kept verbatim as static per-tick arguments.
+    static_argnames: Keyword argument name or iterable of names kept verbatim
+      as static per-tick arguments (passed when instantiating the generator).
+    static_literals: When True, positional arguments containing no `Stream` or
+      Stage-1 thunk stay verbatim inside the static call template instead of
+      being promoted to constant/periodic `Stream`s via `resolve_stream`.
+
+  Returns:
+    A wrapped callable (or decorator) emitting a stateful Stage-1 `Node` and
+    returning a `Stream` (or an `nout`-tuple of `Stream`s when `nout` is set).
+  """
+  if nout is not None:
+    validate_positive_int(nout, 'psyre_sequ nout')
+  argnums = normalize_static_argnums(static_argnums)
+  argnames = normalize_static_argnames(static_argnames)
 
   def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+    _require_callable_target(fn, 'psyre_sequ')
+
     def step_func(
-        o_stream: IStructHandle, *args: IStructHandle, **kwargs: Any
+        o_stream: _StreamPort, *args: _StreamPort, **kwargs: Any
     ) -> Any:
       return _sequ(fn, o_stream, *args, **kwargs)
 
     step_func.__name__ = callable_name(fn)
-    _STATEFUL_STEP_FUNCS.add(step_func)
-    return psyre_loop(step_func, prepare=prepare)
+    setattr(step_func, '_psyre_stateful', True)
+    setattr(step_func, '_psyre_is_sequ', True)
+    return _wrap_partitioned_step(
+        step_func,
+        prepare=prepare,
+        argnums=argnums,
+        argnames=argnames,
+        static_literals=static_literals,
+        nout=nout,
+        decorator_name='psyre_sequ',
+        reject_dynamic_kwargs=True,
+    )
 
   return decorate if inst_func is None else decorate(inst_func)
 
@@ -829,7 +1383,7 @@ def psyre_node(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
   def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-      _require_builder()
+      require_builder()
       scope_name = kwargs.pop('name', name)
       if not isinstance(scope_name, str) or not scope_name:
         raise TypeError('psyre_node name must be a non-empty str.')
@@ -841,37 +1395,135 @@ def psyre_node(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
   return decorator
 
 
-def make_primitive(name: str) -> Callable[..., Any]:
+def make_primitive(name: str, *, doc: str = '') -> Callable[..., Any]:
   """Creates a Stage-1 primitive dispatcher for `name`."""
 
   def dispatch(*args, **kwargs) -> Any:
-    builder = _require_builder()
-    sem = builder.semantics or Semantics.SYNC
+    sem = require_builder().semantics or Semantics.SYNC
     prim = primitives_registry.get(sem, {}).get(name)
     if prim is None:
-      if name in primitives_registry.get(Semantics.SYNC, {}):
-        require_sync_semantics(name)
       raise RuntimeError(
           f'{name} is not supported under {sem.name} semantics.'
       )
     return prim(*args, **kwargs)
 
   dispatch.__name__ = name
+  if doc:
+    dispatch.__doc__ = doc
   return dispatch
 
 
-buffer = make_primitive('buffer')
-counter = make_primitive('counter')
-current = make_primitive('current')
-delay = make_primitive('delay')
-fby = make_primitive('fby')
-ifthenelse = make_primitive('ifthenelse')
-merge = make_primitive('merge')
-morph = make_primitive('morph')
-post = make_primitive('post')
-pre = make_primitive('pre')
-prefix_sum = make_primitive('prefix_sum')
-scan = make_primitive('scan')
-switch = make_primitive('switch')
-when = make_primitive('when')
-whennot = make_primitive('whennot')
+buffer = make_primitive(
+    'buffer',
+    doc=(
+        'Bounded FIFO buffer `buffer(i, pull_p, push_p, size=1)` with '
+        'pull-before-push ordering; raises `BufferError` on '
+        'overflow/underflow.'
+    ),
+)
+counter = make_primitive(
+    'counter',
+    doc=(
+        'Resettable integer counter `counter(start=0, max_val=None, '
+        'tick=True)` incrementing on ticks where `tick` is truthy.'
+    ),
+)
+current = make_primitive(
+    'current',
+    doc=(
+        'Sample-and-hold latch `current(b, i, default=None)` projecting a '
+        "subclocked or equal-clock stream `i` onto `b`'s clock."
+    ),
+)
+fby = make_primitive(
+    'fby',
+    doc=(
+        'Followed-by delay `fby(init, x, n=1)`: emits `init` for `n` active '
+        'ticks after start/reset, then `x` delayed by `n` ticks.'
+    ),
+)
+ifthenelse = make_primitive(
+    'ifthenelse',
+    doc=(
+        'Pointwise strictly scalar multiplexer `ifthenelse(c, t, f)` '
+        'evaluating `t if c else f` (use `np.where`/`jnp.where` for arrays).'
+    ),
+)
+merge = make_primitive(
+    'merge',
+    doc=(
+        'Combines complementary subclocked streams `merge(c, t, f)` or '
+        '`merge(sel, {tag: arm, ...}, default=...)` without dropping tokens.'
+    ),
+)
+morph = make_primitive(
+    'morph',
+    doc=(
+        'Initialization operator `morph(i, j, n=1)` (Lustre `->`): emits the '
+        'first `n` active ticks of `i` after start/reset, then `j`.'
+    ),
+)
+post = make_primitive(
+    'post',
+    doc=(
+        'Lookahead operator `post(i, n=1)`: drops `n` active ticks and emits '
+        'future values `i[t + n]` (Potop-Butucaru et al., arXiv:2311.16977).'
+    ),
+)
+pre = make_primitive(
+    'pre',
+    doc=(
+        'Unit delay `pre(x, n=1)` initialized to `None` for the first `n` '
+        'active ticks after start/reset.'
+    ),
+)
+prefix_sum = make_primitive(
+    'prefix_sum',
+    doc=(
+        'Resettable cumulative sum `prefix_sum(data, start=0)` accumulating '
+        'elements of `data` starting from `start`.'
+    ),
+)
+scan = make_primitive(
+    'scan',
+    doc=(
+        'Cumulative binary fold `scan(data, op=operator.add)` initialized '
+        'with the first element of `data`.'
+    ),
+)
+switch = make_primitive(
+    'switch',
+    doc=(
+        'Same-clock selector `switch(c, t, f)` or '
+        '`switch(sel, {tag: arm, ...}, default=...)` pulling all arms.'
+    ),
+)
+when = make_primitive(
+    'when',
+    doc=(
+        'Downsamples `when(c, i, *, values=..., negated=False)` keeping '
+        'active ticks where `c` is truthy (or matches `values`).'
+    ),
+)
+whennot = make_primitive(
+    'whennot',
+    doc='Downsamples `whennot(c, i)` keeping active ticks where `c` is falsy.',
+)
+
+
+def emit_when(
+    sel: Any,
+    val: Any,
+    selector: WhenSelector | None = None,
+    *,
+    name: str = '',
+) -> Any:
+  """Emits a `when` or `whennot` node matching `selector` (boolean or tagged)."""
+  kwargs = {'name': name} if name else {}
+  if selector is None:
+    return when(sel, val, **kwargs)
+  if selector.is_boolean:
+    if selector.negated:
+      return whennot(sel, val, **kwargs)
+    return when(sel, val, **kwargs)
+  return when(sel, val, selector=selector, **kwargs)

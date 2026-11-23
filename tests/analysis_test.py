@@ -35,18 +35,14 @@ from psyre.common import (
     Semantics,
     buffer,
     counter,
-    current,
     fby,
     ifthenelse,
     logger,
     merge,
-    morph,
     post,
     pre,
-    prefix_sum,
     psyre_comb,
     reset,
-    scan,
 )
 from psyre.graph import Graph
 from psyre.match import (
@@ -110,13 +106,6 @@ class AnalysisTest(absltest.TestCase):
 
     def prog():
       inp = Stream([1, 2, 3, 4])
-      _ = (
-          pre(inp),
-          prefix_sum(inp),
-          morph(10, inp),
-          current(Stream([True, False, True, False]), inp, default=0),
-          scan(inp),
-      )
       cnt = counter(start=1)
       rec_pre = ifthenelse(fby(True, False), 10, pre(lambda: rec_pre))  # pylint: disable=undefined-variable
       a, b = pair_box(inp, lambda: a)  # pylint: disable=undefined-variable
@@ -180,43 +169,38 @@ class AnalysisTest(absltest.TestCase):
       x = merge(cond, lambda: x + 1, 0)  # pylint: disable=undefined-variable
       return x
 
-    merge_graph = build_graph(
-        merge_arm_cycle, semantics=Semantics.SYNC
-    )
-    with self.assertRaises(CausalityError) as merge_err:
-      check_causality(merge_graph)
-    _assert_valid_instantaneous_cycle(
-        self, merge_graph, merge_err.exception.cycle
-    )
+    self._assert_cycle(merge_arm_cycle)
+
+  def _assert_cycle(
+      self,
+      prog,
+      *,
+      regex: str | None = None,
+      semantics: Semantics = Semantics.SYNC,
+  ):
+    graph = build_graph(prog, semantics=semantics)
+    if regex is not None:
+      with self.assertRaisesRegex(CausalityError, regex) as err:
+        check_causality(graph)
+    else:
+      with self.assertRaises(CausalityError) as err:
+        check_causality(graph)
+    _assert_valid_instantaneous_cycle(self, graph, err.exception.cycle)
+    return err.exception.cycle
 
   def test_fby_initial_and_control_stream_cycles(self):
     def fby_init_cycle():
       x = fby(lambda: x + 1, 0)  # pylint: disable=undefined-variable
       return x
 
-    init_graph = build_graph(fby_init_cycle, semantics=Semantics.SYNC)
-    with self.assertRaisesRegex(CausalityError, r'fby#0 -> __add__#1 -> fby#0'):
-      check_causality(init_graph)
-
     def fby_both_ports_self_cycle():
       y = fby(lambda: y, lambda: y)  # pylint: disable=undefined-variable
       return y
-
-    both_graph = build_graph(
-        fby_both_ports_self_cycle, semantics=Semantics.SYNC
-    )
-    with self.assertRaisesRegex(CausalityError, r'fby#0 -> fby#0'):
-      check_causality(both_graph)
 
     def fby_reset_cycle():
       with reset(lambda: y > 0):  # pylint: disable=undefined-variable
         y = fby(0, 1, name='y')
       return y
-
-    rst_graph = build_graph(fby_reset_cycle, semantics=Semantics.SYNC)
-    with self.assertRaises(CausalityError) as rst_err:
-      check_causality(rst_graph)
-    _assert_valid_instantaneous_cycle(self, rst_graph, rst_err.exception.cycle)
 
     def fby_match_activity_cycle():
       with match(lambda: m.out > 0) as m:
@@ -227,12 +211,10 @@ class AnalysisTest(absltest.TestCase):
           m.out = 0
       return m.out
 
-    act_graph = build_graph(
-        fby_match_activity_cycle, semantics=Semantics.SYNC
-    )
-    with self.assertRaises(CausalityError) as act_err:
-      check_causality(act_graph)
-    _assert_valid_instantaneous_cycle(self, act_graph, act_err.exception.cycle)
+    self._assert_cycle(fby_init_cycle, regex=r'fby#0 -> __add__#1 -> fby#0')
+    self._assert_cycle(fby_both_ports_self_cycle, regex=r'fby#0 -> fby#0')
+    self._assert_cycle(fby_reset_cycle)
+    self._assert_cycle(fby_match_activity_cycle)
 
   def test_automaton_buffer_and_post_instantaneous_cycles(self):
     def stateless_match_selector_cycle():
@@ -241,18 +223,10 @@ class AnalysisTest(absltest.TestCase):
           m.out = False
         with case(False):
           m.out = True
-
       return m.out
 
     for sem in (Semantics.SYNC, Semantics.KAHN):
-      match_graph = build_graph(
-          stateless_match_selector_cycle, semantics=sem
-      )
-      with self.assertRaises(CausalityError) as match_err:
-        check_causality(match_graph)
-      _assert_valid_instantaneous_cycle(
-          self, match_graph, match_err.exception.cycle
-      )
+      self._assert_cycle(stateless_match_selector_cycle, semantics=sem)
 
     def strong_unless_output_cycle():
       with automaton() as fsm:
@@ -260,17 +234,7 @@ class AnalysisTest(absltest.TestCase):
           fsm.out = True
         with state(True):
           fsm.out = False
-
       return fsm.out
-
-    unless_graph = build_graph(
-        strong_unless_output_cycle, semantics=Semantics.SYNC
-    )
-    with self.assertRaises(CausalityError) as unless_err:
-      check_causality(unless_graph)
-    _assert_valid_instantaneous_cycle(
-        self, unless_graph, unless_err.exception.cycle
-    )
 
     def intra_state_combinational_cycle():
       with automaton() as fsm:
@@ -279,28 +243,18 @@ class AnalysisTest(absltest.TestCase):
           fsm.out = v + 1
       return fsm.out
 
-    intra_g = build_graph(
-        intra_state_combinational_cycle, semantics=Semantics.SYNC
-    )
-    with self.assertRaises(CausalityError) as intra_err:
-      check_causality(intra_g)
-    _assert_valid_instantaneous_cycle(self, intra_g, intra_err.exception.cycle)
-
     def buffer_cycle():
       b = buffer(lambda: b, True, True)  # pylint: disable=undefined-variable
       return b
-
-    buf_graph = build_graph(buffer_cycle, semantics=Semantics.SYNC)
-    with self.assertRaisesRegex(CausalityError, r'buffer#0 -> buffer#0'):
-      check_causality(buf_graph)
 
     def post_cycle():
       p = post(lambda: p)  # pylint: disable=undefined-variable
       return p
 
-    post_graph = build_graph(post_cycle, semantics=Semantics.SYNC)
-    with self.assertRaisesRegex(CausalityError, r'post#0 -> post#0'):
-      check_causality(post_graph)
+    self._assert_cycle(strong_unless_output_cycle)
+    self._assert_cycle(intra_state_combinational_cycle)
+    self._assert_cycle(buffer_cycle, regex=r'buffer#0 -> buffer#0')
+    self._assert_cycle(post_cycle, regex=r'post#0 -> post#0')
 
   def test_overlapping_cycles_and_check_causality_controls(self):
     with self.assertRaisesRegex(ValueError, 'non-empty'):
@@ -315,11 +269,7 @@ class AnalysisTest(absltest.TestCase):
       mid = a + 1
       return mid * 2
 
-    graph = build_graph(mixed_network, semantics=Semantics.SYNC)
-    with self.assertRaises(CausalityError) as err:
-      check_causality(graph)
-    _assert_valid_instantaneous_cycle(self, graph, err.exception.cycle)
-    cycle_ops = [n.op for n in err.exception.cycle]
+    cycle_ops = [n.op for n in self._assert_cycle(mixed_network)]
     self.assertNotIn('fby', cycle_ops)
 
     def cyclic_sync_or_kahn():

@@ -11,21 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Synchronous (Lustre-style) length-preserving Psyre node primitives."""
+"""Synchronous (Lustre-style) length-preserving Psyre node primitives.
 
+Implements base operators from Lustre (`when`, `current`, `pre`, `fby`,
+`morph`; Halbwachs et al., *Proc. IEEE* 1991), Lucid Synchrone / modular reset
+(`merge`, tagged `when`, reset hooks; Caspi & Pouzet, *ICFP* 1996; Hamon &
+Pouzet, *PPDP* 2000), and bounded reverse-time lookahead (`post`, `buffer`;
+Potop-Butucaru, Cohen, Plotkin & Pompougnac, 2023, arXiv:2311.16977).
+"""
+
+import collections
 from collections.abc import AsyncGenerator
-import random
 import sys
 from typing import Any
 
 # pylint: disable=g-importing-member,g-multiple-import
 from psyre.common import (
     Absent,
+    Bottom,
     RingBuffer,
     Semantics,
+    UNSET,
+    prepare_buffer,
     prepare_counter,
     prepare_current,
-    prepare_delay,
     prepare_fby,
     prepare_merge,
     prepare_morph,
@@ -42,33 +51,19 @@ from psyre.common import (
     pull_all,
     register_primitives,
 )
-from psyre.stream import Stream
+from psyre.stream import StreamPort
 
 # pylint: enable=g-importing-member,g-multiple-import
 
 
-@psyre_comb
-def random_stream():
-  """Returns a random float in [0.0, 1.0) at each stream step."""
-  return random.random()
-
-
-@psyre_sequ
-def once_stream(k):
-  """Returns a resettable stream with a single True value at position k."""
-  idx = 0
-  while True:
-    if k is Absent:
-      out = Absent
-    else:
-      out = idx == k
-      idx += 1
-    k = yield out
-
-
-@psyre_comb
+@psyre_comb(pure=True)
 def ifthenelse(c, t, f):
-  """Length-preserving multiplexer."""
+  """Length-preserving strictly scalar multiplexer (`t if c else f`).
+
+  Evaluates `c` as a Python scalar truth value. For elementwise selection over
+  NumPy or JAX boolean arrays, use `np.where`, `jnp.where`, or `jax.lax.select`
+  instead.
+  """
   return t if c else f
 
 
@@ -76,25 +71,28 @@ def ifthenelse(c, t, f):
 async def when(o_stream, c_stream, i_stream, *, selector=None):
   """Downsamples an input stream, emitting Absent when condition fails."""
   cond = await pull(c_stream)
-  active = cond is not Absent and (
-      bool(cond) if selector is None else selector(cond)
-  )
-  if active:
+  if cond is Absent:
+    o_stream.push(Absent)
+    i_stream.skip_absent()
+  elif bool(cond) if selector is None else selector(cond):
     o_stream.push(await pull(i_stream))
   else:
     o_stream.push(Absent)
-    await pull(i_stream)
+    i_stream.skip()
 
 
 @psyre_loop
 async def whennot(o_stream, c_stream, i_stream):
   """Downsamples an input stream, emitting Absent when condition is true."""
   cond = await pull(c_stream)
-  if cond is not Absent and not cond:
+  if cond is Absent:
+    o_stream.push(Absent)
+    i_stream.skip_absent()
+  elif not cond:
     o_stream.push(await pull(i_stream))
   else:
     o_stream.push(Absent)
-    await pull(i_stream)
+    i_stream.skip()
 
 
 @psyre_loop(prepare=prepare_merge)
@@ -107,67 +105,58 @@ async def merge(o_stream, s_stream, *arm_streams, lookup):
   )
   for idx, arm_stream in enumerate(arm_streams):
     if idx != sel:
-      await pull(arm_stream)
+      arm_stream.skip_absent()
 
 
 @psyre_loop(prepare=prepare_switch)
 async def switch(o_stream, s_stream, *arm_streams, lookup):
   """Selects among same-clock synchronous streams using a selector stream."""
   vals = await pull_all(s_stream, *arm_streams)
-  o_stream.push(Absent if Absent in vals else vals[1 + lookup(vals[0])])
+  o_stream.push(
+      Absent
+      if any(val is Absent for val in vals)
+      else vals[1 + lookup(vals[0])]
+  )
 
 
-@psyre_loop
-async def buffer(o_stream, i_stream, i_p_stream, o_p_stream, size=1):
-  """Length-preserving buffer node emitting Absent when not pushing."""
+@psyre_loop(prepare=prepare_buffer)
+async def buffer(o_stream, i_stream, i_p_stream, o_p_stream, *, size=1):
+  """Length-preserving bounded FIFO buffer emitting `Absent` when not pushing.
+
+  Executes `pull` before `push` on each active tick, backed by `RingBuffer`
+  with empty slots initialized/cleared to `Bottom`. Raises `BufferError` on
+  overflow (pull into an occupied slot) or underflow (push from an empty slot).
+  """
   buf = RingBuffer(size)
   while True:
     start = yield
-    i_val, pull_p, push_p = await pull_all(
-        i_stream, i_p_stream, o_p_stream
-    )
     if start is Absent:
+      i_stream.skip_absent()
+      i_p_stream.skip_absent()
+      o_p_stream.skip_absent()
       o_stream.push(Absent)
       continue
+    pull_p, push_p = await pull_all(i_p_stream, o_p_stream)
     if start:
       buf = RingBuffer(size)
     if pull_p:
-      buf.pull(i_val)
+      buf.pull(await pull(i_stream))
+    else:
+      i_stream.skip_absent()
     o_stream.push(buf.push() if push_p else Absent)
 
 
-@psyre_loop(prepare=prepare_delay)
-async def delay(o_stream, i_stream, *, p_stream, size: int):
-  """Delays i_stream by k local ticks or along a static periodic schedule."""
-  p_handle = Stream(p_stream)
-  buf = RingBuffer(size)
-  while True:
-    start = yield
-    if start is Absent:
-      await pull(i_stream)
-      o_stream.push(Absent)
-      continue
-    if start:
-      p_handle.index = 0
-      buf = RingBuffer(size)
-    i_val = await pull(i_stream)
-    if i_val is not Absent:
-      buf.pull(i_val)
-    o_stream.push(buf.push() if await pull(p_handle) else Absent)
-
-
 async def fby_step_1(
-    o_stream: Stream,
-    i_stream: Stream | None,
-    j_stream: Stream,
+    o_stream: StreamPort,
+    i_stream: StreamPort | None,
+    j_stream: StreamPort,
 ) -> AsyncGenerator[None, Any]:
   """Delays `j_stream` by 1 active tick, initialized from `i_stream`.
 
-  When the start/reset signal is `Absent`, pulls `i_stream` (if present),
-  pushes `Absent` to `o_stream`, and pulls `j_stream` without updating state.
-  Otherwise, loads a non-`Absent` `i_stream` value (or `None` for `pre`) on
-  start/reset, pushes the held state to `o_stream`, and updates state from any
-  non-`Absent` value pulled from `j_stream`.
+  When the start/reset signal is `Absent`, skips `i_stream` (if present),
+  pushes `Absent` to `o_stream`, and skips `j_stream` without updating state.
+  Otherwise, loads `i_stream` (or `None` for `pre`) on start/reset, pushes the
+  held state to `o_stream`, and updates state from `j_stream`.
 
   Args:
     o_stream: Output stream receiving the delayed values (or `Absent`).
@@ -177,26 +166,27 @@ async def fby_step_1(
   Yields:
     None at each tick while receiving the start/reset flag (`bool` or `Absent`).
   """
-  state: Any = Absent
+  state: Any = Bottom
   while True:
     start = yield
-    init_val = None if i_stream is None else await pull(i_stream)
     if start is Absent:
+      if i_stream is not None:
+        i_stream.skip_absent()
       o_stream.push(Absent)
-      await pull(j_stream)
+      j_stream.skip_absent()
       continue
-    if start and init_val is not Absent:
-      state = init_val
+    if start:
+      state = None if i_stream is None else await pull(i_stream)
+    elif i_stream is not None:
+      i_stream.skip()
     o_stream.push(state)
-    in_val = await pull(j_stream)
-    if in_val is not Absent:
-      state = in_val
+    state = await pull(j_stream)
 
 
 async def fby_step(
-    o_stream: Stream,
-    i_stream: Stream | None,
-    j_stream: Stream,
+    o_stream: StreamPort,
+    i_stream: StreamPort | None,
+    j_stream: StreamPort,
     *,
     n: int = 1,
 ) -> AsyncGenerator[None, Any]:
@@ -216,87 +206,56 @@ async def fby_step(
   Yields:
     None at each tick while receiving the start/reset flag (`bool` or `Absent`).
   """
-  stages: list[Any] = [Absent] * n
-  pending: list[tuple[Any, Any]] = []
+  # O(1)-per-tick equivalent of `n` chained `fby_step_1` stages:
+  # - `j_ticks`: interlock queue (True = active tick, False = deferred `Absent`
+  #   tick) so `j_stream.skip_absent()` stays behind the `n - 1` active-tick
+  #   lag and never overtakes buffered active slots.
+  # - `active_lag`: count of `True` entries currently queued in `j_ticks`.
+  # - `init_held`/`rem`: active reset fill counter emitting `init_held` for `n`
+  #   active ticks after start or any reset before releasing `state`.
+  # - `state`: tail register emitted once `rem == 0`.
+  j_ticks: collections.deque[bool] = collections.deque()
+  active_lag = 0
+  init_held: Any = Bottom
+  state: Any = Bottom
+  rem = 0
 
-  def emit(m: int, s_m: Any, i_m: Any) -> Any:
-    if s_m is Absent:
-      return Absent
-    if s_m and i_m is not Absent:
-      stages[m] = i_m
-    return stages[m]
-
-  def update(m: int, s_m: Any, val: Any) -> None:
-    if s_m is not Absent and val is not Absent:
-      stages[m] = val
-
-  while True:
-    start = yield
-    init_val = None if i_stream is None else await pull(i_stream)
-    if start is Absent and not pending:
-      o_stream.push(Absent)
-      await pull(j_stream)
-      continue
-    pending.append((start, init_val))
-    if len(pending) < n:
-      prev: Any = Absent
-      for m in range(len(pending) - 1, n):
-        out = emit(m, start, init_val)
-        update(m, start, prev)
-        prev = out
-      o_stream.push(prev)
-    else:
-      o_stream.push(emit(n - 1, start, init_val))
-      in_val = await pull(j_stream)
-      s_0, _ = pending.pop(0)
-      update(0, s_0, in_val)
-      for m, (s_m, i_m) in enumerate(pending):
-        update(m + 1, s_m, emit(m, s_m, i_m))
-
-
-async def morph_step(
-    o_stream: Stream,
-    i_stream: Stream,
-    j_stream: Stream,
-    *,
-    n: int = 1,
-) -> AsyncGenerator[None, Any]:
-  """Emits `i_stream` for `n` active ticks after start/reset, then `j_stream`.
-
-  On each tick, pulls one value from both `i_stream` and `j_stream`. When the
-  received reset/start signal is `Absent`, pushes `Absent` to `o_stream`
-  without advancing the `n`-tick counter. Otherwise, pushes `i_stream` (pulled
-  first) for the first `n` active ticks after start or any reset, and
-  `j_stream` (pulled first) thereafter.
-
-  Args:
-    o_stream: Output stream receiving the selected values (or `Absent`).
-    i_stream: Prefix stream emitted for `n` active ticks after start or reset.
-    j_stream: Suffix stream emitted on subsequent active ticks.
-    n: Number of active ticks to emit from `i_stream` after start or reset.
-
-  Yields:
-    None at each tick while receiving the start/reset flag (`bool` or `Absent`).
-  """
-  rem = n
   while True:
     start = yield
     if start is Absent:
+      if i_stream is not None:
+        i_stream.skip_absent()
       o_stream.push(Absent)
-      await pull_all(i_stream, j_stream)
+      if active_lag:
+        # Defer the `Absent` skip until buffered active ticks drain past `j`.
+        j_ticks.append(False)
+      else:
+        j_stream.skip_absent()
       continue
     if start:
+      init_held = None if i_stream is None else await pull(i_stream)
       rem = n
+    elif i_stream is not None:
+      i_stream.skip()
     if rem > 0:
       rem -= 1
-      o_stream.push(await pull(i_stream))
-      await pull(j_stream)
+      o_stream.push(init_held)
     else:
-      o_stream.push(await pull(j_stream))
-      await pull(i_stream)
+      o_stream.push(state)
+    j_ticks.append(True)
+    active_lag += 1
+    if active_lag == n:
+      # Lag of `n - 1` active ticks is full: advance `state` by one `j` tick
+      # and drain any contiguous deferred `Absent` ticks immediately behind it.
+      j_ticks.popleft()
+      active_lag -= 1
+      state = await pull(j_stream)
+      while j_ticks and not j_ticks[0]:
+        j_ticks.popleft()
+        j_stream.skip_absent()
 
 
-@psyre_loop(prepare=prepare_fby)
+@psyre_loop(prepare=prepare_fby, stateful=True)
 def fby(o_stream, i_stream, j_stream, *, n: int = 1):
   """Followed-by delay node equivalent to n chained `fby` stages."""
   if n == 1:
@@ -304,7 +263,7 @@ def fby(o_stream, i_stream, j_stream, *, n: int = 1):
   return fby_step(o_stream, i_stream, j_stream, n=n)
 
 
-@psyre_loop(prepare=prepare_pre)
+@psyre_loop(prepare=prepare_pre, stateful=True)
 def pre(o_stream, i_stream, *, n: int = 1):
   """Stateful delay node equivalent to n chained `pre` stages."""
   if n == 1:
@@ -313,52 +272,81 @@ def pre(o_stream, i_stream, *, n: int = 1):
 
 
 @psyre_loop(prepare=prepare_morph)
-def morph(o_stream, i_stream, j_stream, *, n: int = 1):
-  """Initialization operator emitting the first n values of i_stream then j_stream."""
-  return morph_step(o_stream, i_stream, j_stream, n=n)
+async def morph(
+    o_stream: StreamPort,
+    i_stream: StreamPort,
+    j_stream: StreamPort,
+    *,
+    n: int = 1,
+) -> AsyncGenerator[None, Any]:
+  """Emits `i_stream` for `n` active ticks after start/reset, then `j_stream`."""
+  rem = n
+  while True:
+    start = yield
+    if start is Absent:
+      o_stream.push(Absent)
+      i_stream.skip_absent()
+      j_stream.skip_absent()
+      continue
+    if start:
+      rem = n
+    if rem > 0:
+      rem -= 1
+      o_stream.push(await pull(i_stream))
+      j_stream.skip()
+    else:
+      o_stream.push(await pull(j_stream))
+      i_stream.skip()
 
 
 @psyre_loop(prepare=prepare_current)
 async def current(o_stream, b_stream, i_stream, default_stream):
-  """Holds the most recent value of stream i_stream downsampled by b_stream."""
-  memory = Absent
+  """Sample-and-hold latch projecting `i_stream` onto `b_stream`'s clock.
+
+  Enforced statically by mandatory `psyre.clock.check_clocks`:
+  `clk(b_stream) == clk(default_stream) == clk(o_stream)` and
+  `clk(b_stream).is_prefix_of(clk(i_stream))`.
+  """
+  memory: Any = Bottom
   while True:
     start = yield
-    b_val, init = await pull_all(b_stream, default_stream)
     if start is Absent:
+      b_stream.skip_absent()
+      i_stream.skip_absent()
+      default_stream.skip_absent()
       o_stream.push(Absent)
-      await pull(i_stream)
       continue
-    if start and init is not Absent:
-      memory = init
-    if b_val is Absent:
-      o_stream.push(Absent)
-      await pull(i_stream)
-    elif b_val:
+    b_val = await pull(b_stream)
+    if start:
+      memory = await pull(default_stream)
+    else:
+      default_stream.skip()
+    if b_val:
       i_val = await pull(i_stream)
       if i_val is not Absent:
         memory = i_val
-      o_stream.push(i_val)
+      o_stream.push(memory)
     else:
       o_stream.push(memory)
-      await pull(i_stream)
+      i_stream.skip()
 
 
 @psyre_sequ(prepare=prepare_counter)
-def counter(init_val, max_val=None):
-  """Resettable incrementing integer stream starting from init_val."""
+def counter(init_val, tick_val=True, max_val=UNSET):
+  """Resettable integer counter enabled by `tick_val` from `init_val`."""
+  has_max = max_val is not UNSET
   cur = init_val
   while True:
-    if cur is Absent or max_val is Absent:
-      out = Absent
-    else:
-      if max_val is not None:
-        cur = min(cur, max_val)
-      out = cur
-      cur += 1
+    if has_max and max_val is not None:
+      cur = min(cur, max_val)
+    out = cur
+    if tick_val:
+      cur = cur + 1
     sent = yield out
-    if max_val is not None:
-      _, max_val = sent
+    if has_max:
+      _, tick_val, max_val = sent
+    else:
+      _, tick_val = sent
 
 
 @psyre_sequ(prepare=prepare_prefix_sum)
@@ -366,48 +354,37 @@ def prefix_sum(data_val, init_val):
   """Resettable running sum of an input stream starting from init_val."""
   acc = init_val
   while True:
-    if acc is Absent or data_val is Absent:
-      out = Absent
-    else:
-      acc += data_val
-      out = acc
-    data_val, _ = yield out
+    acc = acc + data_val
+    data_val, _ = yield acc
 
 
-@psyre_sequ(prepare=prepare_scan)
+@psyre_sequ(prepare=prepare_scan, static_argnames=('bin_op',))
 def scan(data_val, *, bin_op):
   """Applies binary stream operator bin_op cumulatively across data_val."""
   acc = data_val
-  data_val = yield acc
   while True:
-    if acc is Absent or data_val is Absent:
-      out = Absent
-    else:
-      acc = bin_op(acc, data_val)
-      out = acc
-    data_val = yield out
+    data_val = yield acc
+    acc = bin_op(acc, data_val)
 
 
 @psyre_loop(prepare=prepare_post)
 async def post(o_stream, i_stream, *, n: int = 1):
   """Post node equivalent to n chained `post` stages."""
-  need_drop = True
   while True:
     start = yield
     if start is Absent:
+      # Inactive tick: emit `Absent` without advancing `i_stream` (its ahead
+      # cursor already stays parked at or ahead of the next active index).
       o_stream.push(Absent)
       continue
     if start:
+      # Rewind lookahead cursor to the output index on start/reset and drop
+      # `n` active ticks (`Scheduler` tracks `(in_port, o_port)` watermarks so
+      # slot `o_stream.index` is never evicted before reset completes).
       i_stream.index = o_stream.index
-      need_drop = True
-    if need_drop:
-      if (await pull(i_stream)) is Absent:
-        o_stream.push(Absent)
-        continue
-      for _ in range(n - 1):
+      for _ in range(n):
         while (await pull(i_stream)) is Absent:
           pass
-      need_drop = False
     while (i_val := await pull(i_stream)) is Absent:
       pass
     o_stream.push(i_val)

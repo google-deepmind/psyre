@@ -16,6 +16,7 @@
 from collections.abc import Sequence
 import logging
 import math
+from typing import Any
 
 from absl.testing import absltest
 
@@ -27,9 +28,10 @@ from psyre.common import (
     Absent,
     counter,
     logger,
+    switch,
 )
-from examples import gmoe
-from examples import rnn
+from examples.src import gmoe
+from examples.src import rnn
 from psyre.scheduler import Scheduler
 from psyre.stream import Stream
 from psyre.trace import (
@@ -94,9 +96,7 @@ def _ref_rnn_perceptron(
       )
     h_grid.append(row)
   y_rnn = [h_grid[min(t, num_cells - 1)][t] for t in range(dim)]
-  z = params.per.bh[0] + sum(
-      h_val * w_val for h_val, w_val in zip(y_rnn, params.per.wxh, strict=True)
-  )
+  z = params.per.bh[0] + math.sumprod(y_rnn, params.per.wxh)
   return max(0.0, z)
 
 
@@ -108,10 +108,7 @@ def _ref_chained_gmoe_loss(
 ) -> tuple[float, float, tuple[float, float, float]]:
   """Exact Python reference for chained GMoE with RNN+perceptron experts."""
   scores = tuple(
-      params.gate.b[k]
-      + sum(
-          xv * wv for xv, wv in zip(x_seq, params.gate.w[k], strict=True)
-      )
+      params.gate.b[k] + math.sumprod(x_seq, params.gate.w[k])
       for k in range(3)
   )
   g = _ref_top2_softmax(*scores)
@@ -124,22 +121,24 @@ def _ref_chained_gmoe_loss(
   return out, (out - y_target) ** 2, g
 
 
-def _initial_scalar_params() -> gmoe.ScalarGmoeParamValues:
+def _initial_scalar_params(gmoe_mod: Any = gmoe) -> Any:
   """Returns deterministic scalar GMoE parameters routing all 3 expert pairs."""
-  return gmoe.GmoeParams(
-      gate=gmoe.GateParams(w=(-1.2, 0.1, 1.3), b=(0.5, -0.5, 0.5)),
+  return gmoe_mod.GmoeParams(
+      gate=gmoe_mod.GateParams(w=(-1.2, 0.1, 1.3), b=(0.5, -0.5, 0.5)),
       experts=(
-          gmoe.ScalarExpertParams(w1=1.5, w2=-0.2, b=0.8),
-          gmoe.ScalarExpertParams(w1=-0.7, w2=0.15, b=2.5),
-          gmoe.ScalarExpertParams(w1=0.3, w2=0.45, b=-0.4),
+          gmoe_mod.ScalarExpertParams(w1=1.5, w2=-0.2, b=0.8),
+          gmoe_mod.ScalarExpertParams(w1=-0.7, w2=0.15, b=2.5),
+          gmoe_mod.ScalarExpertParams(w1=0.3, w2=0.45, b=-0.4),
       ),
   )
 
 
-def _initial_chained_params() -> gmoe.ChainedGmoeParamValues:
+def _initial_chained_params(
+    gmoe_mod: Any = gmoe, rnn_mod: Any = rnn
+) -> Any:
   """Returns deterministic chained GMoE-RNN parameters for 3 experts."""
-  return gmoe.GmoeParams(
-      gate=gmoe.GateParams(
+  return gmoe_mod.GmoeParams(
+      gate=gmoe_mod.GateParams(
           w=(
               [1.2, -0.4, 0.3, -0.2, 0.1],
               [-0.3, 1.1, -0.5, 0.4, -0.2],
@@ -148,23 +147,23 @@ def _initial_chained_params() -> gmoe.ChainedGmoeParamValues:
           b=(0.15, -0.05, 0.1),
       ),
       experts=(
-          rnn.ModelParams(
-              rnn=rnn.RnnParams(wxh=0.35, whh=-0.25, bh=0.1),
-              per=rnn.PerceptronParams(
+          rnn_mod.ModelParams(
+              rnn=rnn_mod.RnnParams(wxh=0.35, whh=-0.25, bh=0.1),
+              per=rnn_mod.PerceptronParams(
                   wxh=[0.3, 0.4, -0.2, 0.5, 0.35],
                   bh=[0.6, 0.0, 0.0, 0.0, 0.0],
               ),
           ),
-          rnn.ModelParams(
-              rnn=rnn.RnnParams(wxh=-0.3, whh=0.4, bh=0.15),
-              per=rnn.PerceptronParams(
+          rnn_mod.ModelParams(
+              rnn=rnn_mod.RnnParams(wxh=-0.3, whh=0.4, bh=0.15),
+              per=rnn_mod.PerceptronParams(
                   wxh=[0.45, -0.25, 0.35, 0.2, 0.5],
                   bh=[0.7, 0.0, 0.0, 0.0, 0.0],
               ),
           ),
-          rnn.ModelParams(
-              rnn=rnn.RnnParams(wxh=0.25, whh=0.3, bh=-0.1),
-              per=rnn.PerceptronParams(
+          rnn_mod.ModelParams(
+              rnn=rnn_mod.RnnParams(wxh=0.25, whh=0.3, bh=-0.1),
+              per=rnn_mod.PerceptronParams(
                   wxh=[0.2, 0.35, 0.45, -0.15, 0.4],
                   bh=[0.8, 0.0, 0.0, 0.0, 0.0],
               ),
@@ -174,22 +173,26 @@ def _initial_chained_params() -> gmoe.ChainedGmoeParamValues:
 
 
 def _chained_slice_params(
-    traces: gmoe.ChainedGmoeParamTraces, pass_idx: int
-) -> gmoe.ChainedGmoeParamValues:
+    traces: Any, pass_idx: int, gmoe_mod: Any = gmoe, rnn_mod: Any = rnn
+) -> Any:
   """Extracts chained GMoE-RNN parameter values for `pass_idx`."""
-  start = pass_idx * rnn.DIMENSION
-  end = start + rnn.DIMENSION
-  return gmoe.extract_chained_params(traces.map(lambda seq: seq[start:end]))
+  start = pass_idx * rnn_mod.DIMENSION
+  end = start + rnn_mod.DIMENSION
+  return gmoe_mod.extract_chained_params(traces.map(lambda seq: seq[start:end]))
 
 
 class GmoeTest(absltest.TestCase):
+
+  GMOE: Any = gmoe
+  RNN: Any = rnn
 
   def setUp(self):
     super().setUp()
     logger.setLevel(logging.WARNING)
 
   def test_fixed_moe_demo_matches_paper_chronogram_and_clocks(self):
-    graph = build_graph(gmoe.mixture_of_experts_demo)
+    gmoe_mod = self.GMOE
+    graph = build_graph(gmoe_mod.mixture_of_experts_demo)
     check_causality(graph)
     clocks = check_clocks(graph)
     traces = Scheduler.run_graph(graph, horizon=8, clocks=clocks)
@@ -214,59 +217,23 @@ class GmoeTest(absltest.TestCase):
         traces['e1_recurrent'], [1.0, 0.0, 4.0, 0.0, 9.0, 0.0, 11.0, 0.0]
     )
 
-  def test_scalar_gmoe_dynamic_dispatch_and_clocks(self):
-    params = _initial_scalar_params()
-    # Inputs designed to drop experts 2, 0, and 1 respectively across ticks.
-    xs = [-2.0, 0.0, 2.0]
-    ys = [1.0, 2.5, 4.0]
-
-    def circuit():
-      p_s = params.map(Stream)
-      x_s = Stream(xs)
-      y_s = Stream(ys)
-      fwd = gmoe.gmoe_forward(x_s, p_s)
-      bwd = gmoe.grad_gmoe(x_s, y_s, p_s)
-      return fwd, bwd
-
-    graph = build_graph(circuit)
-    check_causality(graph)
-    clocks = check_clocks(graph)
-    fwd_out, bwd_out = Scheduler.run_graph(
-        graph, horizon=len(xs), clocks=clocks
-    )
-
-    self.assertSequenceAlmostEqual(fwd_out.o, bwd_out.o, places=12)
-    # Confirm every expert is skipped on at least one cycle and is Absent there.
-    skipped_experts: set[int] = set()
-    for t in range(len(xs)):
-      active_count = sum(1 for k in range(3) if bwd_out.conds[k][t])
-      self.assertEqual(active_count, 2)
-      for k in range(3):
-        if bwd_out.conds[k][t]:
-          self.assertTrue(is_present(bwd_out.expert_outputs[k], t))
-          self.assertTrue(is_present(fwd_out.expert_outputs[k], t))
-        else:
-          skipped_experts.add(k)
-          self.assertTrue(is_absent(bwd_out.expert_outputs[k], t))
-          self.assertTrue(is_absent(fwd_out.expert_outputs[k], t))
-          # Unselected expert MUST have exact zero parameter gradients.
-          self.assertEqual(bwd_out.grads.experts[k].w1[t], 0.0)
-          self.assertEqual(bwd_out.grads.experts[k].w2[t], 0.0)
-          self.assertEqual(bwd_out.grads.experts[k].b[t], 0.0)
-    self.assertEqual(skipped_experts, {0, 1, 2})
-
-  def test_scalar_gmoe_reverse_mode_gradients_match_finite_differences(self):
-    params = _initial_scalar_params()
+  def test_scalar_gmoe_dispatch_clocks_and_reverse_mode_gradients(self):
+    gmoe_mod = self.GMOE
+    params = _initial_scalar_params(gmoe_mod)
     # Exercises all 3 active pairs: {0,1} (drop 2), {0,2} (drop 1), {1,2}
-    # (drop 0).
+    # (drop 0), avoiding exact gate-score ties for finite differences.
     cases = [(-2.0, 1.0), (0.5, 2.2), (2.0, 4.5)]
     xs = [c[0] for c in cases]
     ys = [c[1] for c in cases]
 
     def circuit():
-      return gmoe.grad_gmoe(Stream(xs), Stream(ys), params.map(Stream))
+      p_s = params.map(Stream)
+      x_s = Stream(xs)
+      y_s = Stream(ys)
+      return gmoe_mod.gmoe_forward(x_s, p_s), gmoe_mod.grad_gmoe(x_s, y_s, p_s)
 
-    out = Scheduler.run(circuit, horizon=len(cases))
+    fwd_out, out = Scheduler.run(circuit, horizon=len(cases))
+    self.assertSequenceAlmostEqual(fwd_out.o, out.o, places=12)
     eps = 1e-6
     dropped_seen: set[int] = set()
 
@@ -274,69 +241,70 @@ class GmoeTest(absltest.TestCase):
       ref_o, ref_l, ref_g = _ref_scalar_gmoe_loss(xv, yv, params)
       self.assertAlmostEqual(out.o[t], ref_o, places=12)
       self.assertAlmostEqual(out.loss[t], ref_l, places=12)
+      self.assertEqual(sum(1 for k in range(3) if out.conds[k][t]), 2)
       for k in range(3):
         self.assertAlmostEqual(out.gates[k][t], ref_g[k], places=12)
-        if ref_g[k] == 0.0:
+        if out.conds[k][t]:
+          self.assertTrue(is_present(out.expert_outputs[k], t))
+          self.assertTrue(is_present(fwd_out.expert_outputs[k], t))
+        else:
           dropped_seen.add(k)
+          self.assertEqual(ref_g[k], 0.0)
+          self.assertTrue(is_absent(out.expert_outputs[k], t))
+          self.assertTrue(is_absent(fwd_out.expert_outputs[k], t))
+          # Unselected expert MUST have exact zero parameter gradients.
+          for field in ('w1', 'w2', 'b'):
+            self.assertEqual(getattr(out.grads.experts[k], field)[t], 0.0)
 
-      # Finite-difference check on input dx.
-      fd_x = (
-          _ref_scalar_gmoe_loss(xv + eps, yv, params)[1]
-          - _ref_scalar_gmoe_loss(xv - eps, yv, params)[1]
-      ) / (2.0 * eps)
-      self.assertAlmostEqual(out.dx[t], fd_x, places=6)
-
-      # Finite-difference check on all 6 gate parameters.
-      for k in range(3):
-        w_plus = list(params.gate.w)
-        w_plus[k] += eps
-        w_minus = list(params.gate.w)
-        w_minus[k] -= eps
-        p_plus = params._replace(gate=params.gate._replace(w=tuple(w_plus)))
-        p_minus = params._replace(gate=params.gate._replace(w=tuple(w_minus)))
-        fd_gw = (
-            _ref_scalar_gmoe_loss(xv, yv, p_plus)[1]
-            - _ref_scalar_gmoe_loss(xv, yv, p_minus)[1]
+      def _scalar_fd(p_plus, p_minus, x_p=xv, x_m=xv, target_y=yv):
+        return (
+            _ref_scalar_gmoe_loss(x_p, target_y, p_plus)[1]
+            - _ref_scalar_gmoe_loss(x_m, target_y, p_minus)[1]
         ) / (2.0 * eps)
-        self.assertAlmostEqual(out.grads.gate.w[k][t], fd_gw, places=6)
 
-        b_plus = list(params.gate.b)
-        b_plus[k] += eps
-        b_minus = list(params.gate.b)
-        b_minus[k] -= eps
-        p_plus = params._replace(gate=params.gate._replace(b=tuple(b_plus)))
-        p_minus = params._replace(gate=params.gate._replace(b=tuple(b_minus)))
-        fd_gb = (
-            _ref_scalar_gmoe_loss(xv, yv, p_plus)[1]
-            - _ref_scalar_gmoe_loss(xv, yv, p_minus)[1]
-        ) / (2.0 * eps)
-        self.assertAlmostEqual(out.grads.gate.b[k][t], fd_gb, places=6)
-
-      # Finite-difference check on all 9 expert parameters.
+      self.assertAlmostEqual(
+          out.dx[t],
+          _scalar_fd(params, params, xv + eps, xv - eps),
+          places=6,
+      )
       for k in range(3):
+        for field in ('w', 'b'):
+          base = list(getattr(params.gate, field))
+          v_p, v_m = list(base), list(base)
+          v_p[k] += eps
+          v_m[k] -= eps
+          p_p = params._replace(
+              gate=params.gate._replace(**{field: tuple(v_p)})
+          )
+          p_m = params._replace(
+              gate=params.gate._replace(**{field: tuple(v_m)})
+          )
+          self.assertAlmostEqual(
+              getattr(out.grads.gate, field)[k][t],
+              _scalar_fd(p_p, p_m),
+              places=6,
+          )
         for field in ('w1', 'w2', 'b'):
           base_val = getattr(params.experts[k], field)
-          exps_plus = list(params.experts)
-          exps_plus[k] = params.experts[k]._replace(**{field: base_val + eps})
-          exps_minus = list(params.experts)
-          exps_minus[k] = params.experts[k]._replace(**{field: base_val - eps})
-          fd_e = (
-              _ref_scalar_gmoe_loss(
-                  xv, yv, params._replace(experts=tuple(exps_plus))
-              )[1]
-              - _ref_scalar_gmoe_loss(
-                  xv, yv, params._replace(experts=tuple(exps_minus))
-              )[1]
-          ) / (2.0 * eps)
+          exps_p = list(params.experts)
+          exps_p[k] = params.experts[k]._replace(**{field: base_val + eps})
+          exps_m = list(params.experts)
+          exps_m[k] = params.experts[k]._replace(**{field: base_val - eps})
           self.assertAlmostEqual(
-              getattr(out.grads.experts[k], field)[t], fd_e, places=6
+              getattr(out.grads.experts[k], field)[t],
+              _scalar_fd(
+                  params._replace(experts=tuple(exps_p)),
+                  params._replace(experts=tuple(exps_m)),
+              ),
+              places=6,
           )
 
-    # Confirm all 3 experts were dropped at least once (dynamic dispatch).
+    # Confirm all 3 experts were skipped on at least one cycle.
     self.assertEqual(dropped_seen, {0, 1, 2})
 
   def test_scalar_gmoe_training_converges_and_freezes_inactive_experts(self):
-    initial = _initial_scalar_params()
+    gmoe_mod = self.GMOE
+    initial = _initial_scalar_params(gmoe_mod)
     # Multi-regime dataset targeting different functions across x ranges.
     dataset = [
         (-2.0, -3.0),
@@ -349,7 +317,7 @@ class GmoeTest(absltest.TestCase):
     horizon = max_steps + 3
 
     out = Scheduler.run(
-        gmoe.train_gmoe,
+        gmoe_mod.train_gmoe,
         dataset,
         initial,
         max_steps=max_steps,
@@ -366,9 +334,11 @@ class GmoeTest(absltest.TestCase):
     skipped_steps = [0, 0, 0]
     for t in range(max_steps):
       prev_p = (
-          initial if t == 0 else gmoe.extract_scalar_params(out.params, t - 1)
+          initial
+          if t == 0
+          else gmoe_mod.extract_scalar_params(out.params, t - 1)
       )
-      next_p = gmoe.extract_scalar_params(out.params, t)
+      next_p = gmoe_mod.extract_scalar_params(out.params, t)
       for k in range(3):
         if out.conds[k][t]:
           self.assertTrue(is_present(out.expert_outputs[k], t))
@@ -380,10 +350,10 @@ class GmoeTest(absltest.TestCase):
       self.assertGreater(skipped_steps[k], 0)
 
     # Parameters stay strictly constant past max_steps.
-    trained = gmoe.extract_scalar_params(out.params, max_steps - 1)
+    trained = gmoe_mod.extract_scalar_params(out.params, max_steps - 1)
     for t in range(max_steps, horizon):
       self.assertTrue(is_absent(out.loss, t))
-      self.assertEqual(gmoe.extract_scalar_params(out.params, t), trained)
+      self.assertEqual(gmoe_mod.extract_scalar_params(out.params, t), trained)
 
     # Dataset evaluation loss improves substantially after training.
     init_eval = sum(
@@ -394,15 +364,18 @@ class GmoeTest(absltest.TestCase):
     )
     self.assertLess(trained_eval, init_eval * 0.5)
 
-  def test_chained_gmoe_rnn_dynamic_dispatch_and_clocks(self):
-    params = _initial_chained_params()
+  def test_chained_gmoe_rnn_dispatch_clocks_and_reverse_mode_gradients(self):
+    gmoe_mod = self.GMOE
+    rnn_mod = self.RNN
+    params = _initial_chained_params(gmoe_mod, rnn_mod)
+    expert_cells = gmoe_mod.DEFAULT_EXPERT_CELLS  # (3, 4, 5)
     # 3 distinct sequences designed to drop experts 2, 0, and 1 respectively.
     sequences = [
         ([1.0, 0.2, -0.8, 0.1, -0.3], 1.8),
         ([-0.9, 0.8, 0.9, 0.5, 0.6], 1.4),
         ([0.8, -0.9, 0.9, -0.2, 0.4], 1.6),
     ]
-    dim = rnn.DIMENSION
+    dim = rnn_mod.DIMENSION
     horizon = len(sequences) * dim
 
     def circuit():
@@ -410,237 +383,172 @@ class GmoeTest(absltest.TestCase):
       pass_idx = tick // dim
       in_pass = tick % dim
       pass_reset = in_pass == 0
-      samples = rnn.dataset_streams(sequences, in_pass=in_pass)
-      sample = gmoe._select_sequence_sample(pass_idx, samples)
-      p_s = gmoe.chained_param_streams(in_pass, params)
-      fwd = gmoe.chained_gmoe_forward(
+      samples = rnn_mod.dataset_streams(sequences, in_pass=in_pass)
+      sample = rnn_mod.LabeledStream(
+          x=switch(
+              pass_idx,
+              {i: s.x for i, s in enumerate(samples)},
+              default=0.0,
+          ),
+          y=switch(
+              pass_idx,
+              {i: s.y for i, s in enumerate(samples)},
+              default=0.0,
+          ),
+      )
+      p_s = gmoe_mod.chained_param_streams(in_pass, params)
+      fwd = gmoe_mod.chained_gmoe_forward(
           sample.x,
           p_s,
-          expert_cells=gmoe.DEFAULT_EXPERT_CELLS,
+          expert_cells=expert_cells,
           in_pass=in_pass,
           pass_reset=pass_reset,
       )
-      bwd = gmoe.grad_chained_gmoe(
+      bwd = gmoe_mod.grad_chained_gmoe(
           sample.x,
           sample.y,
           p_s,
-          expert_cells=gmoe.DEFAULT_EXPERT_CELLS,
+          expert_cells=expert_cells,
           in_pass=in_pass,
           pass_reset=pass_reset,
       )
       return fwd, bwd
 
-    graph = build_graph(circuit)
-    check_causality(graph)
-    clocks = check_clocks(graph)
-    fwd_out, bwd_out = Scheduler.run_graph(
-        graph, horizon=horizon, clocks=clocks
-    )
+    fwd_out, bwd_out = Scheduler.run(circuit, horizon=horizon)
     self.assertFalse(Scheduler.deadlocked)
-
-    # Forward outputs match between pure forward and reverse-mode forward pass.
     self.assertSequenceAlmostEqual(fwd_out.o, bwd_out.o, places=12)
 
-    # Verify each pass dynamically dispatches 2 experts (all 5 ticks present)
-    # and skips 1 expert (all 5 ticks Absent), exercising all 3 drop choices.
+    eps = 1e-6
     dropped_passes: set[int] = set()
     for p_idx, (x_seq, y_target) in enumerate(sequences):
       start = p_idx * dim
       end = start + dim
-      ref_o, ref_l, ref_g = _ref_chained_gmoe_loss(
-          x_seq, y_target, params, gmoe.DEFAULT_EXPERT_CELLS
-      )
-      self.assertAlmostEqual(bwd_out.o[end - 1], ref_o, places=12)
-      self.assertAlmostEqual(bwd_out.loss[end - 1], ref_l, places=12)
-      for k in range(3):
-        pass_conds = bwd_out.conds[k][start:end]
-        if ref_g[k] == 0.0:
-          dropped_passes.add(k)
-          self.assertEqual(pass_conds, [False] * dim)
-          self.assertEqual(bwd_out.expert_outputs[k][start:end], [Absent] * dim)
-          self.assertEqual(fwd_out.expert_outputs[k][start:end], [Absent] * dim)
-        else:
-          self.assertEqual(pass_conds, [True] * dim)
-          for t in range(start, end):
-            self.assertTrue(is_present(bwd_out.expert_outputs[k], t))
-            self.assertTrue(is_present(fwd_out.expert_outputs[k], t))
-    self.assertEqual(dropped_passes, {0, 1, 2})
-
-  def test_chained_gmoe_rnn_reverse_mode_gradients_match_finite_differences(
-      self,
-  ):
-    params = _initial_chained_params()
-    expert_cells = gmoe.DEFAULT_EXPERT_CELLS  # (3, 4, 5)
-    dim = rnn.DIMENSION
-    # 3 passes dropping experts 2, 0, and 1 respectively.
-    sequences = [
-        ((1.0, 0.2, -0.8, 0.1, -0.3), 1.8),
-        ((-0.9, 0.8, 0.9, 0.5, 0.6), 1.4),
-        ((0.8, -0.9, 0.9, -0.2, 0.4), 1.6),
-    ]
-    eps = 1e-6
-
-    def make_one_pass(xs: Sequence[float], yt: float):
-      def circuit():
-        in_pass = counter() % dim
-        pass_reset = in_pass == 0
-        p_s = gmoe.chained_param_streams(in_pass, params)
-        return gmoe.grad_chained_gmoe(
-            Stream(list(xs)),
-            yt,
-            p_s,
-            expert_cells=expert_cells,
-            in_pass=in_pass,
-            pass_reset=pass_reset,
-        )
-
-      return circuit
-
-    for x_seq, y_target in sequences:
-      with self.subTest(x_seq=x_seq):
-        out = Scheduler.run(make_one_pass(x_seq, y_target), horizon=dim)
-        self.assertFalse(Scheduler.deadlocked)
+      with self.subTest(pass_idx=p_idx, x_seq=x_seq):
         ref_o, ref_l, ref_g = _ref_chained_gmoe_loss(
             x_seq, y_target, params, expert_cells
         )
-        self.assertAlmostEqual(out.o[-1], ref_o, places=12)
-        self.assertAlmostEqual(out.loss[-1], ref_l, places=12)
+        self.assertAlmostEqual(bwd_out.o[end - 1], ref_o, places=12)
+        self.assertAlmostEqual(bwd_out.loss[end - 1], ref_l, places=12)
+
+        def _chain_fd(p_plus, p_minus, xs_p=x_seq, xs_m=x_seq, yt=y_target):
+          return (
+              _ref_chained_gmoe_loss(xs_p, yt, p_plus, expert_cells)[1]
+              - _ref_chained_gmoe_loss(xs_m, yt, p_minus, expert_cells)[1]
+          ) / (2.0 * eps)
 
         # 1. Input gradients dx[0..4].
         for i in range(dim):
-          x_p = list(x_seq)
+          x_p, x_m = list(x_seq), list(x_seq)
           x_p[i] += eps
-          x_m = list(x_seq)
           x_m[i] -= eps
-          fd_x = (
-              _ref_chained_gmoe_loss(x_p, y_target, params, expert_cells)[1]
-              - _ref_chained_gmoe_loss(x_m, y_target, params, expert_cells)[1]
-          ) / (2.0 * eps)
-          self.assertAlmostEqual(out.dx[i], fd_x, places=6)
+          self.assertAlmostEqual(
+              bwd_out.dx[start + i],
+              _chain_fd(params, params, x_p, x_m),
+              places=6,
+          )
 
         # 2. All 15 gate weights + 3 gate biases.
         for k in range(3):
           for i in range(dim):
             w_p = [list(v) for v in params.gate.w]
-            w_p[k][i] += eps
             w_m = [list(v) for v in params.gate.w]
+            w_p[k][i] += eps
             w_m[k][i] -= eps
-            p_p = params._replace(gate=params.gate._replace(w=tuple(w_p)))
-            p_m = params._replace(gate=params.gate._replace(w=tuple(w_m)))
-            fd_w = (
-                _ref_chained_gmoe_loss(x_seq, y_target, p_p, expert_cells)[1]
-                - _ref_chained_gmoe_loss(x_seq, y_target, p_m, expert_cells)[1]
-            ) / (2.0 * eps)
-            self.assertAlmostEqual(out.grads.gate.w[k][i], fd_w, places=6)
+            fd_w = _chain_fd(
+                params._replace(gate=params.gate._replace(w=tuple(w_p))),
+                params._replace(gate=params.gate._replace(w=tuple(w_m))),
+            )
+            self.assertAlmostEqual(
+                bwd_out.grads.gate.w[k][start + i], fd_w, places=6
+            )
 
-          b_p = list(params.gate.b)
+          b_p, b_m = list(params.gate.b), list(params.gate.b)
           b_p[k] += eps
-          b_m = list(params.gate.b)
           b_m[k] -= eps
-          p_p = params._replace(gate=params.gate._replace(b=tuple(b_p)))
-          p_m = params._replace(gate=params.gate._replace(b=tuple(b_m)))
-          fd_b = (
-              _ref_chained_gmoe_loss(x_seq, y_target, p_p, expert_cells)[1]
-              - _ref_chained_gmoe_loss(x_seq, y_target, p_m, expert_cells)[1]
-          ) / (2.0 * eps)
-          for t in range(dim):
-            self.assertAlmostEqual(out.grads.gate.b[k][t], fd_b, places=6)
+          fd_b = _chain_fd(
+              params._replace(gate=params.gate._replace(b=tuple(b_p))),
+              params._replace(gate=params.gate._replace(b=tuple(b_m))),
+          )
+          for t in range(start, end):
+            self.assertAlmostEqual(bwd_out.grads.gate.b[k][t], fd_b, places=6)
 
-        # 3. All 3 experts' RNN scalars (wxh, whh, bh) and perceptron params.
+        # 3. Dynamic dispatch presence & all 3 experts' RNN / perceptron grads.
         for k in range(3):
           exp_k = params.experts[k]
-          grad_k = out.grads.experts[k]
+          grad_k = bwd_out.grads.experts[k]
+          pass_conds = bwd_out.conds[k][start:end]
           if ref_g[k] == 0.0:
-            # Inactive expert MUST have exact zero gradients on every leaf.
-            self.assertEqual(grad_k.rnn.wxh, [0.0] * dim)
-            self.assertEqual(grad_k.rnn.whh, [0.0] * dim)
-            self.assertEqual(grad_k.rnn.bh, [0.0] * dim)
-            self.assertEqual(grad_k.per.wxh, [0.0] * dim)
-            self.assertEqual(grad_k.per.bh, [0.0] * dim)
+            dropped_passes.add(k)
+            self.assertEqual(pass_conds, [False] * dim)
+            self.assertEqual(
+                bwd_out.expert_outputs[k][start:end], [Absent] * dim
+            )
+            self.assertEqual(
+                fwd_out.expert_outputs[k][start:end], [Absent] * dim
+            )
+            self.assertEqual(grad_k.rnn.wxh[start:end], [0.0] * dim)
+            self.assertEqual(grad_k.rnn.whh[start:end], [0.0] * dim)
+            self.assertEqual(grad_k.rnn.bh[start:end], [0.0] * dim)
+            self.assertEqual(grad_k.per.wxh[start:end], [0.0] * dim)
+            self.assertEqual(grad_k.per.bh[start:end], [0.0] * dim)
             continue
+
+          self.assertEqual(pass_conds, [True] * dim)
+          for t in range(start, end):
+            self.assertTrue(is_present(bwd_out.expert_outputs[k], t))
+            self.assertTrue(is_present(fwd_out.expert_outputs[k], t))
 
           for field in ('wxh', 'whh', 'bh'):
             base_val = getattr(exp_k.rnn, field)
-            exps_p = list(params.experts)
+            exps_p, exps_m = list(params.experts), list(params.experts)
             exps_p[k] = exp_k._replace(
                 rnn=exp_k.rnn._replace(**{field: base_val + eps})
             )
-            exps_m = list(params.experts)
             exps_m[k] = exp_k._replace(
                 rnn=exp_k.rnn._replace(**{field: base_val - eps})
             )
-            fd_r = (
-                _ref_chained_gmoe_loss(
-                    x_seq,
-                    y_target,
-                    params._replace(experts=tuple(exps_p)),
-                    expert_cells,
-                )[1]
-                - _ref_chained_gmoe_loss(
-                    x_seq,
-                    y_target,
-                    params._replace(experts=tuple(exps_m)),
-                    expert_cells,
-                )[1]
-            ) / (2.0 * eps)
+            fd_r = _chain_fd(
+                params._replace(experts=tuple(exps_p)),
+                params._replace(experts=tuple(exps_m)),
+            )
             self.assertAlmostEqual(
-                sum(getattr(grad_k.rnn, field)), fd_r, places=6
+                sum(getattr(grad_k.rnn, field)[start:end]), fd_r, places=6
             )
 
           for i in range(dim):
-            pw_p = list(exp_k.per.wxh)
+            pw_p, pw_m = list(exp_k.per.wxh), list(exp_k.per.wxh)
             pw_p[i] += eps
-            pw_m = list(exp_k.per.wxh)
             pw_m[i] -= eps
-            exps_p = list(params.experts)
+            exps_p, exps_m = list(params.experts), list(params.experts)
             exps_p[k] = exp_k._replace(per=exp_k.per._replace(wxh=pw_p))
-            exps_m = list(params.experts)
             exps_m[k] = exp_k._replace(per=exp_k.per._replace(wxh=pw_m))
-            fd_pw = (
-                _ref_chained_gmoe_loss(
-                    x_seq,
-                    y_target,
-                    params._replace(experts=tuple(exps_p)),
-                    expert_cells,
-                )[1]
-                - _ref_chained_gmoe_loss(
-                    x_seq,
-                    y_target,
-                    params._replace(experts=tuple(exps_m)),
-                    expert_cells,
-                )[1]
-            ) / (2.0 * eps)
-            self.assertAlmostEqual(grad_k.per.wxh[i], fd_pw, places=6)
+            fd_pw = _chain_fd(
+                params._replace(experts=tuple(exps_p)),
+                params._replace(experts=tuple(exps_m)),
+            )
+            self.assertAlmostEqual(grad_k.per.wxh[start + i], fd_pw, places=6)
 
           pb_p = [exp_k.per.bh[0] + eps] + list(exp_k.per.bh[1:])
           pb_m = [exp_k.per.bh[0] - eps] + list(exp_k.per.bh[1:])
-          exps_p = list(params.experts)
+          exps_p, exps_m = list(params.experts), list(params.experts)
           exps_p[k] = exp_k._replace(per=exp_k.per._replace(bh=pb_p))
-          exps_m = list(params.experts)
           exps_m[k] = exp_k._replace(per=exp_k.per._replace(bh=pb_m))
-          fd_pb = (
-              _ref_chained_gmoe_loss(
-                  x_seq,
-                  y_target,
-                  params._replace(experts=tuple(exps_p)),
-                  expert_cells,
-              )[1]
-              - _ref_chained_gmoe_loss(
-                  x_seq,
-                  y_target,
-                  params._replace(experts=tuple(exps_m)),
-                  expert_cells,
-              )[1]
-          ) / (2.0 * eps)
-          self.assertAlmostEqual(grad_k.per.bh[0], fd_pb, places=6)
-          self.assertEqual(grad_k.per.bh[1:], [0.0] * (dim - 1))
+          fd_pb = _chain_fd(
+              params._replace(experts=tuple(exps_p)),
+              params._replace(experts=tuple(exps_m)),
+          )
+          self.assertAlmostEqual(grad_k.per.bh[start], fd_pb, places=6)
+          self.assertEqual(grad_k.per.bh[start + 1 : end], [0.0] * (dim - 1))
+    self.assertEqual(dropped_passes, {0, 1, 2})
 
   def test_chained_gmoe_rnn_training_converges_and_freezes_inactive_experts(
       self,
   ):
-    initial = _initial_chained_params()
-    expert_cells = gmoe.DEFAULT_EXPERT_CELLS  # (3, 4, 5)
-    dim = rnn.DIMENSION
+    gmoe_mod = self.GMOE
+    rnn_mod = self.RNN
+    initial = _initial_chained_params(gmoe_mod, rnn_mod)
+    expert_cells = gmoe_mod.DEFAULT_EXPERT_CELLS  # (3, 4, 5)
+    dim = rnn_mod.DIMENSION
     # Alternating sequences activating {0,1}, {1,2}, {0,2} cyclically —
     # every expert transitions active -> inactive -> active repeatedly.
     dataset = [
@@ -654,7 +562,7 @@ class GmoeTest(absltest.TestCase):
     horizon = total_passes * dim
 
     out = Scheduler.run(
-        gmoe.train_chained_gmoe,
+        gmoe_mod.train_chained_gmoe,
         dataset,
         initial,
         expert_cells=expert_cells,
@@ -665,7 +573,9 @@ class GmoeTest(absltest.TestCase):
     self.assertFalse(Scheduler.deadlocked)
 
     # Verify exact INIT_LOAD pass.
-    self.assertEqual(_chained_slice_params(out.params, 0), initial)
+    self.assertEqual(
+        _chained_slice_params(out.params, 0, gmoe_mod, rnn_mod), initial
+    )
 
     # Verify exact training loss emission ticks.
     train_losses = [float(v) for v in present_values(out.loss)]
@@ -680,8 +590,10 @@ class GmoeTest(absltest.TestCase):
       pass_idx = step + 1
       start = pass_idx * dim
       end = start + dim
-      prev_p = _chained_slice_params(out.params, pass_idx - 1)
-      next_p = _chained_slice_params(out.params, pass_idx)
+      prev_p = _chained_slice_params(
+          out.params, pass_idx - 1, gmoe_mod, rnn_mod
+      )
+      next_p = _chained_slice_params(out.params, pass_idx, gmoe_mod, rnn_mod)
       for k in range(3):
         cond_slice = out.conds[k][start:end]
         if all(cond_slice):
@@ -696,16 +608,22 @@ class GmoeTest(absltest.TestCase):
       self.assertGreater(skipped_counts[k], 0)
 
     # Verify parameters freeze completely past max_steps.
-    trained = _chained_slice_params(out.params, max_steps)
-    self.assertEqual(_chained_slice_params(out.params, max_steps + 1), trained)
-    self.assertEqual(_chained_slice_params(out.params, max_steps + 2), trained)
-    self.assertEqual(gmoe.extract_chained_params(out.params), trained)
+    trained = _chained_slice_params(out.params, max_steps, gmoe_mod, rnn_mod)
+    self.assertEqual(
+        _chained_slice_params(out.params, max_steps + 1, gmoe_mod, rnn_mod),
+        trained,
+    )
+    self.assertEqual(
+        _chained_slice_params(out.params, max_steps + 2, gmoe_mod, rnn_mod),
+        trained,
+    )
+    self.assertEqual(gmoe_mod.extract_chained_params(out.params), trained)
 
     # Evaluate trained model with `eval_chained_gmoe` and compare against
     # exact Python reference and initial evaluation loss.
     eval_horizon = len(dataset) * dim
     eval_trace = Scheduler.run(
-        gmoe.eval_chained_gmoe,
+        gmoe_mod.eval_chained_gmoe,
         dataset,
         trained,
         expert_cells=expert_cells,
@@ -725,6 +643,45 @@ class GmoeTest(absltest.TestCase):
         for x_seq, y_target in dataset
     ]
     self.assertLess(sum(eval_losses), sum(ref_init_losses))
+
+  def test_chained_params_normalize_and_extract_non_default_dimension(self):
+    gmoe_mod = self.GMOE
+    rnn_mod = self.RNN
+    expert = rnn_mod.ModelParams(
+        rnn=rnn_mod.RnnParams(wxh=0.25, whh=-0.1, bh=0.05),
+        per=rnn_mod.PerceptronParams(wxh=[0.1, 0.2, 0.3], bh=0.4),
+    )
+    params = gmoe_mod.GmoeParams(
+        gate=gmoe_mod.GateParams(
+            w=([1.0, 2.0, 3.0], 0.5, [-1.0, 0.0, 1.0]),
+            b=(0.1, 0.2, 0.3),
+        ),
+        experts=(expert, expert, expert),
+    )
+    norm = gmoe_mod.normalize_chained_params(params, dimension=3)
+    self.assertEqual(norm.gate.w[1], [0.5, 0.5, 0.5])
+    self.assertEqual(norm.experts[0].per.bh, [0.4, 0.4, 0.4])
+
+    exp_trace = rnn_mod.ModelParams(
+        rnn=rnn_mod.RnnParams(wxh=[0.25] * 3, whh=[-0.1] * 3, bh=[0.05] * 3),
+        per=rnn_mod.PerceptronParams(wxh=[0.1, 0.2, 0.3], bh=[0.4] * 3),
+    )
+    traces = gmoe_mod.GmoeParams(
+        gate=gmoe_mod.GateParams(
+            w=([1.0, 2.0, 3.0], [0.5] * 3, [-1.0, 0.0, 1.0]),
+            b=([0.1] * 3, [0.2] * 3, [0.3] * 3),
+        ),
+        experts=(exp_trace, exp_trace, exp_trace),
+    )
+    self.assertEqual(
+        gmoe_mod.extract_chained_params(traces, dimension=3), norm
+    )
+
+    bad_bool = params._replace(
+        gate=gmoe_mod.GateParams(w=params.gate.w, b=(True, 0.0, 0.0))
+    )
+    with self.assertRaisesRegex(TypeError, 'not bool'):
+      gmoe_mod.normalize_chained_params(bad_bool, dimension=3)
 
 
 if __name__ == '__main__':

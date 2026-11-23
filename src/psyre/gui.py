@@ -24,11 +24,21 @@ import math
 import os
 import re
 import tempfile
-from typing import Literal
+from typing import Any, Literal
 import uuid
 import xml.etree.ElementTree as ET
 
 _LAZY_GZIP_THRESHOLD_BYTES = 256 * 1024
+
+
+def _safe_inline_json(value: Any) -> str:
+  """Serializes `value` as JSON escaped for inline `<script>` embedding."""
+  return (
+      json.dumps(value, separators=(',', ':'))
+      .replace('<', '\\u003c')
+      .replace('>', '\\u003e')
+      .replace('&', '\\u0026')
+  )
 
 RankDir = Literal['LR', 'TB']
 
@@ -40,7 +50,6 @@ NodeKind = Literal[
     'post',
     'ifthenelse',
     'sigma',
-    'once_stream',
     'fifo',
     'counter',
     'static_stream',
@@ -63,6 +72,23 @@ STYLE_CYCLE = ('#FEE2E2', '#DC2626', '#7F1D1D')
 _SVG_NS = 'http://www.w3.org/2000/svg'
 ET.register_namespace('', _SVG_NS)
 
+_PATH_COORD_RE = re.compile(r'(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)')
+_TRANSLATE_RE = re.compile(
+    r'translate\(\s*(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)\s*\)'
+)
+_SVG_ANCHOR_RE = re.compile(r'<(?:[A-Za-z_][\w.-]*:)?a\b')
+
+
+def validate_height_px(height_px: int) -> int:
+  """Validates interactive viewer stage height as a positive integer."""
+  if isinstance(height_px, bool) or not isinstance(height_px, int):
+    raise TypeError(
+        f'height_px must be a positive int, got {type(height_px).__name__}.'
+    )
+  if height_px <= 0:
+    raise ValueError(f'height_px must be > 0, got {height_px}.')
+  return height_px
+
 _TEMP_EXPORT_DIR: tempfile.TemporaryDirectory[str] | None = None
 
 
@@ -70,11 +96,8 @@ _TEMP_EXPORT_DIR: tempfile.TemporaryDirectory[str] | None = None
 class NodeShapeSpec:
   """Metadata driving SVG post-processing for custom node schematic shapes."""
 
-  dom_id: str
   kind: NodeKind
-  rankdir: RankDir
   border_color: str
-  info: str
   subscript: str = ''
 
 
@@ -84,6 +107,7 @@ class SchematicView:
 
   raw_svg: str
   dot_src: str
+  rankdir: RankDir = 'LR'
   shape_specs: Mapping[str, NodeShapeSpec] = dataclasses.field(
       default_factory=dict
   )
@@ -111,6 +135,9 @@ class SchematicBundle:
   node_count: int = 0
   height_px: int = 560
 
+  def __post_init__(self) -> None:
+    validate_height_px(self.height_px)
+
 
 def _parse_polygon_points(points_attr: str) -> list[tuple[float, float]]:
   """Parses an SVG polygon `points` attribute into `(x, y)` float pairs."""
@@ -121,14 +148,20 @@ def _parse_polygon_points(points_attr: str) -> list[tuple[float, float]]:
   return pts
 
 
+def _points_bounds(
+    pts: Sequence[tuple[float, float]],
+) -> tuple[float, float, float, float]:
+  """Returns `(min_x, min_y, max_x, max_y)` for `(x, y)` pairs."""
+  xs = [pt[0] for pt in pts]
+  ys = [pt[1] for pt in pts]
+  return min(xs), min(ys), max(xs), max(ys)
+
+
 def _parse_polygon_bounds(
     points_attr: str,
 ) -> tuple[float, float, float, float]:
   """Extracts `(min_x, min_y, max_x, max_y)` from an SVG polygon points list."""
-  pts = _parse_polygon_points(points_attr)
-  xs = [pt[0] for pt in pts]
-  ys = [pt[1] for pt in pts]
-  return min(xs), min(ys), max(xs), max(ys)
+  return _points_bounds(_parse_polygon_points(points_attr))
 
 
 def _format_pts(pts: Iterable[tuple[float, float]]) -> str:
@@ -136,15 +169,19 @@ def _format_pts(pts: Iterable[tuple[float, float]]) -> str:
   return ' '.join(f'{x:.2f},{y:.2f}' for x, y in pts)
 
 
-def _find_child_with_parent(
-    root: ET.Element, tag: str
-) -> tuple[ET.Element, ET.Element] | None:
-  """Returns `(parent, child)` for the first descendant matching `tag`."""
-  for parent in root.iter():
-    child = parent.find(tag)
-    if child is not None:
-      return parent, child
-  return None
+def _rect_pts(x0: float, y0: float, x1: float, y1: float) -> str:
+  """Formats axis-aligned rectangle corners for an SVG `points` attribute."""
+  return _format_pts([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+
+
+def _svg_el(
+    tag: str, attrs: Mapping[str, str], text: str | None = None
+) -> ET.Element:
+  """Creates an SVG-namespaced `ET.Element` with optional text content."""
+  el = ET.Element(f'{{{_SVG_NS}}}{tag}', dict(attrs))
+  if text is not None:
+    el.text = text
+  return el
 
 
 def _append_subscript_tspan(text_el: ET.Element, subscript: str) -> None:
@@ -161,41 +198,40 @@ def _append_subscript_tspan(text_el: ET.Element, subscript: str) -> None:
   sub_span.text = subscript
 
 
-def _apply_custom_glyph(group: ET.Element, spec: NodeShapeSpec) -> None:
+def _apply_custom_glyph(
+    group: ET.Element, spec: NodeShapeSpec, rankdir: RankDir
+) -> None:
   """Transforms a Graphviz SVG `<g class="node">` into its schematic glyph."""
-  if spec.kind in ('once_stream', 'static_stream'):
-    for shape_tag in (f'{{{_SVG_NS}}}polygon', f'{{{_SVG_NS}}}path'):
-      while (found := _find_child_with_parent(group, shape_tag)) is not None:
-        found[0].remove(found[1])
-    if spec.kind == 'once_stream':
-      for text_el in group.findall(f'.//{{{_SVG_NS}}}text'):
-        text_el.text = None
-        for child in list(text_el):
-          text_el.remove(child)
-        delta_span = ET.SubElement(
-            text_el,
-            f'{{{_SVG_NS}}}tspan',
-            {'font-style': 'italic'},
-        )
-        delta_span.text = 'δ'
-        sub_span = ET.SubElement(
-            text_el,
-            f'{{{_SVG_NS}}}tspan',
-            {'dy': '0.25em', 'font-size': '0.72em'},
-        )
-        sub_span.text = spec.subscript or 'k'
+  if spec.kind == 'static_stream':
+    drop_tags = {f'{{{_SVG_NS}}}polygon', f'{{{_SVG_NS}}}path'}
+    for parent in group.iter():
+      for child in list(parent):
+        if child.tag in drop_tags:
+          parent.remove(child)
     return
 
-  found = _find_child_with_parent(group, f'{{{_SVG_NS}}}polygon')
+  if spec.kind == 'other':
+    if spec.subscript:
+      for text_el in group.findall(f'.//{{{_SVG_NS}}}text'):
+        _append_subscript_tspan(text_el, spec.subscript)
+    return
+
+  poly_tag = f'{{{_SVG_NS}}}polygon'
+  found = next(
+      (
+          (p, child)
+          for p in group.iter()
+          if (child := p.find(poly_tag)) is not None
+      ),
+      None,
+  )
   if found is None:
     return
   poly_parent, poly = found
   orig_pts = _parse_polygon_points(poly.get('points', ''))
   if not orig_pts:
     return
-  xs = [pt[0] for pt in orig_pts]
-  ys = [pt[1] for pt in orig_pts]
-  x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+  x0, y0, x1, y1 = _points_bounds(orig_pts)
   cx = 0.5 * (x0 + x1)
   cy = 0.5 * (y0 + y1)
   width = x1 - x0
@@ -203,40 +239,30 @@ def _apply_custom_glyph(group: ET.Element, spec: NodeShapeSpec) -> None:
   poly_index = list(poly_parent).index(poly)
 
   if spec.kind in ('fby', 'post'):
+    # Expand register/lookahead boxes into squares and draw a directional
+    # chevron hat: downward `v` inside the top edge for unit delay (`fby`/
+    # `pre`) and upward `^` inside the bottom edge for lookahead (`post`).
     side = max(width, height)
     sx0, sx1 = cx - 0.5 * side, cx + 0.5 * side
     sy0, sy1 = cy - 0.5 * side, cy + 0.5 * side
-    poly.set(
-        'points',
-        _format_pts([(sx0, sy0), (sx1, sy0), (sx1, sy1), (sx0, sy1)]),
+    poly.set('points', _rect_pts(sx0, sy0, sx1, sy1))
+    is_post = spec.kind == 'post'
+    poly.set('data-psyre-shape', 'post-square' if is_post else 'fby-square')
+    hat_size = min(9.0, 0.21 * side)
+    hat_y, tip_y, text_dy = (
+        (sy1, sy1 - hat_size, -0.35 * hat_size)
+        if is_post
+        else (sy0, sy0 + hat_size, 0.35 * hat_size)
     )
-    poly.set(
-        'data-psyre-shape',
-        'post-square' if spec.kind == 'post' else 'fby-square',
-    )
-    hat_half_w = min(9.0, 0.21 * side)
-    hat_depth = min(9.0, 0.21 * side)
-    if spec.kind == 'fby':
-      hat_pts = [
-          (cx - hat_half_w, sy0),
-          (cx, sy0 + hat_depth),
-          (cx + hat_half_w, sy0),
-      ]
-      hat_cls = 'psyre-fby-hat'
-      text_dy = 0.35 * hat_depth
-    else:
-      hat_pts = [
-          (cx - hat_half_w, sy1),
-          (cx, sy1 - hat_depth),
-          (cx + hat_half_w, sy1),
-      ]
-      hat_cls = 'psyre-post-hat'
-      text_dy = -0.35 * hat_depth
-    hat = ET.Element(
-        f'{{{_SVG_NS}}}polyline',
+    hat = _svg_el(
+        'polyline',
         {
-            'class': hat_cls,
-            'points': _format_pts(hat_pts),
+            'class': 'psyre-post-hat' if is_post else 'psyre-fby-hat',
+            'points': _format_pts([
+                (cx - hat_size, hat_y),
+                (cx, tip_y),
+                (cx + hat_size, hat_y),
+            ]),
             'fill': 'none',
             'stroke': spec.border_color,
             'stroke-width': '1.6',
@@ -253,52 +279,55 @@ def _apply_custom_glyph(group: ET.Element, spec: NodeShapeSpec) -> None:
     return
 
   if spec.kind in ('when', 'whennot', 'merge'):
-    if spec.rankdir == 'LR':
+    if rankdir == 'LR':
+      # In LR mode draw opposing trapezoids matching TB `trapezium` /
+      # `invtrapezium`: `when` flares wider left-to-right (clock sampler), while
+      # `merge` narrows left-to-right (fan-in multiplexer).
       slope = 0.18 * height
-      if spec.kind == 'merge':
-        pts = [
-            (x0, y0 - slope),
-            (x1, y0 + slope),
-            (x1, y1 - slope),
-            (x0, y1 + slope),
-        ]
-      else:
-        pts = [
-            (x0, y0 + slope),
-            (x1, y0 - slope),
-            (x1, y1 + slope),
-            (x0, y1 - slope),
-        ]
-      poly.set('points', _format_pts(pts))
+      s = -slope if spec.kind == 'merge' else slope
+      poly.set(
+          'points',
+          _format_pts([
+              (x0, y0 + s),
+              (x1, y0 - s),
+              (x1, y1 + s),
+              (x0, y1 - s),
+          ]),
+      )
     poly.set(
         'data-psyre-shape',
         'mux-trapezoid' if spec.kind == 'merge' else 'selector-trapezoid',
     )
     if spec.kind == 'whennot':
-      if spec.rankdir == 'LR':
+      # Active-low inversion bubble placed on the selector entry edge (`n` in
+      # LR, left slanted wall in TB).
+      if rankdir == 'LR':
         bx, by = cx, y0 - 3.2
       else:
         left_xs = sorted(px for px, _ in set(orig_pts))[:2]
         left_mid_x = 0.5 * sum(left_xs) if left_xs else x0
         bx, by = left_mid_x - 3.2, cy
-      bubble = ET.Element(
-          f'{{{_SVG_NS}}}circle',
-          {
-              'class': 'psyre-whennot-bubble',
-              'cx': f'{bx:.2f}',
-              'cy': f'{by:.2f}',
-              'r': '3.2',
-              'fill': '#FFFFFF',
-              'stroke': spec.border_color,
-              'stroke-width': '1.5',
-          },
+      poly_parent.insert(
+          poly_index + 1,
+          _svg_el(
+              'circle',
+              {
+                  'class': 'psyre-whennot-bubble',
+                  'cx': f'{bx:.2f}',
+                  'cy': f'{by:.2f}',
+                  'r': '3.2',
+                  'fill': '#FFFFFF',
+                  'stroke': spec.border_color,
+                  'stroke-width': '1.5',
+              },
+          ),
       )
-      poly_parent.insert(poly_index + 1, bubble)
     return
 
   if spec.kind == 'ifthenelse':
-    pts = [(cx, y0), (x1, cy), (cx, y1), (x0, cy)]
-    poly.set('points', _format_pts(pts))
+    poly.set(
+        'points', _format_pts([(cx, y0), (x1, cy), (cx, y1), (x0, cy)])
+    )
     poly.set('data-psyre-shape', 'ifthenelse-diamond')
     return
 
@@ -306,12 +335,16 @@ def _apply_custom_glyph(group: ET.Element, spec: NodeShapeSpec) -> None:
     poly.set('data-psyre-shape', 'sigma-box')
     return
 
+  if spec.kind not in ('fifo', 'counter'):
+    return
+  for text_el in list(poly_parent.findall(f'{{{_SVG_NS}}}text')):
+    poly_parent.remove(text_el)
+
   if spec.kind == 'fifo':
+    # Open-ended shift-register frame (3 inner slot dividers, no leading bar).
     poly.set('data-psyre-shape', 'fifo-buffer')
     poly.set('stroke', 'none')
-    for text_el in list(poly_parent.findall(f'{{{_SVG_NS}}}text')):
-      poly_parent.remove(text_el)
-    if spec.rankdir == 'TB':
+    if rankdir == 'TB':
       frame_pts = [(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
       dividers = [
           (x0, y0 + frac * height, x1, y0 + frac * height)
@@ -323,163 +356,137 @@ def _apply_custom_glyph(group: ET.Element, spec: NodeShapeSpec) -> None:
           (x0 + frac * width, y0, x0 + frac * width, y1)
           for frac in (0.25, 0.50, 0.75)
       ]
-    frame = ET.Element(
-        f'{{{_SVG_NS}}}polyline',
-        {
-            'class': 'psyre-fifo-frame',
-            'points': _format_pts(frame_pts),
-            'fill': 'none',
-            'stroke': spec.border_color,
-            'stroke-width': '1.6',
-            'stroke-linejoin': 'miter',
-            'stroke-linecap': 'butt',
-        },
-    )
-    poly_parent.insert(poly_index + 1, frame)
-    for offset, (lx0, ly0, lx1, ly1) in enumerate(dividers, start=2):
-      line = ET.Element(
-          f'{{{_SVG_NS}}}line',
-          {
-              'class': 'psyre-fifo-divider',
-              'x1': f'{lx0:.2f}',
-              'y1': f'{ly0:.2f}',
-              'x2': f'{lx1:.2f}',
-              'y2': f'{ly1:.2f}',
-              'stroke': spec.border_color,
-              'stroke-width': '1.4',
-          },
-      )
-      poly_parent.insert(poly_index + offset, line)
-    return
-
-  if spec.kind == 'counter':
+    elems = [
+        _svg_el(
+            'polyline',
+            {
+                'class': 'psyre-fifo-frame',
+                'points': _format_pts(frame_pts),
+                'fill': 'none',
+                'stroke': spec.border_color,
+                'stroke-width': '1.6',
+                'stroke-linejoin': 'miter',
+                'stroke-linecap': 'butt',
+            },
+        ),
+        *(
+            _svg_el(
+                'line',
+                {
+                    'class': 'psyre-fifo-divider',
+                    'x1': f'{lx0:.2f}',
+                    'y1': f'{ly0:.2f}',
+                    'x2': f'{lx1:.2f}',
+                    'y2': f'{ly1:.2f}',
+                    'stroke': spec.border_color,
+                    'stroke-width': '1.4',
+                },
+            )
+            for lx0, ly0, lx1, ly1 in dividers
+        ),
+    ]
+  else:  # counter: 3-digit odometer housing replacing placeholder '042' label.
     fill_color = poly.get('fill', STYLE_STATEFUL[0])
     poly.set('data-psyre-shape', 'counter-odometer')
     poly.set('stroke', 'none')
     poly.set('fill', 'none')
-    for text_el in list(poly_parent.findall(f'{{{_SVG_NS}}}text')):
-      poly_parent.remove(text_el)
-    housing = ET.Element(
-        f'{{{_SVG_NS}}}rect',
-        {
-            'class': 'psyre-counter-housing',
-            'x': f'{x0:.2f}',
-            'y': f'{y0:.2f}',
-            'width': f'{width:.2f}',
-            'height': f'{height:.2f}',
-            'rx': '4.0',
-            'ry': '4.0',
-            'fill': fill_color,
-            'stroke': spec.border_color,
-            'stroke-width': '1.6',
-        },
-    )
-    pad_x = 4.2
-    pad_y = 3.6
-    wx0 = x0 + pad_x
-    wy0 = y0 + pad_y
+    pad_x, pad_y = 4.2, 3.6
+    wx0, wy0 = x0 + pad_x, y0 + pad_y
     win_w = max(12.0, width - 2.0 * pad_x)
     win_h = max(10.0, height - 2.0 * pad_y)
-    window = ET.Element(
-        f'{{{_SVG_NS}}}rect',
-        {
-            'class': 'psyre-counter-window',
-            'x': f'{wx0:.2f}',
-            'y': f'{wy0:.2f}',
-            'width': f'{win_w:.2f}',
-            'height': f'{win_h:.2f}',
-            'rx': '2.0',
-            'ry': '2.0',
-            'fill': '#FFFFFF',
-            'stroke': spec.border_color,
-            'stroke-width': '1.2',
-        },
-    )
-    elems: list[ET.Element] = [housing, window]
     slot_w = win_w / 3.0
-    for div_idx in (1, 2):
-      dx = wx0 + div_idx * slot_w
-      elems.append(
-          ET.Element(
-              f'{{{_SVG_NS}}}line',
-              {
-                  'class': 'psyre-counter-divider',
-                  'x1': f'{dx:.2f}',
-                  'y1': f'{wy0:.2f}',
-                  'x2': f'{dx:.2f}',
-                  'y2': f'{wy0 + win_h:.2f}',
-                  'stroke': spec.border_color,
-                  'stroke-width': '1.1',
-              },
-          )
-      )
-    rx0 = wx0 + 2.0 * slot_w
-    rx1 = wx0 + win_w
-    for ry in (wy0 + 2.8, wy0 + win_h - 2.8):
-      elems.append(
-          ET.Element(
-              f'{{{_SVG_NS}}}line',
-              {
-                  'class': 'psyre-counter-roll',
-                  'x1': f'{rx0 + 2.0:.2f}',
-                  'y1': f'{ry:.2f}',
-                  'x2': f'{rx1 - 2.0:.2f}',
-                  'y2': f'{ry:.2f}',
-                  'stroke': spec.border_color,
-                  'stroke-width': '0.9',
-                  'stroke-opacity': '0.55',
-              },
-          )
-      )
-    for slot_idx, digit in enumerate(('0', '4', '2')):
-      slot_cx = wx0 + (slot_idx + 0.5) * slot_w
-      slot_cy = cy + (2.1 if slot_idx == 2 else 3.6)
-      digit_el = ET.Element(
-          f'{{{_SVG_NS}}}text',
-          {
-              'class': 'psyre-counter-digit',
-              'x': f'{slot_cx:.2f}',
-              'y': f'{slot_cy:.2f}',
-              'text-anchor': 'middle',
-              'font-family': 'Helvetica, monospace',
-              'font-size': '10.5',
-              'font-weight': '700',
-              'fill': STYLE_STATEFUL[2],
-          },
-      )
-      digit_el.text = digit
-      elems.append(digit_el)
-    for offset, el in enumerate(elems, start=1):
-      poly_parent.insert(poly_index + offset, el)
-    return
-
-  if spec.kind == 'other' and spec.subscript:
-    for text_el in group.findall(f'.//{{{_SVG_NS}}}text'):
-      _append_subscript_tspan(text_el, spec.subscript)
+    rx0, rx1 = wx0 + 2.0 * slot_w, wx0 + win_w
+    elems = [
+        _svg_el(
+            'rect',
+            {
+                'class': 'psyre-counter-housing',
+                'x': f'{x0:.2f}',
+                'y': f'{y0:.2f}',
+                'width': f'{width:.2f}',
+                'height': f'{height:.2f}',
+                'rx': '4.0',
+                'ry': '4.0',
+                'fill': fill_color,
+                'stroke': spec.border_color,
+                'stroke-width': '1.6',
+            },
+        ),
+        _svg_el(
+            'rect',
+            {
+                'class': 'psyre-counter-window',
+                'x': f'{wx0:.2f}',
+                'y': f'{wy0:.2f}',
+                'width': f'{win_w:.2f}',
+                'height': f'{win_h:.2f}',
+                'rx': '2.0',
+                'ry': '2.0',
+                'fill': '#FFFFFF',
+                'stroke': spec.border_color,
+                'stroke-width': '1.2',
+            },
+        ),
+        *(
+            _svg_el(
+                'line',
+                {
+                    'class': 'psyre-counter-divider',
+                    'x1': f'{wx0 + div_idx * slot_w:.2f}',
+                    'y1': f'{wy0:.2f}',
+                    'x2': f'{wx0 + div_idx * slot_w:.2f}',
+                    'y2': f'{wy0 + win_h:.2f}',
+                    'stroke': spec.border_color,
+                    'stroke-width': '1.1',
+                },
+            )
+            for div_idx in (1, 2)
+        ),
+        *(
+            _svg_el(
+                'line',
+                {
+                    'class': 'psyre-counter-roll',
+                    'x1': f'{rx0 + 2.0:.2f}',
+                    'y1': f'{ry:.2f}',
+                    'x2': f'{rx1 - 2.0:.2f}',
+                    'y2': f'{ry:.2f}',
+                    'stroke': spec.border_color,
+                    'stroke-width': '0.9',
+                    'stroke-opacity': '0.55',
+                },
+            )
+            for ry in (wy0 + 2.8, wy0 + win_h - 2.8)
+        ),
+        *(
+            _svg_el(
+                'text',
+                {
+                    'class': 'psyre-counter-digit',
+                    'x': f'{wx0 + (slot_idx + 0.5) * slot_w:.2f}',
+                    'y': f'{cy + (2.1 if slot_idx == 2 else 3.6):.2f}',
+                    'text-anchor': 'middle',
+                    'font-family': 'Helvetica, monospace',
+                    'font-size': '10.5',
+                    'font-weight': '700',
+                    'fill': STYLE_STATEFUL[2],
+                },
+                text=digit,
+            )
+            for slot_idx, digit in enumerate(('0', '4', '2'))
+        ),
+    ]
+  for offset, el in enumerate(elems, start=1):
+    poly_parent.insert(poly_index + offset, el)
 
 
 def _shorten_static_stream_edges(
-    root: ET.Element,
     static_edge_to_node: Mapping[str, str],
-    shaft_len_pt: float = 14.0,
+    group_by_id: Mapping[str, ET.Element],
+    node_by_key: Mapping[str, ET.Element],
+    cluster_polys: Sequence[tuple[ET.Element, list[float]]],
 ) -> None:
   """Shortens inline stream arrows and places their label at the arrow tail."""
-  if not static_edge_to_node:
-    return
-  group_by_id = {
-      g.get('id', ''): g for g in root.iter(f'{{{_SVG_NS}}}g') if g.get('id')
-  }
-  node_by_key = {
-      g.get('data-psyre-key', ''): g
-      for g in root.iter(f'{{{_SVG_NS}}}g')
-      if g.get('class') == 'node' and g.get('data-psyre-key')
-  }
-  cluster_polys: list[ET.Element] = []
-  for g in root.iter(f'{{{_SVG_NS}}}g'):
-    if g.get('class') == 'cluster':
-      poly = g.find(f'{{{_SVG_NS}}}polygon')
-      if poly is not None:
-        cluster_polys.append(poly)
   for e_dom, c_dom in static_edge_to_node.items():
     edge_g = group_by_id.get(e_dom)
     node_g = group_by_id.get(c_dom)
@@ -492,9 +499,7 @@ def _shorten_static_stream_edges(
       continue
     pts = [
         (float(m.group(1)), float(m.group(2)))
-        for m in re.finditer(
-            r'(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)', path_el.get('d', '')
-        )
+        for m in _PATH_COORD_RE.finditer(path_el.get('d', ''))
     ]
     poly_pts = _parse_polygon_points(poly_el.get('points', ''))
     if len(pts) < 2 or len(poly_pts) < 3:
@@ -505,14 +510,13 @@ def _shorten_static_stream_edges(
         poly_pts,
         key=lambda pt, xe=x_end, ye=y_end: math.hypot(pt[0] - xe, pt[1] - ye),
     )
-    dst_key = edge_g.get('data-psyre-dst', '')
     dst_port = edge_g.get('data-psyre-dst-port', '')
-    dst_g = node_by_key.get(dst_key)
     if dst_port == 'n':
+      dst_g = node_by_key.get(edge_g.get('data-psyre-dst', ''))
       if dst_g is not None:
         dst_poly = dst_g.find(f'.//{{{_SVG_NS}}}polygon')
-        if dst_poly is not None and dst_poly.get('points'):
-          dx0, dy0, dx1, _ = _parse_polygon_bounds(dst_poly.get('points', ''))
+        if dst_poly is not None and (dst_pts := dst_poly.get('points')):
+          dx0, dy0, dx1, _ = _parse_polygon_bounds(dst_pts)
           tip_x = 0.5 * (dx0 + dx1)
           tip_y = (
               (dy0 - 6.4) if dst_g.get('data-psyre-kind') == 'whennot' else dy0
@@ -520,31 +524,26 @@ def _shorten_static_stream_edges(
       ux, uy = 0.0, 1.0
       arrow_len = 5.5
       shaft_len = 8.5
+    elif dst_port == 'w' or dst_port.endswith(':w'):
+      ux, uy = 1.0, 0.0
+      arrow_len = 5.5
+      shaft_len = 11.0
     else:
-      is_left_port = dst_port == 'w' or dst_port.endswith(':w')
-      if is_left_port:
-        ux, uy = 1.0, 0.0
-      else:
-        dx = tip_x - x_end
-        dy = tip_y - y_end
+      dx, dy = tip_x - x_end, tip_y - y_end
+      tip_dist = math.hypot(dx, dy)
+      dist = tip_dist
+      if dist < 1e-3:
+        dx, dy = tip_x - x_start, tip_y - y_start
         dist = math.hypot(dx, dy)
-        if dist < 1e-3:
-          dx = tip_x - x_start
-          dy = tip_y - y_start
-          dist = math.hypot(dx, dy)
-        if dist < 1e-3:
-          continue
-        ux, uy = dx / dist, dy / dist
-        if abs(ux) >= 0.85:
-          ux, uy = math.copysign(1.0, ux), 0.0
-        elif abs(uy) >= 0.85:
-          ux, uy = 0.0, math.copysign(1.0, uy)
-      arrow_len = (
-          5.5
-          if is_left_port
-          else max(5.5, min(8.0, math.hypot(tip_x - x_end, tip_y - y_end)))
-      )
-      shaft_len = 11.0 if is_left_port else shaft_len_pt
+      if dist < 1e-3:
+        continue
+      ux, uy = dx / dist, dy / dist
+      if abs(ux) >= 0.85:
+        ux, uy = math.copysign(1.0, ux), 0.0
+      elif abs(uy) >= 0.85:
+        ux, uy = 0.0, math.copysign(1.0, uy)
+      arrow_len = max(5.5, min(8.0, tip_dist))
+      shaft_len = 14.0
 
     arrow_half_w = 0.36 * arrow_len
     base_x = tip_x - ux * arrow_len
@@ -554,14 +553,11 @@ def _shorten_static_stream_edges(
     path_el.set(
         'd', f'M{start_x:.2f},{start_y:.2f} L{base_x:.2f},{base_y:.2f}'
     )
+    left_wing = (base_x - uy * arrow_half_w, base_y + ux * arrow_half_w)
+    right_wing = (base_x + uy * arrow_half_w, base_y - ux * arrow_half_w)
     poly_el.set(
         'points',
-        _format_pts([
-            (base_x - uy * arrow_half_w, base_y + ux * arrow_half_w),
-            (tip_x, tip_y),
-            (base_x + uy * arrow_half_w, base_y - ux * arrow_half_w),
-            (base_x - uy * arrow_half_w, base_y + ux * arrow_half_w),
-        ]),
+        _format_pts([left_wing, (tip_x, tip_y), right_wing, left_wing]),
     )
     if dst_port == 'n':
       text_el.set('text-anchor', 'end')
@@ -580,28 +576,20 @@ def _shorten_static_stream_edges(
           'y', f'{start_y - 4.0:.2f}' if uy > 0 else f'{start_y + 11.0:.2f}'
       )
     if text_el.get('text-anchor') == 'end':
+      # Push any enclosing cluster rectangle leftward so tail labels attached
+      # to shortened inline arrows never spill outside the cluster border.
       txt_str = ''.join(text_el.itertext()).strip()
       est_w = max(12.0, 6.8 * len(txt_str))
       left_edge = float(text_el.get('x', '0')) - est_w - 6.0
-      for c_poly in cluster_polys:
-        pts_attr = c_poly.get('points', '')
-        if not pts_attr:
-          continue
-        bx0, by0, bx1, by1 = _parse_polygon_bounds(pts_attr)
+      for c_poly, bounds in cluster_polys:
+        bx0, by0, bx1, by1 = bounds
         if (
             bx0 - 2.0 <= tip_x <= bx1 + 2.0
             and by0 - 2.0 <= tip_y <= by1 + 2.0
             and left_edge < bx0
         ):
-          c_poly.set(
-              'points',
-              _format_pts([
-                  (left_edge, by0),
-                  (bx1, by0),
-                  (bx1, by1),
-                  (left_edge, by1),
-              ]),
-          )
+          bounds[0] = left_edge
+          c_poly.set('points', _rect_pts(left_edge, by0, bx1, by1))
     for edge_text_el in edge_g.findall(f'{{{_SVG_NS}}}text'):
       edge_text_el.set('x', f'{0.5 * (start_x + base_x) - uy * 6.5:.2f}')
       edge_text_el.set(
@@ -610,8 +598,9 @@ def _shorten_static_stream_edges(
       )
 
 
-def _expand_svg_viewbox(root: ET.Element, margin_pt: float = 10.0) -> None:
+def _expand_svg_viewbox(root: ET.Element) -> None:
   """Adds a safety margin around `<svg viewBox>` covering all glyphs/labels."""
+  margin_pt = 10.0
   view_box = root.get('viewBox')
   if not view_box:
     return
@@ -620,15 +609,70 @@ def _expand_svg_viewbox(root: ET.Element, margin_pt: float = 10.0) -> None:
     return
   vx, vy, vw, vh = parts
   min_x, min_y, max_x, max_y = vx, vy, vx + vw, vy + vh
+
+  def include(x0: float, y0: float, x1: float, y1: float) -> None:
+    nonlocal min_x, min_y, max_x, max_y
+    min_x = min(min_x, x0)
+    min_y = min(min_y, y0)
+    max_x = max(max_x, x1)
+    max_y = max(max_y, y1)
+
+  # Graphviz places all nodes/clusters/edges inside a root `<g>` whose
+  # `translate(gx gy)` maps negative-y local points into `viewBox` space.
   graph_group = root.find(f'{{{_SVG_NS}}}g')
   gx, gy = 0.0, 0.0
+  bg_poly: ET.Element | None = None
   if graph_group is not None:
-    m_tr = re.search(
-        r'translate\(\s*(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)\s*\)',
-        graph_group.get('transform', ''),
-    )
+    m_tr = _TRANSLATE_RE.search(graph_group.get('transform', ''))
     if m_tr:
       gx, gy = float(m_tr.group(1)), float(m_tr.group(2))
+    bg_poly = graph_group.find(f'{{{_SVG_NS}}}polygon')
+  # Include custom-substituted node/cluster shapes (`fby`/`post` squares,
+  # LR trapezoids, `whennot` inversion bubbles, widened cluster borders) so
+  # standalone SVGs never clip expanded glyphs beyond Graphviz's initial box.
+  stroke_pad = 2.0
+  for poly_tag in (f'{{{_SVG_NS}}}polygon', f'{{{_SVG_NS}}}polyline'):
+    for poly_el in root.iter(poly_tag):
+      if poly_el is bg_poly:
+        continue
+      pts_attr = poly_el.get('points', '')
+      if not pts_attr:
+        continue
+      pts = _parse_polygon_points(pts_attr)
+      if not pts:
+        continue
+      px0, py0, px1, py1 = _points_bounds(pts)
+      include(
+          px0 + gx - stroke_pad,
+          py0 + gy - stroke_pad,
+          px1 + gx + stroke_pad,
+          py1 + gy + stroke_pad,
+      )
+  for circle_el in root.iter(f'{{{_SVG_NS}}}circle'):
+    cx_attr = circle_el.get('cx')
+    cy_attr = circle_el.get('cy')
+    r_attr = circle_el.get('r')
+    if cx_attr is None or cy_attr is None or r_attr is None:
+      continue
+    cx_v = float(cx_attr) + gx
+    cy_v = float(cy_attr) + gy
+    r_v = float(r_attr) + stroke_pad
+    include(cx_v - r_v, cy_v - r_v, cx_v + r_v, cy_v + r_v)
+  for rect_el in root.iter(f'{{{_SVG_NS}}}rect'):
+    rx_attr = rect_el.get('x')
+    ry_attr = rect_el.get('y')
+    rw_attr = rect_el.get('width')
+    rh_attr = rect_el.get('height')
+    if rx_attr is None or ry_attr is None or rw_attr is None or rh_attr is None:
+      continue
+    rx0 = float(rx_attr) + gx
+    ry0 = float(ry_attr) + gy
+    include(
+        rx0 - stroke_pad,
+        ry0 - stroke_pad,
+        rx0 + float(rw_attr) + stroke_pad,
+        ry0 + float(rh_attr) + stroke_pad,
+    )
   for text_el in root.iter(f'{{{_SVG_NS}}}text'):
     x_attr = text_el.get('x')
     y_attr = text_el.get('y')
@@ -640,43 +684,29 @@ def _expand_svg_viewbox(root: ET.Element, margin_pt: float = 10.0) -> None:
     est_w = max(10.0, 6.5 * len(txt))
     anchor = text_el.get('text-anchor', 'middle')
     if anchor == 'end':
-      min_x = min(min_x, tx - est_w)
-      max_x = max(max_x, tx)
+      tx0, tx1 = tx - est_w, tx
     elif anchor == 'start':
-      min_x = min(min_x, tx)
-      max_x = max(max_x, tx + est_w)
+      tx0, tx1 = tx, tx + est_w
     else:
-      min_x = min(min_x, tx - 0.5 * est_w)
-      max_x = max(max_x, tx + 0.5 * est_w)
-    min_y = min(min_y, ty - 14.0)
-    max_y = max(max_y, ty + 6.0)
+      tx0, tx1 = tx - 0.5 * est_w, tx + 0.5 * est_w
+    include(tx0, ty - 14.0, tx1, ty + 6.0)
   new_x = min_x - margin_pt
   new_y = min_y - margin_pt
   new_w = (max_x - min_x) + 2.0 * margin_pt
   new_h = (max_y - min_y) + 2.0 * margin_pt
-  root.set(
-      'viewBox',
-      f'{new_x:.2f} {new_y:.2f} {new_w:.2f} {new_h:.2f}',
-  )
+  root.set('viewBox', f'{new_x:.2f} {new_y:.2f} {new_w:.2f} {new_h:.2f}')
   root.set('width', f'{new_w:.0f}pt')
   root.set('height', f'{new_h:.0f}pt')
-  if graph_group is not None:
-    bg_poly = graph_group.find(f'{{{_SVG_NS}}}polygon')
-    if bg_poly is not None and bg_poly.get('points'):
-      bx0, by0, bx1, by1 = _parse_polygon_bounds(bg_poly.get('points', ''))
-      dx_left = max(margin_pt, vx - min_x + margin_pt)
-      dx_right = max(margin_pt, max_x - (vx + vw) + margin_pt)
-      dy_top = max(margin_pt, vy - min_y + margin_pt)
-      dy_bot = max(margin_pt, max_y - (vy + vh) + margin_pt)
-      bg_poly.set(
-          'points',
-          _format_pts([
-              (bx0 - dx_left, by0 - dy_top),
-              (bx1 + dx_right, by0 - dy_top),
-              (bx1 + dx_right, by1 + dy_bot),
-              (bx0 - dx_left, by1 + dy_bot),
-          ]),
-      )
+  if bg_poly is not None and (bg_pts := bg_poly.get('points')):
+    bx0, by0, bx1, by1 = _parse_polygon_bounds(bg_pts)
+    dx_left = max(margin_pt, vx - min_x + margin_pt)
+    dx_right = max(margin_pt, max_x - (vx + vw) + margin_pt)
+    dy_top = max(margin_pt, vy - min_y + margin_pt)
+    dy_bot = max(margin_pt, max_y - (vy + vh) + margin_pt)
+    bg_poly.set(
+        'points',
+        _rect_pts(bx0 - dx_left, by0 - dy_top, bx1 + dx_right, by1 + dy_bot),
+    )
 
 
 def _unwrap_svg_anchors(root: ET.Element) -> None:
@@ -699,14 +729,29 @@ def _unwrap_svg_anchors(root: ET.Element) -> None:
 def render_view_svg(view: SchematicView) -> str:
   """Post-processes a `SchematicView` into custom schematic SVG markup."""
   root = ET.fromstring(view.raw_svg)
-  _unwrap_svg_anchors(root)
+  # Strip any Graphviz `<svg:a>` link wrappers emitted from tooltip/URL attrs.
+  if _SVG_ANCHOR_RE.search(view.raw_svg):
+    _unwrap_svg_anchors(root)
+  collect_static = bool(view.static_edge_to_node)
+  group_by_id: dict[str, ET.Element] = {}
+  node_by_key: dict[str, ET.Element] = {}
+  cluster_polys: list[tuple[ET.Element, list[float]]] = []
   for group in root.iter(f'{{{_SVG_NS}}}g'):
     dom_id = group.get('id', '')
     group_cls = group.get('class', '')
+    if collect_static:
+      if dom_id:
+        group_by_id[dom_id] = group
+      if group_cls == 'cluster':
+        c_poly = group.find(f'{{{_SVG_NS}}}polygon')
+        if c_poly is not None and (pts_attr := c_poly.get('points', '')):
+          cluster_polys.append((c_poly, list(_parse_polygon_bounds(pts_attr))))
     title_el = group.find(f'{{{_SVG_NS}}}title')
     raw_key = (title_el.text or '').strip() if title_el is not None else ''
     if group_cls == 'node' and raw_key:
       group.set('data-psyre-key', raw_key)
+      if collect_static:
+        node_by_key[raw_key] = group
     elif group_cls == 'edge' and '->' in raw_key:
       src_raw, dst_raw = raw_key.split('->', 1)
       if dom_id in view.reversed_edge_ids:
@@ -732,8 +777,11 @@ def render_view_svg(view: SchematicView) -> str:
     spec = view.shape_specs.get(dom_id)
     if spec is not None:
       group.set('data-psyre-kind', spec.kind)
-      _apply_custom_glyph(group, spec)
-  _shorten_static_stream_edges(root, view.static_edge_to_node)
+      _apply_custom_glyph(group, spec, view.rankdir)
+  if collect_static:
+    _shorten_static_stream_edges(
+        view.static_edge_to_node, group_by_id, node_by_key, cluster_polys
+    )
   _expand_svg_viewbox(root)
   return ET.tostring(root, encoding='unicode')
 
@@ -745,11 +793,10 @@ def _wrap_interactive_html(
     semantics_label: str,
     node_count: int,
     height_px: int,
-    initial_view_key: str = '',
-    fsm_prefixes: Sequence[str] = (),
+    initial_view_key: str,
+    fsm_prefixes: Sequence[str],
 ) -> str:
   """Wraps schematic SVG views in a zoom/pan/expand/inspect HTML widget."""
-  initial_key = initial_view_key if initial_view_key in svg_views else ''
   uid = f'psyre_viz_{uuid.uuid4().hex[:8]}'
   header_title = html.escape(title or 'Psyre Stage-1 Primitive Graph')
   sem_badge = html.escape(semantics_label)
@@ -784,24 +831,23 @@ def _wrap_interactive_html(
   view_divs: list[str] = []
   gz_views: dict[str, str] = {}
   for view_key, svg_markup in svg_views.items():
-    is_active = view_key == initial_key
+    is_active = view_key == initial_view_key
     if use_lazy_gzip and not is_active:
       compressed = gzip.compress(svg_markup.encode('utf-8'), compresslevel=9)
       gz_views[view_key] = base64.b64encode(compressed).decode('ascii')
       continue
     active_cls = ' active' if is_active else ''
-    disp = 'block' if is_active else 'none'
     escaped_key = html.escape(view_key, quote=True)
     view_divs.append(
         f'<div class="psyre-viz-view{active_cls}" '
-        f'data-psyre-view="{escaped_key}" style="display:{disp}">'
+        f'data-psyre-view="{escaped_key}">'
         f'{svg_markup}</div>'
     )
   views_html = '\n      '.join(view_divs)
-  all_prefixes_json = json.dumps(list(fsm_prefixes))
-  available_keys_json = json.dumps(list(svg_views.keys()))
-  gz_views_json = json.dumps(gz_views, separators=(',', ':'))
-  initial_key_json = json.dumps(initial_key)
+  all_prefixes_json = _safe_inline_json(list(fsm_prefixes))
+  available_keys_json = _safe_inline_json(list(svg_views.keys()))
+  gz_views_json = _safe_inline_json(gz_views)
+  initial_key_json = _safe_inline_json(initial_view_key)
 
   return f"""<div id="{uid}_root" class="psyre-viz-card">
   <style>
@@ -971,6 +1017,12 @@ def _wrap_interactive_html(
       display: inline-block;
       will-change: transform;
     }}
+    #{uid}_root .psyre-viz-view {{
+      display: none;
+    }}
+    #{uid}_root .psyre-viz-view.active {{
+      display: block;
+    }}
     #{uid}_root .psyre-viz-view svg {{
       display: block;
       overflow: visible;
@@ -1067,13 +1119,13 @@ def _wrap_interactive_html(
     <div id="{uid}_info">{default_hint}</div>
     <div class="psyre-viz-legend">{fsm_legend_html}
       <span><i class="psyre-swatch"
-        style="background:#FEF3C7;border:1px solid #D97706"></i>when</span>
+        style="background:{STYLE_SELECTOR[0]};border:1px solid {STYLE_SELECTOR[1]}"></i>when</span>
       <span><i class="psyre-swatch"
-        style="background:#CCFBF1;border:1px solid #0D9488"></i>merge</span>
+        style="background:{STYLE_MUX[0]};border:1px solid {STYLE_MUX[1]}"></i>merge</span>
       <span><i class="psyre-swatch"
-        style="background:#EDE9FE;border:1px solid #6D28D9"></i>fby/pre (∨) · post (∧)</span>
+        style="background:{STYLE_FBY[0]};border:1px solid {STYLE_FBY[1]}"></i>fby/pre (∨) · post (∧)</span>
       <span><i class="psyre-swatch"
-        style="background:#F3E8FF;border:1px solid #7C3AED"></i>morph · Σ · δₖ · FIFO</span>
+        style="background:{STYLE_STATEFUL[0]};border:1px solid {STYLE_STATEFUL[1]}"></i>morph · Σ · FIFO</span>
     </div>
   </div>
   <script>
@@ -1099,11 +1151,13 @@ def _wrap_interactive_html(
       Array.from(canvas.querySelectorAll(".psyre-viz-view")).forEach((el) => {{
         viewCache.set(el.getAttribute("data-psyre-view") || "", el);
       }});
-      let currentKey = {initial_key_json};
       let switchSeq = 0;
-      const expandedSet = new Set(
-        currentKey ? currentKey.split("|").filter(Boolean) : []
-      );
+      const expandedSet = new Set();
+      function setExpandedFromKey(key) {{
+        expandedSet.clear();
+        if (key) key.split("|").filter(Boolean).forEach((p) => expandedSet.add(p));
+      }}
+      setExpandedFromKey({initial_key_json});
 
       function activeSvg() {{
         const v =
@@ -1122,16 +1176,19 @@ def _wrap_interactive_html(
       const MAX_SCALE = 12.0;
       const TRACK_PAD = 8;
 
-      function scaleToRatio(s) {{
+      function logScaleBounds() {{
         const logMin = Math.log(minScale);
-        const logSpan = Math.log(MAX_SCALE) - logMin;
+        return {{ logMin, logSpan: Math.log(MAX_SCALE) - logMin }};
+      }}
+
+      function scaleToRatio(s) {{
+        const {{ logMin, logSpan }} = logScaleBounds();
         const clamped = Math.min(MAX_SCALE, Math.max(minScale, s));
         return (Math.log(clamped) - logMin) / logSpan;
       }}
 
       function ratioToScale(r) {{
-        const logMin = Math.log(minScale);
-        const logSpan = Math.log(MAX_SCALE) - logMin;
+        const {{ logMin, logSpan }} = logScaleBounds();
         const clamped = Math.min(1, Math.max(0, r));
         return Math.exp(logMin + clamped * logSpan);
       }}
@@ -1214,17 +1271,6 @@ def _wrap_interactive_html(
         infoEl.textContent = defaultMsg;
       }}
 
-      function hasView(key) {{
-        return availableKeySet.has(key);
-      }}
-
-      function setExpandedFromKey(key) {{
-        expandedSet.clear();
-        if (key) {{
-          key.split("|").forEach((p) => expandedSet.add(p));
-        }}
-      }}
-
       async function decodeGzSvg(b64) {{
         const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
@@ -1247,14 +1293,13 @@ def _wrap_interactive_html(
         const div = document.createElement("div");
         div.className = "psyre-viz-view";
         div.setAttribute("data-psyre-view", key);
-        div.style.display = "none";
         div.innerHTML = svgMarkup;
         viewCache.set(key, div);
         return div;
       }}
 
       async function switchView(nextKey, statusMsg) {{
-        if (!hasView(nextKey)) return;
+        if (!availableKeySet.has(nextKey)) return;
         const seq = ++switchSeq;
         let targetEl;
         try {{
@@ -1264,13 +1309,11 @@ def _wrap_interactive_html(
           return;
         }}
         if (seq !== switchSeq || !targetEl) return;
-        currentKey = nextKey;
         setExpandedFromKey(nextKey);
         if (lazyMode) {{
           Array.from(canvas.querySelectorAll(".psyre-viz-view")).forEach((v) => {{
             if (v !== targetEl) {{
               v.classList.remove("active");
-              v.style.display = "none";
               v.remove();
             }}
           }});
@@ -1278,12 +1321,9 @@ def _wrap_interactive_html(
             canvas.appendChild(targetEl);
           }}
           targetEl.classList.add("active");
-          targetEl.style.display = "block";
         }} else {{
           viewCache.forEach((v, k) => {{
-            const isTarget = k === nextKey;
-            v.classList.toggle("active", isTarget);
-            v.style.display = isTarget ? "block" : "none";
+            v.classList.toggle("active", k === nextKey);
           }});
         }}
         clearSelection();
@@ -1291,21 +1331,26 @@ def _wrap_interactive_html(
         fitToStage();
       }}
 
-      function expandPrefix(pfx) {{
-        const ancs = [];
+      function ancestorPrefixes(pfx, includeSelf) {{
         const parts = pfx.split("/");
-        for (let i = 1; i <= parts.length; i++) {{
+        const limit = includeSelf ? parts.length : parts.length - 1;
+        const result = [];
+        for (let i = 1; i <= limit; i++) {{
           const anc = parts.slice(0, i).join("/");
-          if (allPrefixes.includes(anc)) {{
-            expandedSet.add(anc);
-            ancs.push(anc);
-          }}
+          if (allPrefixes.includes(anc)) result.push(anc);
         }}
-        let nextKey = Array.from(expandedSet).sort().join("|");
-        if (!hasView(nextKey)) {{
+        return result;
+      }}
+
+      function expandPrefix(pfx) {{
+        const ancs = ancestorPrefixes(pfx, true);
+        const candidate = new Set(expandedSet);
+        ancs.forEach((a) => candidate.add(a));
+        let nextKey = Array.from(candidate).sort().join("|");
+        if (!availableKeySet.has(nextKey)) {{
           nextKey = ancs.slice().sort().join("|");
         }}
-        if (!hasView(nextKey)) {{
+        if (!availableKeySet.has(nextKey)) {{
           let bestKey = allPrefixes.slice().sort().join("|");
           let bestLen = Infinity;
           availableKeys.forEach((k) => {{
@@ -1324,22 +1369,14 @@ def _wrap_interactive_html(
       }}
 
       function collapsePrefix(pfx) {{
-        for (const item of Array.from(expandedSet)) {{
-          if (item === pfx || item.startsWith(pfx + "/")) {{
-            expandedSet.delete(item);
-          }}
+        const candidate = Array.from(expandedSet).filter(
+          (item) => item !== pfx && !item.startsWith(pfx + "/")
+        );
+        let nextKey = candidate.sort().join("|");
+        if (!availableKeySet.has(nextKey)) {{
+          nextKey = ancestorPrefixes(pfx, false).sort().join("|");
         }}
-        let nextKey = Array.from(expandedSet).sort().join("|");
-        if (!hasView(nextKey)) {{
-          const ancOnly = [];
-          const parts = pfx.split("/");
-          for (let i = 1; i < parts.length; i++) {{
-            const anc = parts.slice(0, i).join("/");
-            if (allPrefixes.includes(anc)) ancOnly.push(anc);
-          }}
-          nextKey = ancOnly.sort().join("|");
-        }}
-        if (!hasView(nextKey)) {{
+        if (!availableKeySet.has(nextKey)) {{
           nextKey = "";
         }}
         switchView(
@@ -1500,12 +1537,9 @@ def _wrap_interactive_html(
             ty = Math.max(12, (rect.height - h) * 0.5);
             applyTransform();
           }} else if (act === "expand-all") {{
-            expandedSet.clear();
-            allPrefixes.forEach((p) => expandedSet.add(p));
-            const nextKey = Array.from(expandedSet).sort().join("|");
+            const nextKey = Array.from(new Set(allPrefixes)).sort().join("|");
             switchView(nextKey, "Expanded all automata");
           }} else if (act === "collapse-all") {{
-            expandedSet.clear();
             switchView("", "Collapsed all automata");
           }}
         }});
@@ -1598,14 +1632,12 @@ def _wrap_interactive_html(
         }});
       }});
 
-      let lastStageWidth = 0;
       if (typeof ResizeObserver !== "undefined") {{
         const ro = new ResizeObserver((entries) => {{
           const w = entries[0] && entries[0].contentRect.width;
-          if (w && Math.abs(w - lastStageWidth) > 4) {{
-            const firstLayout = lastStageWidth === 0;
-            lastStageWidth = w;
-            if (firstLayout) fitToStage();
+          if (w > 4) {{
+            ro.disconnect();
+            fitToStage();
           }}
         }});
         ro.observe(stage);
@@ -1617,18 +1649,20 @@ def _wrap_interactive_html(
 </div>"""
 
 
+def _resolve_initial_view_key(bundle: SchematicBundle) -> str:
+  """Returns the initial view key present in `bundle.views`."""
+  if bundle.initial_view_key in bundle.views:
+    return bundle.initial_view_key
+  if '' in bundle.views:
+    return ''
+  if bundle.views:
+    return next(iter(bundle.views))
+  raise ValueError('SchematicBundle.views must contain at least one view.')
+
+
 def render_bundle_html(bundle: SchematicBundle) -> str:
   """Renders a `SchematicBundle` into a self-contained interactive HTML viewer."""
-  svg_views = {key: render_view_svg(view) for key, view in bundle.views.items()}
-  return _wrap_interactive_html(
-      svg_views,
-      title=bundle.title,
-      semantics_label=bundle.semantics_label,
-      node_count=bundle.node_count,
-      height_px=bundle.height_px,
-      initial_view_key=bundle.initial_view_key,
-      fsm_prefixes=bundle.fsm_prefixes,
-  )
+  return build_visualization(bundle).html
 
 
 def _get_temp_export_dir() -> str:
@@ -1644,17 +1678,15 @@ def _write_export_text(
     content: str,
     path: str | None,
     *,
-    stem: str,
     suffix: str,
 ) -> str:
   """Writes `content` to `path` or a session temporary file and returns path."""
   if path is None:
-    safe_stem = re.sub(r'[^A-Za-z0-9_.-]+', '_', stem).strip('_') or 'psyre'
     with tempfile.NamedTemporaryFile(
         mode='w',
         encoding='utf-8',
         dir=_get_temp_export_dir(),
-        prefix=f'{safe_stem}_',
+        prefix='psyre_graph_',
         suffix=suffix,
         delete=False,
     ) as tmp_file:
@@ -1689,21 +1721,17 @@ class GraphVisualization:
 
   def save_svg(self, path: str | None = None) -> str:
     """Writes standalone SVG to `path` (or a temporary file if `None`)."""
-    return _write_export_text(self.svg, path, stem='psyre_graph', suffix='.svg')
+    return _write_export_text(self.svg, path, suffix='.svg')
 
   def save_html(self, path: str | None = None) -> str:
     """Writes interactive HTML to `path` (or a temporary file if `None`)."""
-    return _write_export_text(
-        self.html, path, stem='psyre_graph', suffix='.html'
-    )
+    return _write_export_text(self.html, path, suffix='.html')
 
 
 def build_visualization(bundle: SchematicBundle) -> GraphVisualization:
   """Builds a `GraphVisualization` from a `SchematicBundle`."""
+  initial_key = _resolve_initial_view_key(bundle)
   svg_views = {key: render_view_svg(view) for key, view in bundle.views.items()}
-  initial_key = (
-      bundle.initial_view_key if bundle.initial_view_key in svg_views else ''
-  )
   html_markup = _wrap_interactive_html(
       svg_views,
       title=bundle.title,

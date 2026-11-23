@@ -14,9 +14,11 @@
 """Unit tests for asynchronous (Kahn) Psyre stream primitives and execution."""
 
 import enum
+import io
 import logging
 import operator
 from typing import Any
+from unittest import mock
 
 from absl.testing import absltest
 
@@ -28,11 +30,12 @@ from psyre.automaton import (
     until,
 )
 from psyre.common import (
+    Absent,
+    Bottom,
     Semantics,
     buffer,
     counter,
     current,
-    delay,
     fby,
     ifthenelse,
     logger,
@@ -41,8 +44,10 @@ from psyre.common import (
     post,
     pre,
     prefix_sum,
+    psyre_comb,
     reset,
     scan,
+    switch,
     when,
     whennot,
 )
@@ -53,7 +58,7 @@ from psyre.match import (
     match,
 )
 from psyre.scheduler import Scheduler
-from psyre.stream import Stream, resolve_handle
+from psyre.stream import Stream
 from psyre.trace import present_values
 
 # pylint: enable=g-importing-member,g-multiple-import
@@ -67,8 +72,6 @@ class _Mode(enum.Enum):
 class _Vec:
   """Minimal object supporting the @ operator for testing Stream matmul."""
 
-  value: int
-
   def __init__(self, value: int):
     self.value = value
 
@@ -80,9 +83,54 @@ class _Vec:
 
 class KahnTest(absltest.TestCase):
 
-  def test_experiments(self):
-    logger.setLevel(logging.INFO)
+  def setUp(self):
+    super().setUp()
+    logger.setLevel(logging.WARNING)
 
+  def _assert_absent_bottom_elision(
+      self, sync_vals: list[Any], kahn_vals: list[Any]
+  ) -> None:
+    """Asserts unpadded KAHN trace has no Absent/Bottom and matches SYNC."""
+    self.assertTrue(
+        all(v is not Absent and v is not Bottom for v in kahn_vals),
+        f'Unexpected Absent/Bottom sentinel in KAHN trace: {kahn_vals!r}',
+    )
+    self.assertEqual(present_values(sync_vals), kahn_vals)
+
+  def _run_and_assert_elision(
+      self,
+      prog: Any,
+      *,
+      horizon: int,
+      streams: tuple[str, ...] | None = None,
+      label: str = 'output',
+  ) -> tuple[Any, Any]:
+    """Runs `prog` in SYNC and KAHN and checks Absent/Bottom-elision match."""
+    sync_res = Scheduler.run(
+        prog,
+        horizon=horizon,
+        semantics=Semantics.SYNC,
+        clock_calculus=True,
+        streams=streams,
+    )
+    self.assertFalse(Scheduler.deadlocked)
+    kahn_res = Scheduler.run(
+        prog,
+        horizon=horizon,
+        semantics=Semantics.KAHN,
+        clock_calculus=True,
+        streams=streams,
+    )
+    self.assertFalse(Scheduler.deadlocked)
+    if isinstance(sync_res, dict):
+      for key, sync_vals in sync_res.items():
+        with self.subTest(**{label: key}):
+          self._assert_absent_bottom_elision(sync_vals, kahn_res[key])
+    else:
+      self._assert_absent_bottom_elision(sync_res, kahn_res)
+    return sync_res, kahn_res
+
+  def test_experiments(self):
     def inner():
       nat = counter()
       prefix = prefix_sum(nat)
@@ -98,14 +146,16 @@ class KahnTest(absltest.TestCase):
       cur = current(b3, merged)
       return ifthenelse(cur, cur, 0)
 
-    self.assertEqual(
-        Scheduler.run(inner, horizon=6, semantics=Semantics.KAHN),
-        [0, 1, 1, 1, 20, 20],
-    )
+    logger.setLevel(logging.INFO)
+    try:
+      self.assertEqual(
+          Scheduler.run(inner, horizon=6, semantics=Semantics.KAHN),
+          [0, 1, 1, 1, 20, 20],
+      )
+    finally:
+      logger.setLevel(logging.WARNING)
 
   def test_operators(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       s = Stream([2, 3, 4])
       v = Stream([_Vec(2), _Vec(3), _Vec(4)])
@@ -206,24 +256,7 @@ class KahnTest(absltest.TestCase):
       with self.subTest(operator=name):
         self.assertEqual(actual[name], expected_values)
 
-  def test_random_stream(self):
-    logger.setLevel(logging.WARNING)
-    r1, r2 = Scheduler.run(
-        lambda: (Stream.random(), Stream.random()),
-        horizon=5,
-        semantics=Semantics.KAHN,
-    )
-    self.assertLen(r1, 5)
-    self.assertLen(r2, 5)
-    for v in r1 + r2:
-      self.assertGreaterEqual(v, 0.0)
-      self.assertLess(v, 1.0)
-    self.assertGreater(len(set(r1)), 1)
-    self.assertNotEqual(r1, r2)
-
   def test_ifthenelse(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       cond = [True, False, True, False]
       true_branch = [1, 2, 3, 4]
@@ -236,8 +269,6 @@ class KahnTest(absltest.TestCase):
     )
 
   def test_scan(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       return (
           scan([1, 2, 3, 4], op=operator.add),
@@ -255,8 +286,6 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(min_s, [3, 1, 1, -2])
 
   def test_when_and_whennot(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       cond = [True, False, True, False, True]
       inp = [10, 20, 30, 40, 50]
@@ -267,8 +296,6 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(wn_out, [20, 40])
 
   def test_merge(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       cond = Stream([True, False, False, True, False])
       true_branch = [1, 2]
@@ -278,9 +305,6 @@ class KahnTest(absltest.TestCase):
       typed_sel = [True, 1, False, 0, None]
       return {
           'merge': merge(cond, true_branch, false_branch),
-          'merge_ignore_default': merge(
-              cond, true_branch, false_branch, default=[-1]
-          ),
           'roundtrip': merge(cond, when(cond, inp), whennot(cond, inp)),
           'multi_merge': merge(
               sel,
@@ -301,19 +325,26 @@ class KahnTest(absltest.TestCase):
 
     res = Scheduler.run(inner, horizon=5, semantics=Semantics.KAHN)
     self.assertEqual(res['merge'], [1, 10, 20, 2, 30])
-    self.assertEqual(res['merge_ignore_default'], [1, 10, 20, 2, 30])
     self.assertEqual(res['roundtrip'], [100, 200, 300, 400, 500])
     self.assertEqual(res['multi_merge'], [1, 10, 100, 2, -1])
     self.assertEqual(res['bool_none_merge'], [10, -1, 30, -2, 50])
     self.assertEqual(res['int_merge'], [-1, 20, -2, 40, -3])
 
-  def test_fby(self):
-    logger.setLevel(logging.WARNING)
+    for op_fn in (merge, switch):
+      with self.assertRaisesRegex(ValueError, 'does not accept default='):
+        Scheduler.run(
+            lambda fn=op_fn: fn(
+                Stream([True, False]), [1, 2], [3, 4], default=[-1]
+            ),
+            horizon=2,
+            semantics=Semantics.KAHN,
+        )
 
+  def test_fby(self):
     def inner():
-      init = [10, 20, 30, 40, 50]
-      delayed = [1, 2, 3, 4, 5]
-      rst = [False, False, False, True, False]
+      init = Stream([10, 20, 30, 40, 50])
+      delayed = Stream([1, 2, 3, 4, 5])
+      rst = Stream([False, False, False, True, False])
       with reset(rst):
         fby_rst = fby(init, delayed)
         fby_n_rst = fby(init, delayed, 2)
@@ -345,36 +376,64 @@ class KahnTest(absltest.TestCase):
     self.assertFalse(Scheduler.deadlocked)
 
   def test_buffer(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       inp = [10, 20, 30, 40]
       inp_p = [True, True, False, False, True, False, True]
       out_p = [False, False, True, True, False, True, True]
-      return buffer(inp, inp_p, out_p), buffer(inp, inp_p, out_p, size=2)
+      return buffer(inp, inp_p, out_p, size=2)
 
-    size_one, size_two = Scheduler.run(
-        inner, horizon=7, semantics=Semantics.KAHN
-    )
-    self.assertEqual(size_one, [20, None, 30, 40])
+    size_two = Scheduler.run(inner, horizon=7, semantics=Semantics.KAHN)
     self.assertEqual(size_two, [10, 20, 30, 40])
 
-  def test_delay(self):
-    logger.setLevel(logging.WARNING)
+    # Valid `None` stream values flow cleanly through `buffer` in KAHN.
+    def none_payload():
+      inp = [None, 20, None, 40]
+      inp_p = [True, True, False, False, True, False, True]
+      out_p = [False, False, True, True, False, True, True]
+      return buffer(inp, inp_p, out_p, size=2)
 
-    def inner():
-      inp = [10, 20, 30, 40]
-      sched = Stream.periodic([False, False], [True, False])
-      return delay(inp), delay(inp, 2), delay(inp, period=sched)
+    self.assertEqual(
+        Scheduler.run(none_payload, horizon=7, semantics=Semantics.KAHN),
+        [None, 20, None, 40],
+    )
 
-    d1, d2, dp = Scheduler.run(inner, horizon=4, semantics=Semantics.KAHN)
-    self.assertEqual(d1, [10, 20, 30, 40])
-    self.assertEqual(d2, [10, 20, 30, 40])
-    self.assertEqual(dp, [10, 20, 30, 40])
+    for prog, horizon, pattern in (
+        (
+            lambda: buffer([10, 20], [True, True], [False, False], size=1),
+            2,
+            'RingBuffer overflow',
+        ),
+        (
+            lambda: buffer([None, 1], [True, True], [False, False], size=1),
+            2,
+            'RingBuffer overflow',
+        ),
+        (
+            lambda: buffer([10], [False], [True], size=1),
+            1,
+            'RingBuffer underflow',
+        ),
+        (
+            lambda: buffer(
+                [None], [True, False, False], [False, True, True], size=1
+            ),
+            3,
+            'RingBuffer underflow',
+        ),
+    ):
+      with self.subTest(pattern=pattern, horizon=horizon):
+        with self.assertRaises(ExceptionGroup) as eg:
+          Scheduler.run(prog, horizon=horizon, semantics=Semantics.KAHN)
+        self.assertTrue(
+            any(
+                isinstance(err, BufferError) and pattern in str(err)
+                for err in eg.exception.exceptions
+            ),
+            f'Expected BufferError matching {pattern!r}, got '
+            f'{eg.exception.exceptions!r}',
+        )
 
   def test_once_stream(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       rst = [False, False, True, False, False]
       with reset(rst):
@@ -390,8 +449,6 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(o1_rst, [False, True, False, True, False])
 
   def test_periodic_stream(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       return Stream.periodic([1, 2], [10, 20]), Stream.periodic([], [7, 8, 9])
 
@@ -402,7 +459,6 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(empty_prefix, [7, 8, 9, 7, 8, 9])
 
   def test_pre(self):
-    logger.setLevel(logging.WARNING)
     self.assertEqual(
         Scheduler.run(
             lambda: (pre([10, 20, 30, 40]), pre([10, 20, 30, 40], 2)),
@@ -413,8 +469,6 @@ class KahnTest(absltest.TestCase):
     )
 
   def test_post(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       inp = [10, 20, 30, 40]
       return (
@@ -433,12 +487,10 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(pn_pre, [10, 20])
 
   def test_morph(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
-      first = [10, 20, 30, 40, 50]
-      rest = [1, 2, 3, 4, 5]
-      rst = [False, False, False, True, False]
+      first = Stream([10, 20, 30, 40, 50])
+      rest = Stream([1, 2, 3, 4, 5])
+      rst = Stream([False, False, False, True, False])
       with reset(rst):
         m_rst = morph(first, rest)
         m2_rst = morph(first, rest, 2)
@@ -453,8 +505,6 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(m2_rst, [10, 20, 3, 40, 50])
 
   def test_current(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       cond = [False, True, False, False, True, False]
       inp = [10, 20, 30, 40, 50, 60]
@@ -467,11 +517,9 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(custom_d, [-1, 20, 20, 20, 50, 50])
 
   def test_counter(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
-      rst = [False, False, True, False, False]
-      rst2 = [False, False, False, False, True]
+      rst = Stream([False, False, True, False, False])
+      rst2 = Stream([False, False, False, False, True])
       with reset(rst):
         with_rst = counter(start=10)
         with reset(rst2):
@@ -487,11 +535,9 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(nested_rst, [10, 11, 10, 11, 10])
 
   def test_prefix_sum(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
-      inp = [1, 2, 3, 4, 5]
-      rst = [False, False, True, False, False]
+      inp = Stream([1, 2, 3, 4, 5])
+      rst = Stream([False, False, True, False, False])
       with reset(rst):
         with_rst = prefix_sum(inp, start=10)
       return prefix_sum(inp), prefix_sum(inp, start=10), with_rst
@@ -504,27 +550,21 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(with_rst, [11, 13, 13, 17, 22])
 
   def test_reset(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
-      inp = [10, 20, 30, 40, 50]
-      init = [100, 200, 300, 400, 500]
-      delayed = [1, 2, 3, 4, 5]
-      cond = [True, False, True, False, True]
-      rst = [False, False, True, False, False]
-      rst2 = [False, False, False, False, True]
+      inp = Stream([10, 20, 30, 40, 50])
+      init = Stream([100, 200, 300, 400, 500])
+      delayed = Stream([1, 2, 3, 4, 5])
+      cond = Stream([True, False, True, False, True])
+      rst = Stream([False, False, True, False, False])
+      max_inp = Stream([3, 5, 1, 4, 2])
 
       with reset(rst):
         scan_r = scan(inp, op=operator.add)
-        scan_max_r = scan([3, 5, 1, 4, 2], op=Stream.max)
+        scan_max_r = scan(max_inp, op=Stream.max)
         fby_r = fby(init, delayed)
         post_r = post(inp)
         morph_r = morph(init, delayed)
-        counter_r = counter(start=10)
-        psum_r = prefix_sum(inp, start=100)
         when_fby_r = when(cond, fby(init, delayed))
-        with reset(rst2):
-          nested_counter_r = counter(start=10)
 
       return {
           'scan': scan_r,
@@ -532,10 +572,7 @@ class KahnTest(absltest.TestCase):
           'fby': fby_r,
           'post': post_r,
           'morph': morph_r,
-          'counter': counter_r,
-          'prefix_sum': psum_r,
           'when_fby': when_fby_r,
-          'nested_counter': nested_counter_r,
       }
 
     res = Scheduler.run(inner, horizon=5, semantics=Semantics.KAHN)
@@ -544,24 +581,19 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(res['fby'], [100, 1, 300, 3, 4])
     self.assertEqual(res['post'], [20, 30, 40, 50, 50])
     self.assertEqual(res['morph'], [100, 2, 300, 4, 5])
-    self.assertEqual(res['counter'], [10, 11, 10, 11, 12])
-    self.assertEqual(res['prefix_sum'], [110, 130, 130, 170, 220])
     self.assertEqual(res['when_fby'], [100, 300, 4])
-    self.assertEqual(res['nested_counter'], [10, 11, 10, 11, 10])
 
   def test_nested_match_subclocks_and_resets(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       outer_gate = Stream([True, False, True, True, False, True])
-      inner_gate = Stream([True, True, False, True, True, True])
-      outer_reset = Stream([False, False, True, False, False, False])
-      inner_reset = Stream([False, False, False, True, False, False])
+      inner_gate = Stream([True, False, True, True])
+      outer_reset = Stream([False, True, False, False])
+      inner_reset = Stream([False, True, False])
       downsampled = when(outer_gate, [1, 2, 3, 4, 5, 6])
 
       with match(outer_gate):
         with case(True):
-          when_in_case = downsampled + [100, 200, 300, 400, 500, 600]
+          when_in_case = downsampled + [100, 200, 300, 400]
           when_in_case.name = 'when_in_case'
           with reset(outer_reset):
             counter(start=10, name='gated_counter')
@@ -581,27 +613,25 @@ class KahnTest(absltest.TestCase):
         streams=('when_in_case', 'gated_counter', 'nested_counter'),
     )
     self.assertFalse(Scheduler.deadlocked)
-    self.assertEqual(res['when_in_case'], [101, 303, 404, 606])
+    self.assertEqual(res['when_in_case'], [101, 203, 304, 406])
     self.assertEqual(res['gated_counter'], [10, 10, 11, 12])
     self.assertEqual(res['nested_counter'], [100, 100, 101])
 
   def test_match(self):
-    logger.setLevel(logging.WARNING)
-
     def inner():
       mode = Stream(
           [_Mode.FAST, _Mode.SLOW, _Mode.FAST, _Mode.SLOW, _Mode.FAST]
       )
       x = Stream([10, 20, 30, 40, 50])
       dyn_x = counter(start=1) * 10
-      rst = Stream([False, False, False, False, True])
+      rst = Stream([False, False, True])
 
       with match(mode) as enum_m:
         with case(_Mode.FAST):
           with reset(rst):
             enum_m.out = counter(start=0) + 2 * x
           enum_m.passthrough = dyn_x
-          enum_m.seq_or_const = [100, 200, 300, 400, 500]
+          enum_m.seq_or_const = [100, 200, 300]
           enum_m.delayed = lambda: late_x
         with case(_Mode.SLOW):
           enum_m.out = counter(start=100) + x
@@ -612,7 +642,9 @@ class KahnTest(absltest.TestCase):
       late_x = Stream([1, 2, 3, 4, 5])
 
       # Guarded partial operation (avoids division by zero) + never-taken arm.
-      denom = Stream([2, 0, 5, 0, 10])
+      # `denom` is made a dynamic base-clock stream so `match` downsamples
+      # `denom` (skipping zeros) in the default arm.
+      denom = when(Stream(True), [2, 0, 5, 0, 10])
       with match(denom) as div_m:
         with case(0):
           div_m.q_sampled = -1
@@ -624,20 +656,20 @@ class KahnTest(absltest.TestCase):
           div_m.q_sampled = 100 // nz
           div_m.q_outer = 100 // denom
 
-      # Nested match where inner selector carries invalid tags when outer arm
-      # is inactive.
+      # Nested match where a dynamic base-clock inner selector carries invalid
+      # tags when the outer arm is inactive.
       outer_sel = Stream(['LEFT', 'RIGHT', 'LEFT', 'RIGHT', 'LEFT'])
-      inner_sel = Stream([1, 999, 2, 999, 1])
+      inner_sel = when(Stream(True), [1, 999, 2, 999, 1])
       with match(outer_sel) as nested_m:
         with case('LEFT'):
           with match(inner_sel) as inner_m:
             with case(1):
-              inner_m.val = scan(x)
+              inner_m.val = scan(dyn_x)
             with case(2):
-              inner_m.val = x + 2
+              inner_m.val = dyn_x + 2
           nested_m.out = inner_m.val
         with case():
-          nested_m.out = -x
+          nested_m.out = -dyn_x
 
       return enum_m, div_m, nested_m.out
 
@@ -645,17 +677,15 @@ class KahnTest(absltest.TestCase):
         inner, horizon=5, semantics=Semantics.KAHN
     )
     self.assertFalse(Scheduler.deadlocked)
-    self.assertEqual(enum_res['out'], [20, 120, 61, 141, 100])
+    self.assertEqual(enum_res['out'], [20, 110, 41, 121, 60])
     self.assertEqual(enum_res['passthrough'], [10, -1, 30, -1, 50])
-    self.assertEqual(enum_res['seq_or_const'], [100, 7, 300, 7, 500])
-    self.assertEqual(enum_res['delayed'], [1, 0, 3, 0, 5])
+    self.assertEqual(enum_res['seq_or_const'], [100, 7, 200, 7, 300])
+    self.assertEqual(enum_res['delayed'], [1, 0, 2, 0, 3])
     self.assertEqual(div_res['q_sampled'], [50, -1, 20, -1, 10])
     self.assertEqual(div_res['q_outer'], [50, -1, 20, -1, 10])
     self.assertEqual(nested_out, [10, -20, 32, -40, 60])
 
   def test_match_last(self):
-    logger.setLevel(logging.WARNING)
-
     def accum(cmd: Stream) -> Stream:
       with match(cmd) as m:
         prev = last(lambda: m.val, 10)
@@ -692,7 +722,7 @@ class KahnTest(absltest.TestCase):
           inline_m.val = last(lambda: inline_m.val, 10)
 
       outer_sel = Stream(['ON', 'OFF', 'ON', 'OFF', 'ON', 'ON'])
-      sub_cmd = Stream(['INC', 'INC', 'INC', 'DEC', 'DEC', 'INC'])
+      sub_cmd = Stream(['INC', 'INC', 'DEC', 'INC'])
       with match(outer_sel) as hier_m:
         with case('ON'):
           hier_m.out = accum(sub_cmd)
@@ -716,38 +746,90 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(res['inline_accum'], [15, 20, 20, 18, 23, 21])
     self.assertEqual(res['hier_accum'], [15, -1, 20, -1, 18, 23])
 
-  def test_automaton_unsupported(self):
-    logger.setLevel(logging.WARNING)
+  def test_automaton_and_cross_activity_reset(self):
+    def program():
+      # 1. Instantaneous and internally-delayed cross-activity resets:
+      c = Stream([True, False, True, False, True, True])
+      r = Stream([False, True, False, False, False, True])
+      with reset(r):
+        with match(c) as sup_m:
+          with case(True):
+            sup_m.cnt = counter(start=10)
+          with case(False):
+            sup_m.cnt = 0
 
-    def automaton_fn():
-      with automaton() as fsm:
-        with state('A'):
-          fsm.out = 1
+      # 2. Static-False gate under cross-activity reset terminates cleanly:
+      with reset(r):
+        with match(Stream(False)) as dead_m:
+          with case(True):
+            dead_m.out = counter(start=1)
+          with case(False):
+            dead_m.out = -1
 
-    def state_fn():
-      with state('A'):
-        pass
+      # 3. Resetting subclock stateful nodes outside `when` or `match`
+      #    (directly, over `buffer`, and with an extra `when`-guarded reset):
+      x = Stream([10, 20, 30, 40, 50, 60])
+      r_d = Stream([False, False, True, False, False, False])
+      with reset(r):
+        coarse_fby = fby(99, when(c, x))
+        coarse_scan = scan(when(c, x))
+        with reset(when(c, False)):
+          manual_fby = fby(99, when(c, x))
+      with reset(r_d):
+        buf_fby = fby(99, buffer(x, True, morph(False, True, n=1), size=3))
 
-    def unless_fn():
-      unless(Stream(True), 'A')
+      # 4. Hierarchical automaton with outer reset=True and inner reset=False:
+      outer_flip = Stream([False, False, True, True, False, False])
+      inner_flip = Stream([True, False, False, False, True, False])
+      with automaton(init='ON') as outer:
+        with state('ON'):
+          with automaton(init='X') as inner_fsm:
+            with state('X'):
+              until(inner_flip, 'Y', reset=False)
+              inner_fsm.y = counter(start=0)
+            with state('Y', unless(r, 'X', reset=True)):
+              until(inner_flip, 'X', reset=False)
+              inner_fsm.y = counter(start=10)
+          until(outer_flip, 'OFF', reset=True)
+          outer.out = inner_fsm.y
+        with state('OFF'):
+          until(outer_flip, 'ON', reset=True)
+          outer.out = -1
 
-    def until_fn():
-      until(Stream(True), 'A')
+      return {
+          'sup_cnt': sup_m.cnt,
+          'dead_gate': dead_m.out,
+          'coarse_fby': coarse_fby,
+          'coarse_scan': coarse_scan,
+          'manual_fby': manual_fby,
+          'buf_fby': buf_fby,
+          'hier_fsm': outer.out,
+      }
 
-    for fn in (
-        automaton_fn,
-        state_fn,
-        unless_fn,
-        until_fn,
-    ):
-      with self.assertRaisesRegex(
-          RuntimeError, 'only supported under SYNC semantics'
-      ):
-        Scheduler.run(fn, horizon=2, semantics=Semantics.KAHN)
+    _, kahn_res = self._run_and_assert_elision(program, horizon=6)
+    self.assertEqual(kahn_res['sup_cnt'], [10, 0, 10, 0, 11, 10])
+    self.assertEqual(kahn_res['dead_gate'], [-1, -1, -1, -1, -1, -1])
+    self.assertEqual(kahn_res['coarse_fby'], [99, 99, 30, 99])
+    self.assertEqual(kahn_res['coarse_scan'], [10, 30, 80, 60])
+    self.assertEqual(kahn_res['manual_fby'], [99, 99, 30, 99])
+    self.assertEqual(kahn_res['buf_fby'], [99, 99, 30, 40])
+
+    # Base-clock KAHN programs with resets still run when clock_calculus=False:
+    def base_clock_reset():
+      r = Stream([False, False, True, False, False, False])
+      with reset(r):
+        return counter(start=1)
+
+    base_cnt = Scheduler.run(
+        base_clock_reset,
+        horizon=6,
+        semantics=Semantics.KAHN,
+        clock_calculus=False,
+    )
+    self.assertFalse(Scheduler.deadlocked)
+    self.assertEqual(base_cnt, [1, 2, 1, 2, 3, 4])
 
   def test_deadlock_and_local_starvation(self):
-    logger.setLevel(logging.WARNING)
-
     def causal_starvation():
       starved = when(False, counter()) + 1
       short = post(counter(start=10)) + 1
@@ -782,7 +864,6 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(healthy_s, [1, 3, 6, 10, 15, 21, 28, 36])
 
   def test_max_min_and_stream_bool(self):
-    logger.setLevel(logging.WARNING)
     s = Stream([-1.0, 2.0])
     self.assertIsInstance(s, Stream)
     s_any: Any = s
@@ -824,20 +905,7 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(res['min_multi'], [-3, -2, 0, -4])
     self.assertEqual(res['clamped'], [0, 2, 4, 5])
 
-  def test_resolve_handle(self):
-    logger.setLevel(logging.WARNING)
-    s = Stream([10, 20])
-    h_direct = resolve_handle(s)
-    h_thunk = resolve_handle(lambda: s)
-    h_nested = resolve_handle(lambda: lambda: s)
-    h_static = resolve_handle([7, 8])
-    self.assertIs(h_direct.istruct, s.istruct)
-    self.assertIs(h_thunk.istruct, s.istruct)
-    self.assertIs(h_nested.istruct, s.istruct)
-    self.assertTrue(h_static.istruct.static)
-
   def test_absent_elision_equivalence_with_sync(self):
-    logger.setLevel(logging.WARNING)
     horizon = 8
 
     def program():
@@ -878,13 +946,17 @@ class KahnTest(absltest.TestCase):
         with case(False):
           morph_m.val = 0
 
-      # Buffer (lossless, overwriting, under base reset, and inside match/case):
+      # Buffer (size=2, size=1, under base reset, and inside match/case):
       ip = Stream([True, True, False, False, True, False, True, False])
       op = Stream([False, True, True, False, False, True, True, False])
+      ip1 = Stream([True, False, True, True, False, True, False, False])
+      op1 = Stream([False, True, True, False, True, True, False, False])
+      ip_rst = Stream([True, True, True, False, True, False, True, False])
+      op_rst = Stream([False, True, False, True, False, True, True, False])
       buf2 = buffer(when(ip, xs), ip, op, size=2)
-      buf1 = buffer(when(ip, xs), ip, op, size=1)
+      buf1 = buffer(when(ip1, xs), ip1, op1, size=1)
       with reset(base_rst):
-        buf_rst = buffer(when(ip, xs), ip, op, size=2)
+        buf_rst = buffer(when(ip_rst, xs), ip_rst, op_rst, size=2)
       with match(op) as buf_m:
         with case(True):
           buf_active = buf2 + ys + scan(ys)
@@ -945,6 +1017,90 @@ class KahnTest(absltest.TestCase):
           with default():
             rst_last_m.total = prev_r - ys
 
+      # Cross-activity / supersampled resets (both delayed on inactive ticks
+      # and instantaneous on active ticks, single and nested match + reset):
+      super_rst = Stream(
+          [False, True, False, False, True, True, False, False]
+      )
+      with reset(super_rst):
+        with match(cond) as sup_m:
+          with case(True):
+            sup_fby = fby(xs * 10, ys, name='sup_fby')
+            sup_pre = pre(xs, name='sup_pre')
+            sup_cnt = counter(start=10, name='sup_cnt')
+            sup_scan = scan(xs, name='sup_scan')
+            sup_psum = prefix_sum(ys, start=100, name='sup_psum')
+            sup_morph = morph(xs * 10, ys, name='sup_morph')
+            sup_cur = current(inner_gate, xs, default=-1, name='sup_cur')
+            sup_once = Stream.once(1, name='sup_once')
+            post(xs, name='sup_post')
+            sup_buf = buffer(
+                when(inner_gate, xs), inner_gate, inner_gate, size=2
+            )
+            with reset(inner_rst):
+              with match(inner_gate) as sup_nested_m:
+                with case(True):
+                  sup_nested_cnt = counter(start=50, name='sup_nested_cnt')
+                  sup_nested_m.val = sup_nested_cnt + ys
+                with case(False):
+                  sup_nested_m.val = 0
+            sup_m.val = (
+                sup_fby
+                + sup_cnt
+                + sup_scan
+                + sup_psum
+                + sup_morph
+                + sup_cur
+                + merge(inner_gate, sup_buf, 0)
+                + sup_nested_m.val
+            )
+            sup_m.once = sup_once
+            sup_m.pre = sup_pre
+          with case(False):
+            sup_m.val = 0
+            sup_m.once = False
+            sup_m.pre = -1
+
+      # Flat and hierarchical automata (weak until, strong unless, reset=True
+      # and reset=False, last(), and enclosing outer reset):
+      abort = Stream([False, False, False, True, False, False, False, False])
+      wake = Stream([False, False, False, False, True, False, False, False])
+      with automaton(init='RUN') as flat_fsm:
+        prev_v = last(lambda: flat_fsm.v, init=0)
+        with state('RUN', unless(abort, 'IDLE')):
+          c_run = counter(start=1, name='flat_run_cnt')
+          until(c_run >= 2, 'HOLD', reset=False)
+          flat_fsm.v = prev_v + c_run
+        with state('HOLD'):
+          until(True, 'RUN', reset=False)
+          flat_fsm.v = prev_v + 100
+        with state('IDLE', unless(wake, 'RUN', reset=True)):
+          flat_fsm.v = counter(start=500, name='flat_idle_cnt')
+
+      outer_flip = Stream(
+          [False, False, True, True, False, False, True, False]
+      )
+      inner_flip = Stream(
+          [True, False, False, False, False, True, False, False]
+      )
+      with reset(super_rst):
+        with automaton(init='ON') as hier_fsm:
+          with state('ON'):
+            with automaton(init='X') as inner_fsm:
+              with state('X', unless(abort, 'Y')):
+                inner_x = counter(start=1, name='hier_inner_x')
+                until(inner_flip, 'Y', reset=False)
+                inner_fsm.z = last(lambda: inner_fsm.z, 10) + inner_x
+              with state('Y'):
+                inner_y = counter(start=20, name='hier_inner_y')
+                until(inner_flip, 'X', reset=False)
+                inner_fsm.z = last(lambda: inner_fsm.z, 10) + inner_y
+            until(outer_flip, 'OFF', reset=True)
+            hier_fsm.out = inner_fsm.z
+          with state('OFF'):
+            until(outer_flip, 'ON', reset=True)
+            hier_fsm.out = -1
+
       return {
           'fby_base': fby_base,
           'pre_base': pre_base,
@@ -973,21 +1129,14 @@ class KahnTest(absltest.TestCase):
           'tag_match': tag_m.acc,
           'bool_match': bool_m.val,
           'rst_last_match': rst_last_m.total,
+          'sup_match_val': sup_m.val,
+          'sup_match_once': sup_m.once,
+          'sup_match_pre': sup_m.pre,
+          'flat_fsm': flat_fsm.v,
+          'hier_fsm': hier_fsm.out,
       }
 
-    sync_traces = Scheduler.run(
-        program, horizon=horizon, semantics=Semantics.SYNC, clock_calculus=True
-    )
-    self.assertFalse(Scheduler.deadlocked)
-
-    kahn_traces = Scheduler.run(
-        program, horizon=horizon, semantics=Semantics.KAHN, clock_calculus=True
-    )
-    self.assertFalse(Scheduler.deadlocked)
-
-    for key, sync_vals in sync_traces.items():
-      with self.subTest(output=key):
-        self.assertEqual(present_values(sync_vals), kahn_traces[key])
+    self._run_and_assert_elision(program, horizon=horizon)
 
     sub_names = (
         'morph_sub',
@@ -998,26 +1147,27 @@ class KahnTest(absltest.TestCase):
         'post_sub_rst',
         'w_inner',
         'nested_scan',
+        'sup_fby',
+        'sup_pre',
+        'sup_cnt',
+        'sup_scan',
+        'sup_psum',
+        'sup_morph',
+        'sup_cur',
+        'sup_once',
+        'sup_post',
+        'sup_nested_cnt',
+        'flat_run_cnt',
+        'flat_idle_cnt',
+        'hier_inner_x',
+        'hier_inner_y',
     )
-    sync_sub_traces = Scheduler.run(
+    self._run_and_assert_elision(
         program,
         horizon=horizon,
-        semantics=Semantics.SYNC,
-        clock_calculus=True,
         streams=sub_names,
+        label='subclock_output',
     )
-    self.assertFalse(Scheduler.deadlocked)
-    kahn_sub_traces = Scheduler.run(
-        program,
-        horizon=horizon,
-        semantics=Semantics.KAHN,
-        clock_calculus=True,
-        streams=sub_names,
-    )
-    self.assertFalse(Scheduler.deadlocked)
-    for key, sync_vals in sync_sub_traces.items():
-      with self.subTest(subclock_output=key):
-        self.assertEqual(present_values(sync_vals), kahn_sub_traces[key])
 
     # Ungated Absent-strict combinational pipelines directly on a `when`
     # subclock also preserve Absent-elision across all emitted tokens within
@@ -1027,25 +1177,11 @@ class KahnTest(absltest.TestCase):
       xs = Stream([10, 20, 30, 40, 50, 60])
       return (when(cond, xs) + 1) * 2
 
-    sync_w_raw = Scheduler.run(
-        ungated_subclock_pipeline,
-        horizon=6,
-        semantics=Semantics.SYNC,
-        clock_calculus=True,
-    )
-    sync_w = present_values(sync_w_raw)
-
-    kahn_w = Scheduler.run(
-        ungated_subclock_pipeline,
-        horizon=6,
-        semantics=Semantics.KAHN,
-        clock_calculus=True,
-    )
-    self.assertEqual(kahn_w, sync_w)
+    self._run_and_assert_elision(ungated_subclock_pipeline, horizon=6)
 
     # Horizon-shortened `post` pipelines (where downstream consumers in KAHN
     # block at the horizon boundary after `post` drops initial token(s)) also
-    # satisfy Absent-elision across all emitted values:
+    # satisfy Absent/Bottom-elision across all emitted values:
     def horizon_shortened_post_pipelines():
       cond = Stream([True, False, True, True, False, True])
       xs = Stream([10, 20, 30, 40, 50, 60])
@@ -1077,40 +1213,306 @@ class KahnTest(absltest.TestCase):
           'sub_match_merged': sub_m.val,
       }
 
-    sync_post_traces = Scheduler.run(
-        horizon_shortened_post_pipelines,
-        horizon=6,
-        semantics=Semantics.SYNC,
-        clock_calculus=True,
+    sync_post_traces, _ = self._run_and_assert_elision(
+        horizon_shortened_post_pipelines, horizon=6, label='post_pipeline'
     )
-    kahn_post_traces = Scheduler.run(
-        horizon_shortened_post_pipelines,
-        horizon=6,
-        semantics=Semantics.KAHN,
-        clock_calculus=True,
-    )
-    for key, sync_vals in sync_post_traces.items():
-      with self.subTest(post_pipeline=key):
-        self.assertEqual(present_values(sync_vals), kahn_post_traces[key])
+    self.assertIs(sync_post_traces['post_chain'][-1], Bottom)
 
     sub_post_names = ('sub_post_plus', 'sub_post_chain', 'sub_post_bounded')
-    sync_sub_post = Scheduler.run(
+    sync_sub_post, _ = self._run_and_assert_elision(
         horizon_shortened_post_pipelines,
         horizon=6,
-        semantics=Semantics.SYNC,
-        clock_calculus=True,
         streams=sub_post_names,
+        label='sub_post_pipeline',
     )
-    kahn_sub_post = Scheduler.run(
-        horizon_shortened_post_pipelines,
-        horizon=6,
+    self.assertIs(sync_sub_post['sub_post_plus'][-1], Bottom)
+    self.assertIs(sync_sub_post['sub_post_chain'][-1], Bottom)
+
+  def test_kahn_shared_stopped_stream_with_post_and_non_post_consumers(self):
+    # Cancelling a post() or arm-scoped waiter on a shared stopped stream must
+    # not cancel sibling waiters or hang deadlock detection.
+    def shared_post_and_comb(lookahead: int):
+      p = post(counter(start=10), lookahead)
+      c1 = post(p)
+      c2 = p + 1
+      c3 = c2 + 1
+      return p, c1, c2, c3
+
+    p_tr, c1_tr, c2_tr, c3_tr = Scheduler.run(
+        shared_post_and_comb, 1, horizon=4, semantics=Semantics.KAHN
+    )
+    self.assertFalse(Scheduler.deadlocked)
+    self.assertEqual(p_tr, [11, 12, 13])
+    self.assertEqual(c1_tr, [12, 13])
+    self.assertEqual(c2_tr, [12, 13, 14])
+    self.assertEqual(c3_tr, [13, 14, 15])
+
+    ep, ec1, ec2, ec3 = Scheduler.run(
+        shared_post_and_comb, 4, horizon=4, semantics=Semantics.KAHN
+    )
+    self.assertTrue(Scheduler.deadlocked)
+    self.assertEqual((ep, ec1, ec2, ec3), ([], [], [], []))
+
+    def shared_when_arm_and_outer_consumer():
+      sel = Stream([True, False, False, False])
+      short = when(sel, counter(start=1))
+      with match(sel) as m:
+        with case(True):
+          m.arm = short + 10
+        with case(False):
+          m.arm = 0
+      outer = short + 1
+      tail = outer + 1
+      return m.arm, outer, tail
+
+    arm_tr, outer_tr, tail_tr = Scheduler.run(
+        shared_when_arm_and_outer_consumer,
+        horizon=4,
         semantics=Semantics.KAHN,
-        clock_calculus=True,
-        streams=sub_post_names,
     )
-    for key, sync_vals in sync_sub_post.items():
-      with self.subTest(sub_post_pipeline=key):
-        self.assertEqual(present_values(sync_vals), kahn_sub_post[key])
+    self.assertFalse(Scheduler.deadlocked)
+    self.assertEqual(arm_tr, [11, 0, 0, 0])
+    self.assertEqual(outer_tr, [2])
+    self.assertEqual(tail_tr, [3])
+
+  def test_kahn_task_exception_does_not_deadlock_or_leak_buffers(self):
+    @psyre_comb
+    def boom_tick0(val):
+      raise ValueError(f'boom at {val}')
+
+    @psyre_comb
+    def boom_tick2(val):
+      if val >= 2:
+        raise ValueError(f'later boom at {val}')
+      return val + 1
+
+    for sem in (Semantics.KAHN, Semantics.SYNC):
+      for label, fn, match_msg in (
+          ('tick0', boom_tick0, 'boom at 0'),
+          ('tick2', boom_tick2, 'later boom at 2'),
+      ):
+        with self.subTest(semantics=sem, case=label):
+          handles: dict[str, Stream] = {}
+
+          def cyclic_fail(step_fn, out_handles):
+            a = fby(0, lambda: b, name='a')  # pylint: disable=undefined-variable
+            b = step_fn(a)
+            out_handles['a'] = a
+            out_handles['b'] = b
+            return a, b
+
+          stderr = io.StringIO()
+          with mock.patch('sys.stderr', stderr):
+            with self.assertRaises(ExceptionGroup) as eg:
+              Scheduler.run(
+                  cyclic_fail,
+                  fn,
+                  handles,
+                  horizon=5,
+                  semantics=sem,
+              )
+          self.assertFalse(Scheduler.deadlocked)
+          self.assertIsInstance(eg.exception.exceptions[0], ValueError)
+          self.assertIn(match_msg, str(eg.exception.exceptions[0]))
+          self.assertEqual(stderr.getvalue(), '')
+          self.assertEmpty(handles['a'].seq)
+          self.assertEmpty(handles['b'].seq)
+
+  def test_deferred_mux_dedup_and_post_skip_parity(self):
+    def mux_thunk_dedup():
+      t = Stream([0, 1, 2, 0, 1, 2])
+      x = counter(10)
+      w = when(t, x, values=(0, 1))
+      w2 = when(t, counter(100), values=2)
+      return merge(t, {0: lambda: w, 1: lambda: w, 2: w2})
+
+    self.assertEqual(
+        Scheduler.run(mux_thunk_dedup, horizon=6, semantics=Semantics.SYNC),
+        [10, 11, 102, 13, 14, 105],
+    )
+    for cc in (True, False):
+      with self.subTest(case='mux_thunk', semantics=Semantics.KAHN, cc=cc):
+        self.assertEqual(
+            Scheduler.run(
+                mux_thunk_dedup,
+                horizon=6,
+                semantics=Semantics.KAHN,
+                clock_calculus=cc,
+            ),
+            [10, 11, 102, 13, 14, 105],
+        )
+
+    def post_discard_prog():
+      src_hi = post(counter(10), 4)
+      src_def = post(counter(100), 4)
+      src_cur = post(counter(20), 4)
+      return {
+          'fby1': fby(src_hi, counter(0)),
+          'fby2': fby(src_hi, counter(0), 2),
+          'morph': morph(src_hi, counter(0)),
+          'current': current(
+              Stream([False, True, False, False, False, False]),
+              src_cur,
+              default=src_def,
+          ),
+      }
+
+    kahn_res = Scheduler.run(
+        post_discard_prog, horizon=6, semantics=Semantics.KAHN
+    )
+    sync_res = Scheduler.run(
+        post_discard_prog, horizon=6, semantics=Semantics.SYNC
+    )
+    self.assertEqual(kahn_res, sync_res)
+    self.assertEqual(kahn_res['fby1'], [14, 0, 1, 2, 3, 4])
+    self.assertEqual(kahn_res['fby2'], [14, 14, 0, 1, 2, 3])
+    self.assertEqual(kahn_res['morph'], [14, 1, 2, 3, 4, 5])
+    self.assertEqual(kahn_res['current'], [104, 25, 25, 25, 25, 25])
+
+  def test_none_as_automaton_state_and_match_case(self):
+    def prog():
+      flip = Stream([False, True, False, True])
+      with automaton(init=None) as fsm:
+        with state(None):
+          until(flip, 'ON')
+          fsm.out = None
+        with state('ON'):
+          until(flip, None)
+          fsm.out = 1
+      with match(fsm.out) as m:
+        with case(None):
+          m.tag = 'none'
+        with case(1):
+          m.tag = None
+      return fsm.out, m.tag
+
+    for sem in (Semantics.SYNC, Semantics.KAHN):
+      with self.subTest(semantics=sem):
+        out, tag = Scheduler.run(prog, horizon=4, semantics=sem)
+        self.assertEqual(out, [None, None, 1, 1])
+        self.assertEqual(tag, ['none', 'none', None, None])
+
+  def test_subclock_current_and_counter_tick_sync_kahn_parity(self):
+    def prog():
+      nat = counter(0, name='nat')
+      is_odd = (nat % 2) == 1
+      is_even = ~is_odd
+      c_dyn = (nat % 3) == 0
+      d_stat = Stream([False, True, True, False])
+      ind_tag = Stream(['A', 'B', 'A', 'C', 'A', 'B', 'C', 'A'])
+      ind_bool = merge(
+          ind_tag, {'A': True, 'B': False, 'C': False}
+      )
+      int_sel = Stream([0, 2, 0, 5, 0, 0, 3, 1])
+
+      odd = when(is_odd, nat)
+      even = whennot(is_odd, nat * 10)
+      nested_dyn = when(when(is_odd, c_dyn), odd)
+      nested_stat = when(d_stat, odd)
+      nested_neg = whennot(d_stat, odd)
+      tagged_a = when(ind_tag, nat + 100, values='A')
+      tagged_not_a = when(ind_tag, nat + 200, values='A', negated=True)
+      empty_sub = when(ind_tag, nat, values=())
+      ind_sub = when(ind_bool, nat + 300)
+      int_sub = when(int_sel, nat)
+      none_sub = when(
+          is_odd, Stream([9, None, 9, 42, 9, None, 9, 77])
+      )
+      buf_sub = buffer(odd, is_odd, is_odd, size=4)
+      rst = Stream([False, False, False, False, True, False, False, False])
+
+      with reset(rst):
+        rst_cur = current(True, odd, default=500)
+        rst_cnt = counter(
+            start=10,
+            max_val=12,
+            tick=Stream([False, True, False, True, True, False, True, True]),
+        )
+
+      with match(is_odd) as m:
+        with case(True):
+          inner_sub = when(d_stat, nat)
+          inner_empty = when(ind_tag, nat, values=())
+          m.cur = current(True, inner_sub, default=-5)
+          m.cur_empty = current(True, inner_empty, default=-9)
+          m.cnt = counter(start=0, tick=d_stat)
+        with case(False):
+          m.cur = -1
+          m.cur_empty = -1
+          m.cnt = -1
+
+      match_rst = Stream([
+          False, True, False, False, False, False, False, False
+      ])
+      with reset(match_rst):
+        with match(is_odd) as m_rst:
+          with case(True):
+            m_rst.out = current(True, when(d_stat, nat), default=777)
+          with case(False):
+            m_rst.out = 0
+
+      return {
+          'odd_self': current(is_odd, odd, default=0),
+          'odd_shared': current(True, odd, default=-1),
+          'odd_disjoint': current(is_even, odd, default=99),
+          'odd_false': current(False, odd, default=88),
+          'odd_gated': current(c_dyn, odd, default=-2),
+          'even_neg': current(True, even, default=-3),
+          'nested_dyn': current(True, nested_dyn, default=-4),
+          'nested_stat': current(True, nested_stat, default=-5),
+          'nested_neg': current(True, nested_neg, default=-6),
+          'tagged_a': current(True, tagged_a, default=-7),
+          'tagged_not_a': current(True, tagged_not_a, default=-8),
+          'empty_sub': current(True, empty_sub, default=-9),
+          'ind_sub': current(True, ind_sub, default=-10),
+          'int_sub': current(True, int_sub, default=-11),
+          'none_sub': current(True, none_sub, default=123),
+          'none_def': current(is_odd, odd, default=None),
+          'buf_sub': current(True, buf_sub, default=-12),
+          'rst_cur': rst_cur,
+          'rst_cnt': rst_cnt,
+          'match_cur': m.cur,
+          'match_cur_empty': m.cur_empty,
+          'match_cnt': m.cnt,
+          'match_rst_cur': m_rst.out,
+      }
+
+    sync_res = Scheduler.run(prog, horizon=8, semantics=Semantics.SYNC)
+    kahn_res = Scheduler.run(prog, horizon=8, semantics=Semantics.KAHN)
+    for key in sync_res:
+      with self.subTest(stream=key):
+        self.assertEqual(
+            present_values(kahn_res[key]),
+            present_values(sync_res[key]),
+        )
+    self.assertEqual(kahn_res['odd_self'], [0, 1, 1, 3, 3, 5, 5, 7])
+    self.assertEqual(kahn_res['odd_shared'], [-1, 1, 1, 3, 3, 5, 5, 7])
+    self.assertEqual(kahn_res['odd_disjoint'], [99] * 8)
+    self.assertEqual(kahn_res['odd_false'], [88] * 8)
+    self.assertEqual(kahn_res['odd_gated'], [-2, -2, -2, 3, 3, 3, 3, 3])
+    self.assertEqual(kahn_res['empty_sub'], [-9] * 8)
+    self.assertEqual(
+        kahn_res['none_sub'], [123, None, None, 42, 42, None, None, 77]
+    )
+    self.assertEqual(kahn_res['none_def'], [None, 1, 1, 3, 3, 5, 5, 7])
+    self.assertEqual(kahn_res['rst_cur'], [500, 1, 1, 3, 500, 5, 5, 7])
+
+    # Early-EOF subclocked `post` into `current` matches under present_values.
+    def eof_post_subclock():
+      c = Stream([True, True, False, True])
+      cnt = counter(10)
+      with reset(when(c, False)):
+        sub_p = post(when(c, cnt))
+      b = Stream([True, False, True, False])
+      return current(b, sub_p, default=-1)
+
+    kahn_eof = Scheduler.run(
+        eof_post_subclock, horizon=4, semantics=Semantics.KAHN
+    )
+    sync_eof = Scheduler.run(
+        eof_post_subclock, horizon=4, semantics=Semantics.SYNC
+    )
+    self.assertEqual(present_values(kahn_eof), present_values(sync_eof))
 
 
 if __name__ == '__main__':

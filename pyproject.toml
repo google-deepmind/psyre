@@ -20,7 +20,7 @@ build-backend = "flit_core.buildapi"
 name = "psyre"
 description = "Psyre synchronous and Kahn reactive dataflow DSL in Python."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = {file = "LICENSE"}
 authors = [{name = "Psyre Authors"}]
 classifiers = [
@@ -29,19 +29,21 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Compilers",
 ]
-dependencies = [
-    "pydot>=1.4.2",
-]
+dependencies = []
 dynamic = ["version"]
 
 [project.optional-dependencies]
+viz = [
+    "pydot>=1.4.2",
+]
 test = [
     "absl-py>=2.0.0",
+    "pydot>=1.4.2",
     "pytest>=8.0.0",
 ]
 

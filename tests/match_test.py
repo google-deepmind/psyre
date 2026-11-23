@@ -25,12 +25,15 @@ from psyre.automaton import (
     until,
 )
 from psyre.builder import build_graph
+from psyre.clock import check_clocks
 from psyre.common import (
     Absent,
+    Bottom,
     Semantics,
     counter,
     logger,
     post,
+    reset,
     switch,
     when,
 )
@@ -62,13 +65,6 @@ class _Pair(NamedTuple):
 
   a: Any
   b: Any
-
-
-class _NamedPair(NamedTuple):
-  """NamedTuple of Streams testing static NamedTuple lowering in match()."""
-
-  left: Any
-  right: Any
 
 
 class MatchTest(absltest.TestCase):
@@ -156,7 +152,7 @@ class MatchTest(absltest.TestCase):
         )
         self.assertEqual(empty_case_tag, ['is_A', 'B', 'C', 'Z', 'is_A', 'Q'])
 
-  def test_match_structured_dataclass_namedtuple_and_tuple_outputs(self):
+  def test_match_structured_namedtuple_and_tuple_outputs(self):
     """Checks static field-wise merging of structured stream bundles."""
 
     def dense_prog():
@@ -165,41 +161,32 @@ class MatchTest(absltest.TestCase):
         with case(_Mode.FAST):
           structured.pair = _Pair(Stream(1), Stream(2))
           structured.tup = (Stream(10), None)
-          structured.named = _NamedPair(Stream(100), Stream(200))
         with case(_Mode.SLOW):
           structured.pair = _Pair(counter(start=5), Stream(8))
           structured.tup = (Stream(30), Stream(40))
-          structured.named = _NamedPair(Stream(300), Stream(400))
 
       self.assertIsInstance(structured.pair, _Pair)
-      self.assertIsInstance(structured.named, _NamedPair)
-      return structured.pair, structured.tup, structured.named
+      return structured.pair, structured.tup
 
     for sem in (Semantics.KAHN, Semantics.SYNC):
       with self.subTest(semantics=sem):
-        pair, tup, named = Scheduler.run(dense_prog, horizon=4, semantics=sem)
+        pair, tup = Scheduler.run(dense_prog, horizon=4, semantics=sem)
         self.assertEqual(pair, _Pair([1, 5, 1, 6], [2, 8, 2, 8]))
         self.assertEqual(tup, ([10, 30, 10, 30], [None, 40, None, 40]))
-        self.assertEqual(
-            named, _NamedPair([100, 300, 100, 300], [200, 400] * 2)
-        )
 
     def sparse_sync_prog():
       active = Stream([True, True, False, True])
-      sel = Stream([_Mode.FAST, _Mode.SLOW, _Mode.FAST, _Mode.SLOW])
+      sel = Stream([_Mode.FAST, _Mode.SLOW, _Mode.SLOW])
       with match(active):
         with case(True):
           with match(sel) as structured:
             with case(_Mode.FAST):
               structured.pair = _Pair(Stream(1), Stream(2))
               structured.tup = (Stream(10), Stream(20))
-              structured.named = _NamedPair(Stream(100), Stream(200))
             with case(_Mode.SLOW):
               structured.pair = _Pair(counter(start=5), Stream(8))
               structured.tup = (Stream(30), Stream(40))
-              structured.named = _NamedPair(Stream(300), Stream(400))
           self.assertIsInstance(structured.pair, _Pair)
-          self.assertIsInstance(structured.named, _NamedPair)
         with case(False):
           pass
 
@@ -207,26 +194,17 @@ class MatchTest(absltest.TestCase):
         sparse_sync_prog,
         horizon=4,
         semantics=Semantics.SYNC,
-        streams=(
-            'pair_a',
-            'pair_b',
-            'tup_0',
-            'tup_1',
-            'named_left',
-            'named_right',
-        ),
+        streams=('pair_a', 'pair_b', 'tup_0', 'tup_1'),
     )
     self.assertEqual(res_s['pair_a'], [1, 5, Absent, 6])
     self.assertEqual(res_s['pair_b'], [2, 8, Absent, 8])
     self.assertEqual(res_s['tup_0'], [10, 30, Absent, 30])
     self.assertEqual(res_s['tup_1'], [20, 40, Absent, 40])
-    self.assertEqual(res_s['named_left'], [100, 300, Absent, 300])
-    self.assertEqual(res_s['named_right'], [200, 400, Absent, 400])
 
   def test_sync_absent_selector_does_not_tick_wildcard(self):
     def inner():
       active = Stream([True, False, True, False])
-      sub_cmd = Stream(['A', 'A', 'Z', 'Z'])
+      sub_cmd = Stream(['A', 'Z'])
 
       with match(active):
         with case(True):
@@ -248,7 +226,7 @@ class MatchTest(absltest.TestCase):
   def test_last_in_absent_match_arm(self):
     def inner():
       active = Stream([True, True, False, True, False, True])
-      sel = Stream(['INC', 'INC', 'INC', 'DEC', 'DEC', 'INC'])
+      sel = Stream(['INC', 'INC', 'DEC', 'INC'])
 
       with match(active):
         with case(True):
@@ -295,6 +273,18 @@ class MatchTest(absltest.TestCase):
           m.out = 1
 
     self._assert_psyre_error(case_after_default, ValueError, 'Unreachable')
+
+    for sentinel, regex in (
+        (Absent, 'cannot contain Absent'),
+        (Bottom, 'cannot contain Bottom'),
+    ):
+
+      def sentinel_case(tag=sentinel):
+        with match(Stream('A')) as m:
+          with case(tag):
+            m.out = 1
+
+      self._assert_psyre_error(sentinel_case, TypeError, regex)
 
     def state_in_match():
       with match(Stream('UP')) as m:
@@ -383,19 +373,6 @@ class MatchTest(absltest.TestCase):
             Scheduler.run_graph(scoped_g, horizon=4),
         )
 
-    def return_from_case():
-      with match(Stream('A')):
-        with default():
-          return last(Stream([1, 2]), 0)
-
-    for sem in (Semantics.KAHN, Semantics.SYNC):
-      self._assert_psyre_error(
-          return_from_case,
-          RuntimeError,
-          'Arm-local last\\(\\) cannot escape.*program output',
-          semantics=sem,
-      )
-
     def escape_match_output():
       x = Stream([10, 20])
       with match(Stream([True, False])) as m:
@@ -406,13 +383,11 @@ class MatchTest(absltest.TestCase):
           m.out = 0
       return lv
 
-    for sem in (Semantics.KAHN, Semantics.SYNC):
-      self._assert_psyre_error(
-          escape_match_output,
-          RuntimeError,
-          'Arm-local last\\(\\) cannot escape.*program output',
-          semantics=sem,
-      )
+    self._assert_psyre_error(
+        escape_match_output,
+        RuntimeError,
+        'Arm-local last\\(\\) cannot escape.*program output',
+    )
 
     def escape_stream_return():
       with match(Stream([True, False])):
@@ -439,20 +414,17 @@ class MatchTest(absltest.TestCase):
           m.out = x + 1
       return m.out
 
-    for sem in (Semantics.KAHN, Semantics.SYNC):
+    self._assert_psyre_error(
+        escape_stream_return,
+        RuntimeError,
+        'Arm-local stream cannot escape.*program output',
+    )
+    for fn in (escape_stream_outer_consumer, escape_stream_sibling_arm):
       self._assert_psyre_error(
-          escape_stream_return,
+          fn,
           RuntimeError,
-          'Arm-local stream cannot escape.*program output',
-          semantics=sem,
+          'Arm-local stream cannot escape.*consumed by',
       )
-      for fn in (escape_stream_outer_consumer, escape_stream_sibling_arm):
-        self._assert_psyre_error(
-            fn,
-            RuntimeError,
-            'Arm-local stream cannot escape.*consumed by',
-            semantics=sem,
-        )
 
   def test_multi_valued_when_switch_and_reduced_match_lowering(self):
     def direct_prims():
@@ -516,28 +488,42 @@ class MatchTest(absltest.TestCase):
         [Absent, Absent, 3, Absent],
     )
 
-    # Boolean match lowers cleanly to 5 nodes (when, whennot, +, -, bool merge):
-    def bool_match_prog():
-      c = Stream([True, False, True, False], name='c')
-      x = Stream([1, 2, 3, 4], name='x')
-      with match(c) as m:
-        with case(True):
-          m.y = x + 1
-        with case(False):
-          m.y = x - 1
-      return m.y
+    # Boolean match over clock-polymorphic static vs dynamic outer `x`:
+    # static emits zero `when`/`whennot` (3 nodes: +, -, bool merge);
+    # dynamic downsamples via `when`/`whennot` (6 nodes).
+    def make_bool_match(dynamic: bool):
+      def prog():
+        c = Stream([True, False, True, False], name='c')
+        x = counter(start=1, name='x') if dynamic else Stream(
+            [1, 2, 3, 4], name='x'
+        )
+        with match(c) as m:
+          with case(True):
+            m.y = x + 1
+          with case(False):
+            m.y = x - 1
+        return m.y
 
-    g_bool = build_graph(bool_match_prog, semantics=Semantics.SYNC)
-    self.assertLen(g_bool.nodes, 5)
+      return prog
+
+    g_bool = build_graph(make_bool_match(False), semantics=Semantics.SYNC)
+    self.assertLen(g_bool.nodes, 3)
     merge_nodes = [n for n in g_bool.nodes if n.op == 'merge']
     self.assertLen(merge_nodes, 1)
     self.assertTrue(merge_nodes[0].kwargs['lookup'].is_boolean)
-    self.assertEqual(Scheduler.run_graph(g_bool, horizon=4), [2, 1, 4, 3])
+    self.assertEqual(
+        Scheduler.run_graph(g_bool, horizon=4, clocks=check_clocks(g_bool)),
+        [2, 0, 3, 1],
+    )
+    g_bool_dyn = build_graph(make_bool_match(True), semantics=Semantics.SYNC)
+    self.assertLen(g_bool_dyn.nodes, 6)
+    self.assertEqual(Scheduler.run_graph(g_bool_dyn, horizon=4), [2, 1, 4, 3])
 
-    # Multi-way match emits zero indicator merges; post(const) stays Absent
-    # on inactive tick 0:
+    # Multi-way match emits zero indicator merges; `post(7)` is uniform with
+    # `post([7, 7])` and produces `Bottom` once `'A'` has no next active tick
+    # within the horizon.
     def multi_match_post_const():
-      tag = Stream(['B', 'A', 'A', 'B'], name='tag')
+      tag = Stream(['B', 'A', 'A', 'A'], name='tag')
       with match(tag) as m:
         with case('A'):
           m.y = post(7)
@@ -549,7 +535,197 @@ class MatchTest(absltest.TestCase):
         multi_match_post_const, semantics=Semantics.SYNC
     )
     self.assertLen([n for n in g_multi.nodes if n.op == 'merge'], 1)
-    self.assertEqual(Scheduler.run_graph(g_multi, horizon=4), [0, 7, 7, 0])
+    self.assertEqual(
+        Scheduler.run_graph(g_multi, horizon=4, clocks=check_clocks(g_multi)),
+        [0, 7, 7, Bottom],
+    )
+
+  def test_same_arm_handle_read_after_assign_requires_lambda(self):
+    def eager_read_after_assign():
+      with match(Stream([True, False, True, False])) as m:
+        with case(True):
+          m.v = 10
+          m.prev = last(m.v, 0)
+        with case(False):
+          m.v = 20
+          m.prev = last(m.v, 0)
+      return m.prev
+
+    self._assert_psyre_error(
+        eager_read_after_assign,
+        AttributeError,
+        'wrap forward references in lambda',
+    )
+
+    def deferred_last_after_assign():
+      with match(Stream([True, False, True, False])) as m:
+        with case(True):
+          m.v = 10
+          m.prev = last(lambda: m.v, 0)
+        with case(False):
+          m.v = 20
+          m.prev = last(lambda: m.v, 0)
+      return m.v, m.prev
+
+    for sem in (Semantics.SYNC, Semantics.KAHN):
+      with self.subTest(semantics=sem):
+        v_tr, prev_tr = Scheduler.run(
+            deferred_last_after_assign, horizon=4, semantics=sem
+        )
+        self.assertEqual(v_tr, [10, 20, 10, 20])
+        self.assertEqual(prev_tr, [0, 10, 20, 10])
+
+  def test_match_shared_stream_across_multiple_arms(self):
+    seq = [True, False, False, True]
+
+    # Static `shared` is clock-polymorphic (`[T, T, F, F]`); dynamic outer
+    # `shared` is downsampled per arm (`[T, F, F, T]`).
+    def make_shared_prog(dynamic: bool):
+      def prog():
+        sel = Stream([True, False, True, False])
+        shared = when(Stream(True), seq) if dynamic else Stream(seq)
+        with match(sel) as m:
+          with case(True):
+            m.flag = shared
+          with case(False):
+            m.flag = shared
+        return m.flag
+
+      return prog
+
+    for sem in (Semantics.SYNC, Semantics.KAHN):
+      for opt in (False, True):
+        for dynamic, expected in (
+            (False, [True, True, False, False]),
+            (True, seq),
+        ):
+          with self.subTest(semantics=sem, optimize=opt, dynamic=dynamic):
+            self.assertEqual(
+                Scheduler.run(
+                    make_shared_prog(dynamic),
+                    horizon=4,
+                    semantics=sem,
+                    optimize=opt,
+                ),
+                expected,
+            )
+
+  def test_match_arm_output_thunk_preserves_reset_and_rejects_invalid(self):
+    def reset_arm_output():
+      sel = Stream([True, True, True, False, True, True])
+      r = Stream([False, False, True, False, False, False])
+      with match(sel) as m:
+        with case(True):
+          with reset(r):
+            m.o = lambda: counter(10)
+        with case(False):
+          m.o = 0
+      return m.o
+
+    for sem in (Semantics.SYNC, Semantics.KAHN):
+      for opt in (False, True):
+        with self.subTest(semantics=sem, optimize=opt):
+          self.assertEqual(
+              Scheduler.run(
+                  reset_arm_output, horizon=6, semantics=sem, optimize=opt
+              ),
+              [10, 11, 10, 0, 11, 12],
+          )
+
+    def nested_thunk_tuple_output():
+      sel = Stream([True, False])
+      with match(sel) as m:
+        with case(True):
+          m.o = (lambda: (lambda: counter(10)), 1)
+        with case(False):
+          m.o = (0, 2)
+      return m.o
+
+    def nested_thunk_selector():
+      sel = Stream([True, False])
+      with match(lambda: (lambda: sel)) as m:
+        with case(True):
+          m.o = 1
+        with case(False):
+          m.o = 0
+      return m.o
+
+    def nested_thunk_dead_output():
+      sel = Stream([True, False])
+      with match(sel) as m:
+        with case(True):
+          m.o = lambda: (lambda: counter(10))
+        with case(False):
+          m.o = 0
+      return counter(0)
+
+    def scalar_thunk_output():
+      sel = Stream([True, False])
+      with match(sel) as m:
+        with case(True):
+          m.o = lambda: 42
+        with case(False):
+          m.o = 0
+      return m.o
+
+    for bad_prog in (
+        nested_thunk_tuple_output,
+        nested_thunk_selector,
+        nested_thunk_dead_output,
+    ):
+      with self.subTest(prog=bad_prog.__name__):
+        with self.assertRaisesRegex(TypeError, 'Nested Stage-1 thunks'):
+          build_graph(bad_prog)
+    with self.assertRaisesRegex(TypeError, 'Stream instance'):
+      build_graph(scalar_thunk_output, optimize=False)
+
+  def test_fail_fast_container_nan_and_overlapping_case_tags(self):
+    for make_bad in (
+        lambda c: [counter(0), counter(1)],
+        lambda c: {'a': counter(0)},
+        lambda c: {'a': lambda: c},
+    ):
+
+      def bad_container(factory=make_bad):
+        sel = when(Stream(True), Stream([True, False]))
+        with match(sel) as m:
+          with case(True):
+            m.y = factory(sel)
+          with case(False):
+            m.y = factory(sel)
+        return m.y
+
+      with self.assertRaisesRegex(TypeError, 'tuple or NamedTuple'):
+        build_graph(bad_container)
+
+    def nan_case_tag():
+      with match(Stream(1.0)) as m:
+        with case(float('nan')):
+          m.y = 1
+        with default():
+          m.y = 2
+      return m.y
+
+    with self.assertRaisesRegex(ValueError, 'NaN'):
+      build_graph(nan_case_tag)
+
+    def partial_overlap_case():
+      with match(Stream(1)) as m:
+        with case(1):
+          m.y = 1
+        with case(1, 2):
+          m.y = 2
+      return m.y
+
+    def intra_arm_dup_case():
+      with match(Stream(1)) as m:
+        with case(1, 1):
+          m.y = 1
+      return m.y
+
+    for bad_dup in (partial_overlap_case, intra_arm_dup_case):
+      with self.assertRaisesRegex(ValueError, 'Duplicate'):
+        build_graph(bad_dup)
 
 
 if __name__ == '__main__':

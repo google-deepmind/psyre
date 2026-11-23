@@ -17,7 +17,6 @@ from collections.abc import Callable, Sequence
 import dataclasses
 import logging
 import operator
-import sys
 from typing import Any
 
 from absl.testing import absltest
@@ -38,21 +37,23 @@ from psyre.clock import (
     check_clocks,
 )
 from psyre.common import (
+    Absent,
+    Bottom,
     Semantics,
     buffer,
     counter,
     current,
-    delay,
     fby,
     ifthenelse,
+    is_thunk,
     logger,
     merge,
     morph,
     post,
     pre,
     prefix_sum,
-    prepare_delay,
     prepare_iterated_n,
+    psyre_comb,
     reset,
     scan,
     switch,
@@ -64,15 +65,16 @@ from psyre.match import (
     match,
 )
 from psyre.scheduler import Scheduler
+from psyre.static_stream import StaticWord
 from psyre.stream import Stream
 from psyre.trace import present_values
 
 # pylint: enable=g-importing-member,g-multiple-import
 
 
-def _share_stream(spec: Any) -> Any:
-  """Shares a single Stream/IStruct across multiple internal consumer ports."""
-  if callable(spec):
+def share_stream(spec: Any) -> Any:
+  """Shares a single Stream across multiple internal consumer ports."""
+  if is_thunk(spec):
     return spec
   return spec if isinstance(spec, Stream) else Stream(spec)
 
@@ -96,7 +98,11 @@ def periodic_stream_pervasive(
     prefix: Sequence[Any], period: Sequence[Any], name: str = ''
 ) -> Stream:
   """Derived periodic stream constructed from Stream(prefix, period=...)."""
-  return Stream(list(prefix), period=list(period), name=name)
+  return Stream(
+      prefix if isinstance(prefix, StaticWord) else list(prefix),
+      period=period if isinstance(period, StaticWord) else list(period),
+      name=name,
+  )
 
 
 def pre_pervasive(x: Any, n: int = 1, name: str = 'pre') -> Stream:
@@ -108,7 +114,7 @@ def fby_pervasive(
     i_stream: Any, j_stream: Any, n: int = 1, name: str = 'fby'
 ) -> Stream:
   """Derived iterated followed-by delay implemented by chaining `fby` n times."""
-  shared_init = _share_stream(i_stream)
+  shared_init = share_stream(i_stream)
   return _iterate(
       n, 'fby', j_stream, lambda acc, nm: fby(shared_init, acc, name=nm), name
   )
@@ -131,15 +137,18 @@ def morph_pervasive(
 def current_pervasive(
     b: Any, i: Any, default: Any = None, name: str = 'current'
 ) -> Stream:
-  """Derived sample-and-hold of stream i downsampled by boolean stream b."""
+  """Derived same-clock sample-and-hold of stream i gated by boolean b."""
   c = merge(b, when(b, i), whennot(b, fby(default, lambda: c)), name=name)
   return c
 
 
 def counter_pervasive(
-    start: Any = 0, max_val: Any = None, name: str = 'counter'
+    start: Any = 0,
+    max_val: Any = None,
+    tick: Any = True,
+    name: str = 'counter',
 ) -> Stream:
-  """Derived resettable incrementing integer stream starting from start."""
+  """Derived resettable incrementing integer stream enabled by tick."""
   cur = fby(
       start,
       lambda: acc,
@@ -147,7 +156,11 @@ def counter_pervasive(
   )
   if max_val is not None:
     cur = cur.min(max_val, name=name)
-  acc = cur + 1
+  acc = (
+      cur + 1
+      if isinstance(tick, bool) and tick
+      else ifthenelse(tick, cur + 1, cur)
+  )
   return cur
 
 
@@ -175,6 +188,24 @@ def _slot_thunk(slots: Sequence[Any], idx: int) -> Callable[[], Any]:
   return lambda: slots[idx]
 
 
+@psyre_comb
+def check_buffer_pull(overflow: bool, val: Any) -> Any:
+  """Raises `BufferError` on overflow; otherwise forwards `val`."""
+  if overflow:
+    raise BufferError('RingBuffer overflow: pull into occupied slot.')
+  return val
+
+
+@psyre_comb
+def check_buffer_push(valid: bool, val: Any) -> Any:
+  """Raises `BufferError` on underflow; otherwise forwards `val`."""
+  if not valid:
+    raise BufferError(
+        'RingBuffer underflow: push from empty slot before matching pull.'
+    )
+  return val
+
+
 def buffer_pervasive(
     i_stream: Any,
     i_p_stream: Any,
@@ -182,19 +213,27 @@ def buffer_pervasive(
     size: int = 1,
     name: str = 'buffer',
 ) -> Stream:
-  """Derived bounded ring buffer implemented purely from core primitives."""
+  """Derived bounded lossless FIFO buffer implemented from core primitives."""
   if size < 1:
     raise ValueError(f'buffer size must be >= 1, got {size}.')
-  i_p = _share_stream(i_p_stream)
-  o_p = _share_stream(o_p_stream)
+  i_p = share_stream(i_p_stream)
+  o_p = share_stream(o_p_stream)
   in_val = merge(i_p, i_stream, None)
 
   if size == 1:
-    slot_next: list[Any] = [None]
+    slot_next: list[Any] = [None, None]
     prev_slot = fby(None, lambda: slot_next[0])
-    after_pull = ifthenelse(i_p, in_val, prev_slot)
+    prev_valid = fby(False, lambda: slot_next[1])
+    checked_in = check_buffer_pull(
+        ifthenelse(i_p, prev_valid, False), in_val
+    )
+    after_pull = ifthenelse(i_p, checked_in, prev_slot)
+    after_valid = ifthenelse(i_p, True, prev_valid)
     slot_next[0] = ifthenelse(o_p, None, after_pull)
-    return when(o_p, after_pull, name=name)
+    slot_next[1] = ifthenelse(o_p, False, after_valid)
+    return check_buffer_push(
+        when(o_p, after_valid), when(o_p, after_pull), name=name
+    )
 
   idx_next: list[Any] = [None, None]
   pull_idx = fby(0, lambda: idx_next[0])
@@ -203,52 +242,34 @@ def buffer_pervasive(
   idx_next[1] = ifthenelse(o_p, (push_idx + 1) % size, push_idx)
 
   next_slots: list[Any] = [None] * size
+  next_valids: list[Any] = [None] * size
+  prev_valids: list[Stream] = [
+      fby(False, _slot_thunk(next_valids, slot_idx))
+      for slot_idx in range(size)
+  ]
+  pulled_occupied = switch(pull_idx, dict(enumerate(prev_valids)))
+  checked_in = check_buffer_pull(
+      ifthenelse(i_p, pulled_occupied, False), in_val
+  )
   after_slots: list[Stream] = []
+  after_valids: list[Stream] = []
   for slot_idx in range(size):
     prev_s = fby(None, _slot_thunk(next_slots, slot_idx))
-    after_s = ifthenelse((pull_idx == slot_idx) & i_p, in_val, prev_s)
-    next_slots[slot_idx] = ifthenelse(
-        (push_idx == slot_idx) & o_p, None, after_s
-    )
+    prev_v = prev_valids[slot_idx]
+    write_here = ifthenelse(i_p, pull_idx == slot_idx, False)
+    after_s = ifthenelse(write_here, checked_in, prev_s)
+    after_v = ifthenelse(write_here, True, prev_v)
+    read_here = ifthenelse(o_p, push_idx == slot_idx, False)
+    next_slots[slot_idx] = ifthenelse(read_here, None, after_s)
+    next_valids[slot_idx] = ifthenelse(read_here, False, after_v)
     after_slots.append(after_s)
+    after_valids.append(after_v)
 
-  return when(o_p, switch(push_idx, dict(enumerate(after_slots))), name=name)
-
-
-def delay_pervasive(
-    i_stream: Any,
-    k: int | None = None,
-    *,
-    period: Any = None,
-    name: str = 'delay',
-) -> Stream:
-  """Derived delay implemented via buffer in SYNC and ifthenelse in KAHN."""
-  _, delay_kwargs = prepare_delay(i_stream, k, period=period)
-  p_istruct = delay_kwargs['p_stream']
-  size = delay_kwargs['size']
-  if Scheduler.semantics == Semantics.KAHN:
-    return ifthenelse(True, i_stream, i_stream, name=name)
-  shared_in = _share_stream(i_stream)
-  tick = counter()
-  if period is None:
-    steps = 1 if k is None else k
-    o_p = _share_stream(tick >= steps)
-  else:
-    prefix = tuple(p_istruct.prefix)
-    period_seq = tuple(p_istruct.period)
-    p_len = len(prefix)
-    t_len = len(period_seq)
-    idx = (
-        tick % t_len
-        if p_len == 0
-        else ifthenelse(tick < p_len, tick, p_len + ((tick - p_len) % t_len))
-    )
-    table = dict(enumerate((*prefix, *period_seq)))
-    o_p = _share_stream(switch(idx, table, default=False))
-  ip = _share_stream(ifthenelse(o_p, shared_in, shared_in) == shared_in)
-  buf = buffer(when(ip, shared_in), ip, o_p, size=size)
-  absent_s = post(ip, sys.maxsize)
-  return merge(o_p, buf, whennot(o_p, absent_s), name=name)
+  rd_val = switch(push_idx, dict(enumerate(after_slots)))
+  rd_valid = switch(push_idx, dict(enumerate(after_valids)))
+  return check_buffer_push(
+      when(o_p, rd_valid), when(o_p, rd_val), name=name
+  )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -265,11 +286,10 @@ class _Ops:
   prefix_sum: Callable[..., Stream] = prefix_sum
   scan: Callable[..., Stream] = scan
   buffer: Callable[..., Stream] = buffer
-  delay: Callable[..., Stream] = delay
 
 
 _PRIMITIVE_OPS = _Ops()
-_PERVASIVE_OPS = _Ops(
+PERVASIVE_OPS = _Ops(
     periodic_stream=periodic_stream_pervasive,
     pre=pre_pervasive,
     fby=fby_pervasive,
@@ -280,16 +300,16 @@ _PERVASIVE_OPS = _Ops(
     prefix_sum=prefix_sum_pervasive,
     scan=scan_pervasive,
     buffer=buffer_pervasive,
-    delay=delay_pervasive,
 )
 
 
-def _get_ops(use_primitives: bool) -> _Ops:
-  """Returns either the primitive or derived pervasive operator bundle."""
-  return _PRIMITIVE_OPS if use_primitives else _PERVASIVE_OPS
-
-
 class PervasivesTest(absltest.TestCase):
+
+  OPS = PERVASIVE_OPS
+
+  def get_ops(self, use_primitives: bool) -> _Ops:
+    """Returns either the primitive or derived pervasive operator bundle."""
+    return _PRIMITIVE_OPS if use_primitives else self.OPS
 
   def setUp(self):
     super().setUp()
@@ -336,7 +356,7 @@ class PervasivesTest(absltest.TestCase):
 
   def test_primitive_node_count_reduction(self):
     def build_variant(use_primitives: bool):
-      ops = _get_ops(use_primitives)
+      ops = self.get_ops(use_primitives)
 
       def prog():
         xs = Stream([3, 1, 4, 1, 5, 9])
@@ -353,7 +373,6 @@ class PervasivesTest(absltest.TestCase):
             ops.counter(start=5, max_val=7),
             ops.prefix_sum(xs, start=100),
             ops.scan(xs, op=Stream.max),
-            ops.delay(xs, 2),
         )
 
       return prog
@@ -365,13 +384,13 @@ class PervasivesTest(absltest.TestCase):
       check_causality(perv_graph)
       check_clocks(prim_graph)
       check_clocks(perv_graph)
-      # 10 single-node primitives = 10 nodes, vs expanded pervasive nodes.
-      self.assertLen(prim_graph.nodes, 10)
+      # 9 single-node primitives = 9 nodes, vs expanded pervasive nodes.
+      self.assertLen(prim_graph.nodes, 9)
       self.assertLess(len(prim_graph.nodes), len(perv_graph.nodes))
 
   def test_base_clock_resets_and_operators_match_pervasives(self):
     def make_prog(use_primitives: bool):
-      ops = _get_ops(use_primitives)
+      ops = self.get_ops(use_primitives)
 
       def prog():
         xs = Stream([3, 1, 4, 1, 5, 9, 2, 6])
@@ -454,7 +473,7 @@ class PervasivesTest(absltest.TestCase):
 
   def test_subclocks_match_and_automaton_match_pervasives(self):
     def make_match_prog(use_primitives: bool):
-      ops = _get_ops(use_primitives)
+      ops = self.get_ops(use_primitives)
 
       def prog():
         xs = Stream([2, 5, 1, 8, 3, 7, 4, 6, 9, 2])
@@ -501,7 +520,7 @@ class PervasivesTest(absltest.TestCase):
       return prog
 
     def make_automaton_prog(use_primitives: bool):
-      ops = _get_ops(use_primitives)
+      ops = self.get_ops(use_primitives)
 
       def prog():
         xs = Stream([2, 5, 1, 8, 3, 7, 4, 6, 9, 2])
@@ -523,13 +542,11 @@ class PervasivesTest(absltest.TestCase):
       return prog
 
     self._assert_equivalent(make_match_prog, horizon=10)
-    self._assert_equivalent(
-        make_automaton_prog, horizon=10, semantics=(Semantics.SYNC,)
-    )
+    self._assert_equivalent(make_automaton_prog, horizon=10)
 
   def test_sync_absent_inputs_and_supersampled_resets_match_pervasives(self):
     def make_prog(use_primitives: bool):
-      ops = _get_ops(use_primitives)
+      ops = self.get_ops(use_primitives)
 
       def prog():
         rst = Stream([False, False, True, False, False, True, False, False])
@@ -586,7 +603,6 @@ class PervasivesTest(absltest.TestCase):
     self._assert_equivalent(
         make_prog,
         horizon=8,
-        semantics=(Semantics.SYNC,),
         streams=(
             'abs_pre',
             'abs_arr',
@@ -602,43 +618,55 @@ class PervasivesTest(absltest.TestCase):
 
   def test_buffer_pervasive_matches_primitive_in_kahn_and_sync(self):
     def make_prog(use_primitives: bool):
-      p_buf = buffer if use_primitives else buffer_pervasive
+      p_buf = buffer if use_primitives else self.OPS.buffer
 
       def prog():
         xs = Stream([10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
-        # Lossless FIFO, underflow (push when empty -> None), and same-tick
-        # cut-through (pull & push simultaneously):
+        xs_none = Stream([None, 20, None, 40, None, 60, None, 80, None, 100])
+        # Single-slot lossless FIFO + same-tick cut-through:
+        ip_1 = Stream(
+            [True, False, True, False, True, False, True, False, True, False]
+        )
+        op_1 = Stream(
+            [False, True, True, False, False, True, True, False, False, True]
+        )
+        # Depth-2 lossless FIFO + cut-through and wrap-around:
         ip_a = Stream(
-            [True, True, False, False, False, True, False, True, True, False]
+            [True, True, False, False, True, True, False, True, False, False]
         )
         op_a = Stream(
-            [False, False, True, True, True, True, False, False, True, True]
+            [False, False, True, True, False, True, True, True, False, False]
         )
-        # Ring-buffer overwrite (3 consecutive pulls before pushes):
-        ip_ov = Stream(
-            [True, True, True, False, False, True, True, True, True, False]
+        # Depth-3 lossless FIFO filling all 3 slots before draining:
+        ip_3 = Stream(
+            [True, True, True, False, False, True, True, False, False, False]
         )
-        op_ov = Stream(
-            [False, False, False, True, True, False, False, False, True, True]
+        op_3 = Stream(
+            [False, False, False, True, True, False, False, True, True, True]
         )
+        # Reset discarding unread buffered items before new causal pull/push:
         rst = Stream(
             [False, False, False, True, False, False, False, True, False, False]
+        )
+        ip_r = Stream(
+            [True, True, False, True, True, False, True, True, False, False]
+        )
+        op_r = Stream(
+            [False, False, True, False, True, True, False, True, False, False]
         )
         gate = Stream(
             [True, False, True, True, False, True, True, False, True, True]
         )
 
-        b1_a = p_buf(when(ip_a, xs), ip_a, op_a, size=1)
+        b1_a = p_buf(when(ip_1, xs), ip_1, op_1, size=1)
         b2_a = p_buf(when(ip_a, xs), ip_a, op_a, size=2)
         b3_a = p_buf(when(ip_a, xs), ip_a, op_a, size=3)
-
-        b1_ov = p_buf(when(ip_ov, xs), ip_ov, op_ov, size=1)
-        b2_ov = p_buf(when(ip_ov, xs), ip_ov, op_ov, size=2)
-        b3_ov = p_buf(when(ip_ov, xs), ip_ov, op_ov, size=3)
+        b2_none = p_buf(when(ip_a, xs_none), ip_a, op_a, size=2)
+        b3_full = p_buf(when(ip_3, xs), ip_3, op_3, size=3)
 
         with reset(rst):
-          b2_rst = p_buf(when(ip_ov, xs), ip_ov, op_ov, size=2)
-          b3_rst = p_buf(when(ip_a, xs), ip_a, op_a, size=3)
+          b2_rst = p_buf(when(ip_r, xs), ip_r, op_r, size=2)
+          b3_rst = p_buf(when(ip_r, xs), ip_r, op_r, size=3)
 
         # Delayed feedback through fby + buffer:
         fb_buf = p_buf(
@@ -649,7 +677,7 @@ class PervasivesTest(absltest.TestCase):
         )
         with match(op_a) as fb_m:
           with case(True):
-            fb_m.val = ifthenelse(fb_buf == None, 0, fb_buf)  # pylint: disable=singleton-comparison
+            fb_m.val = fb_buf
           with case(False):
             fb_m.val = 5
         fb_state = fb_m.val + 1
@@ -660,7 +688,7 @@ class PervasivesTest(absltest.TestCase):
             sub_buf = p_buf(when(ip_a, xs), ip_a, op_a, size=2, name='sub_buf')
             with match(op_a) as use_m:
               with case(True):
-                use_m.val = ifthenelse(sub_buf == None, -1, sub_buf)  # pylint: disable=singleton-comparison
+                use_m.val = sub_buf
               with case(False):
                 use_m.val = 0
             sub_m.val = use_m.val
@@ -671,9 +699,8 @@ class PervasivesTest(absltest.TestCase):
             'b1_a': b1_a,
             'b2_a': b2_a,
             'b3_a': b3_a,
-            'b1_ov': b1_ov,
-            'b2_ov': b2_ov,
-            'b3_ov': b3_ov,
+            'b2_none': b2_none,
+            'b3_full': b3_full,
             'b2_rst': b2_rst,
             'b3_rst': b3_rst,
             'fb_state': fb_state,
@@ -699,45 +726,119 @@ class PervasivesTest(absltest.TestCase):
     )
     for key, sync_vals in sync_traces.items():
       with self.subTest(absent_elision=key):
-        self.assertEqual(present_values(sync_vals), kahn_traces[key])
+        kahn_vals = kahn_traces[key]
+        self.assertTrue(
+            all(v is not Absent and v is not Bottom for v in kahn_vals)
+        )
+        self.assertEqual(present_values(sync_vals), kahn_vals)
+
+    # Verify overflow and underflow fail fast with BufferError for both
+    # primitive `buffer` and derived `buffer_pervasive` (including `None`).
+    bad_cases = (
+        (
+            'overflow_s1',
+            lambda fn: fn([10, 20], [True, True], [False, False], size=1),
+            2,
+            'overflow',
+        ),
+        (
+            'overflow_s1_none',
+            lambda fn: fn([None, 20], [True, True], [False, False], size=1),
+            2,
+            'overflow',
+        ),
+        (
+            'overflow_s2',
+            lambda fn: fn(
+                [None, 20, 30],
+                [True, True, True],
+                [False, False, False],
+                size=2,
+            ),
+            3,
+            'overflow',
+        ),
+        (
+            'underflow_s1',
+            lambda fn: fn([10], [False], [True], size=1),
+            1,
+            'underflow',
+        ),
+        (
+            'underflow_s2_after_none',
+            lambda fn: fn(
+                [None], [True, False, False], [False, True, True], size=2
+            ),
+            3,
+            'underflow',
+        ),
+    )
+
+    def reset_underflow(op_fn: Any) -> Stream:
+      rst = Stream([False, True])
+      ip = Stream([True, False])
+      op = Stream([False, True])
+      with reset(rst):
+        return op_fn([10], ip, op, size=2)
+
+    bad_cases += (('underflow_after_reset', reset_underflow, 2, 'underflow'),)
+    for label, builder_fn, hz, word in bad_cases:
+      for use_prim in (True, False):
+        op_fn = buffer if use_prim else self.OPS.buffer
+        for sem in (Semantics.SYNC, Semantics.KAHN):
+          with self.subTest(case=label, primitive=use_prim, semantics=sem):
+            with self.assertRaises(ExceptionGroup) as eg:
+              Scheduler.run(
+                  lambda fn=builder_fn, op=op_fn: fn(op),
+                  horizon=hz,
+                  semantics=sem,
+              )
+            self.assertTrue(
+                any(
+                    isinstance(err, BufferError) and word in str(err)
+                    for err in eg.exception.exceptions
+                ),
+                f'Expected BufferError({word!r}), got '
+                f'{eg.exception.exceptions!r}',
+            )
 
   def test_buffer_pervasive_supersampled_reset_and_validation(self):
     def make_super_prog(use_primitives: bool):
-      p_buf = buffer if use_primitives else buffer_pervasive
+      p_buf = buffer if use_primitives else self.OPS.buffer
 
       def prog():
-        ip = Stream([True, True, False, True, False, False, True, False])
-        xs = when(ip, [10, 20, 30, 40, 50, 60, 70, 80])
-        op = Stream([False, False, True, False, True, True, False, True])
+        ip1 = Stream([True, False, True, False, True, False, True, False])
+        op1 = Stream([False, True, True, False, False, True, False, True])
+        ip2 = Stream([True, True, False, True, False, False, True, False])
+        op2 = Stream([False, False, True, False, True, True, False, True])
+        ip_sub = Stream([True, True, False, True, False, True])
+        op_sub = Stream([False, False, True, False, True, True])
+        xs = Stream([10, 20, 30, 40, 50, 60, 70, 80])
         cond = Stream([True, False, True, True, False, True, True, True])
         super_rst = Stream(
             [False, True, False, False, True, False, False, False]
         )
 
-        raw1 = p_buf(xs, ip, op, size=1)
-        raw2 = p_buf(xs, ip, op, size=2)
+        raw1 = p_buf(when(ip1, xs), ip1, op1, size=1)
+        raw2 = p_buf(when(ip2, xs), ip2, op2, size=2)
         with reset(super_rst):
           with match(cond) as m:
             with case(True):
               buf_out = p_buf(
-                  when(ip, [1, 2, 3, 4, 5, 6, 7, 8]), ip, op, size=2
+                  when(ip_sub, [1, 2, 3, 4, 5, 6]), ip_sub, op_sub, size=2
               )
-              m.out = merge(op, buf_out, -1)
+              m.out = merge(op_sub, buf_out, -1)
             with case(False):
               m.out = 0
         return {'raw1': raw1, 'raw2': raw2, 'super_match': m.out}
 
       return prog
 
-    self._assert_equivalent(
-        make_super_prog,
-        horizon=8,
-        semantics=(Semantics.SYNC,),
-    )
+    self._assert_equivalent(make_super_prog, horizon=8)
 
     with self.assertRaisesRegex(ValueError, 'buffer size must be >= 1'):
       build_graph(
-          lambda: buffer_pervasive(when(True, 1), True, True, size=0),
+          lambda: self.OPS.buffer(when(True, 1), True, True, size=0),
           semantics=Semantics.SYNC,
       )
 
@@ -746,7 +847,7 @@ class PervasivesTest(absltest.TestCase):
     def bad_clock():
       ip = Stream([True, False, True, False])
       op = Stream([False, True, False, True])
-      return buffer_pervasive(counter(), ip, op, size=2)
+      return self.OPS.buffer(counter(), ip, op, size=2)
 
     with self.assertRaises(ClockError):
       check_clocks(build_graph(bad_clock, semantics=Semantics.SYNC))
@@ -754,7 +855,7 @@ class PervasivesTest(absltest.TestCase):
     # Instantaneous cut-through self-loop is rejected by check_causality just
     # like primitive `buffer`:
     def bad_cycle():
-      cyc = buffer_pervasive(when(True, lambda: cyc), True, True, size=2)  # pylint: disable=undefined-variable
+      cyc = self.OPS.buffer(when(True, lambda: cyc), True, True, size=2)  # pylint: disable=undefined-variable
       return cyc
 
     with self.assertRaises(CausalityError):
@@ -762,175 +863,9 @@ class PervasivesTest(absltest.TestCase):
           build_graph(bad_cycle, semantics=Semantics.SYNC)
       )
 
-  def test_delay_pervasive_matches_primitive_in_kahn_and_sync(self):
-    def make_prog(use_primitives: bool):
-      p_delay = delay if use_primitives else delay_pervasive
-
-      def prog():
-        xs = Stream([10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
-        ys = Stream([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-        rst = Stream(
-            [False, False, False, True, False, False, False, True, False, False]
-        )
-        gate = Stream(
-            [True, False, True, True, False, True, True, False, True, True]
-        )
-        arm_rst = Stream([
-            False,
-            False,
-            False,
-            False,
-            False,
-            True,
-            False,
-            False,
-            False,
-            False,
-        ])
-        sched_a = Stream.periodic([False, False], [True])
-        sched_b = Stream.periodic([False], [True, False])
-        sched_c = Stream.periodic([], [False, True, True])
-
-        d_def = p_delay(xs)
-        d_k0 = p_delay(xs, 0)
-        d_k2 = p_delay(xs, k=2)
-        d_pa = p_delay(xs, period=sched_a)
-        d_pb = p_delay(xs, period=sched_b)
-        d_pc = p_delay(xs, period=sched_c)
-
-        with reset(rst):
-          d_k1_rst = p_delay(xs)
-          d_k2_rst = p_delay(xs, 2)
-          d_pb_rst = p_delay(xs, period=sched_b)
-
-        with match(gate) as sub_m:
-          with case(True):
-            sub_d1 = p_delay(xs, 1, name='sub_d1')
-            sub_dp = p_delay(ys, period=sched_b, name='sub_dp')
-            with reset(arm_rst):
-              p_delay(xs, 2, name='sub_d_rst')
-              p_delay(ys, period=sched_c, name='sub_dp_rst')
-            sub_m.val = sub_d1 + sub_dp
-          with case(False):
-            sub_m.val = -1
-
-        return {
-            'd_def': d_def,
-            'd_k0': d_k0,
-            'd_k2': d_k2,
-            'd_pa': d_pa,
-            'd_pb': d_pb,
-            'd_pc': d_pc,
-            'd_k1_rst': d_k1_rst,
-            'd_k2_rst': d_k2_rst,
-            'd_pb_rst': d_pb_rst,
-            'sub_val': sub_m.val,
-        }
-
-      return prog
-
-    self._assert_equivalent(
-        make_prog,
-        horizon=10,
-        streams=('sub_d1', 'sub_dp', 'sub_d_rst', 'sub_dp_rst'),
-    )
-
-    def make_automaton_prog(use_primitives: bool):
-      p_delay = delay if use_primitives else delay_pervasive
-
-      def prog():
-        xs = Stream([10, 20, 30, 40, 50, 60, 70, 80])
-        sched = Stream.periodic([False], [True, False])
-        with automaton(init='A') as fsm:
-          with state('A'):
-            c_a = counter(start=0)
-            until(c_a >= 2, 'B')
-            fsm.d_k = p_delay(xs, 1)
-            fsm.d_p = p_delay(xs, period=sched)
-          with state('B'):
-            c_b = counter(start=0)
-            until(c_b >= 1, 'A')
-            fsm.d_k = p_delay(xs, 0)
-            fsm.d_p = -1
-        return {'fsm_dk': fsm.d_k, 'fsm_dp': fsm.d_p}
-
-      return prog
-
-    self._assert_equivalent(
-        make_automaton_prog, horizon=8, semantics=(Semantics.SYNC,)
-    )
-
-    def make_absent_and_super_prog(use_primitives: bool):
-      p_delay = delay if use_primitives else delay_pervasive
-
-      def prog():
-        sparse_sched = Stream.periodic(
-            [], [True, False, True, False, True, True, False, True]
-        )
-        sparse_x = delay(Stream([10, 20, 30, 40, 50]), period=sparse_sched)
-        rst = Stream([False, False, False, True, False, False, False, False])
-        cond = Stream([True, False, True, True, False, True, True, True])
-        super_rst = Stream(
-            [False, True, False, False, True, False, False, False]
-        )
-        sched = Stream.periodic([False], [True, False])
-
-        raw_k1 = p_delay(sparse_x, 1)
-        raw_p = p_delay(sparse_x, period=sched)
-        with reset(rst):
-          rst_k1 = p_delay(sparse_x, 1)
-          rst_p = p_delay(sparse_x, period=sched)
-        with reset(super_rst):
-          with match(cond) as m:
-            with case(True):
-              m.dk = p_delay([1, 2, 3, 4, 5, 6, 7, 8], 1)
-              m.dp = p_delay([1, 2, 3, 4, 5, 6, 7, 8], period=sched)
-            with case(False):
-              m.dk = -1
-              m.dp = -1
-        return {
-            'raw_k1': raw_k1,
-            'raw_p': raw_p,
-            'rst_k1': rst_k1,
-            'rst_p': rst_p,
-            'super_dk': m.dk,
-            'super_dp': m.dp,
-        }
-
-      return prog
-
-    self._assert_equivalent(
-        make_absent_and_super_prog,
-        horizon=8,
-        semantics=(Semantics.SYNC,),
-    )
-
-    bad_delay_cases = (
-        (ValueError, 'non-negative integer', lambda f: f(1, -1)),
-        (ValueError, 'non-negative integer', lambda f: f(1, True)),
-        (
-            ValueError,
-            'either k or period, not both',
-            lambda f: f(1, 2, period=Stream.periodic([False], [True])),
-        ),
-        (TypeError, 'static periodic', lambda f: f(1, period=[False, True])),
-        (ValueError, 'static periodic', lambda f: f(1, period=counter())),
-        (
-            ValueError,
-            'boolean values',
-            lambda f: f(1, period=Stream.periodic([0], [1])),
-        ),
-    )
-    for fn in (delay, delay_pervasive):
-      for exc_type, regex, call_fn in bad_delay_cases:
-        with self.assertRaisesRegex(exc_type, regex):
-          build_graph(
-              lambda c=call_fn, f=fn: c(f), semantics=Semantics.SYNC
-          )
-
   def test_iterated_pre_fby_post_match_pervasives(self):
     def make_prog(use_primitives: bool):
-      ops = _get_ops(use_primitives)
+      ops = self.get_ops(use_primitives)
 
       def prog():
         xs = Stream([10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
@@ -1023,48 +958,16 @@ class PervasivesTest(absltest.TestCase):
         make_prog, horizon=10, streams=('post_sub', 'post_sub_rst')
     )
 
-    def make_sync_only_prog(use_primitives: bool):
-      ops = _get_ops(use_primitives)
+    def make_super_and_automaton_prog(use_primitives: bool):
+      ops = self.get_ops(use_primitives)
 
       def prog():
-        sparse_sched = Stream.periodic(
-            [], [True, False, True, True, False, True, True, False, True, True]
-        )
-        init_sched = Stream.periodic(
-            [], [True, True, False, True, True, True, False, True, True, True]
-        )
-        sparse_x = delay(
-            Stream([10, 20, 30, 40, 50, 60, 70]), period=sparse_sched
-        )
-        inits = delay(
-            Stream([100, 200, 400, 500, 600, 800, 900, 10]), period=init_sched
-        )
-        rst = Stream(
-            [False, False, False, False, True, False, False, False, False, True]
-        )
         cond = Stream(
             [True, False, True, True, False, True, True, False, True, True]
         )
         super_rst = Stream(
             [False, True, False, False, True, False, False, True, False, False]
         )
-
-        raw_pre1 = ops.pre(sparse_x, 1)
-        raw_pre = ops.pre(sparse_x, 2)
-        raw_fby1 = ops.fby(inits, sparse_x, 1)
-        raw_fby = ops.fby(inits, sparse_x, 3)
-        raw_post = ops.post(sparse_x, 2)
-        raw_morph = ops.morph(inits, sparse_x, 3)
-        fby_post_loop = ops.fby(
-            1, lambda: ops.post(fby_post_loop, 2) + 1, 3
-        )  # pylint: disable=undefined-variable
-        with reset(rst):
-          rst_pre1 = ops.pre(sparse_x, 1)
-          rst_pre = ops.pre(sparse_x, 2)
-          rst_fby1 = ops.fby(inits, sparse_x, 1)
-          rst_fby = ops.fby(inits, sparse_x, 2)
-          rst_post = ops.post(sparse_x, 1)
-          rst_morph = ops.morph(inits, sparse_x, 2)
         with reset(super_rst):
           with match(cond) as m:
             with case(True):
@@ -1072,14 +975,13 @@ class PervasivesTest(absltest.TestCase):
               m.super_pre = ops.pre([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 2)
               m.super_fby1 = ops.fby(99, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 1)
               m.super_fby = ops.fby(99, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 2)
-              m.super_post = ops.post([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 1)
+              ops.post([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 1, name='super_post')
               m.super_morph = ops.morph(99, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 2)
             with case(False):
               m.super_pre1 = -1
               m.super_pre = -1
               m.super_fby1 = -1
               m.super_fby = -1
-              m.super_post = -1
               m.super_morph = -1
 
         with automaton(init='A') as fsm:
@@ -1088,61 +990,210 @@ class PervasivesTest(absltest.TestCase):
             until(c_a >= 3, 'B')
             fsm.f1 = ops.fby(50, [10, 20, 30, 40, 50, 60, 70, 80, 90, 100], 1)
             fsm.f = ops.fby(50, [10, 20, 30, 40, 50, 60, 70, 80, 90, 100], 2)
-            fsm.p = ops.post([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 1)
+            ops.post([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 1, name='fsm_p')
             fsm.m = ops.morph(50, [10, 20, 30, 40, 50, 60, 70, 80, 90, 100], 2)
           with state('B'):
             c_b = counter(start=0)
             until(c_b >= 1, 'A')
             fsm.f1 = -1
             fsm.f = -1
-            fsm.p = -1
             fsm.m = -1
 
         return {
-            'raw_pre1': raw_pre1,
-            'raw_pre': raw_pre,
-            'raw_fby1': raw_fby1,
-            'raw_fby': raw_fby,
-            'raw_post': raw_post,
-            'raw_morph': raw_morph,
-            'fby_post_loop': fby_post_loop,
-            'rst_pre1': rst_pre1,
-            'rst_pre': rst_pre,
-            'rst_fby1': rst_fby1,
-            'rst_fby': rst_fby,
-            'rst_post': rst_post,
-            'rst_morph': rst_morph,
             'super_pre1': m.super_pre1,
             'super_pre': m.super_pre,
             'super_fby1': m.super_fby1,
             'super_fby': m.super_fby,
-            'super_post': m.super_post,
             'super_morph': m.super_morph,
             'fsm_f1': fsm.f1,
             'fsm_f': fsm.f,
-            'fsm_p': fsm.p,
             'fsm_m': fsm.m,
         }
 
       return prog
 
     self._assert_equivalent(
-        make_sync_only_prog, horizon=10, semantics=(Semantics.SYNC,)
+        make_super_and_automaton_prog,
+        horizon=10,
+        streams=('super_post', 'fsm_p'),
+    )
+
+    def make_subclock_iterated_prog(use_primitives: bool):
+      ops = self.get_ops(use_primitives)
+
+      def prog():
+        # Include leading False ticks so tick 0 is `Absent` in SYNC.
+        sched = Stream([
+            False, True, False, True, True, False, True, True, False, True,
+        ])
+        raw_x = when(
+            sched,
+            Stream([9, 10, 9, 20, 30, 9, 40, 50, 9, 60]),
+        )
+        raw_inits = when(
+            sched,
+            Stream([9, 100, 9, 200, 300, 9, 400, 500, 9, 600]),
+        )
+        rst = Stream(
+            [False, False, False, False, True, False, True, False, False, False]
+        )
+
+        with match(sched) as m:
+          with case(True):
+            sub_pre1 = ops.pre(raw_x, 1)
+            sub_pre = ops.pre(raw_x, 2)
+            sub_fby1 = ops.fby(raw_inits, raw_x, 1)
+            sub_fby = ops.fby(raw_inits, raw_x, 3)
+            ops.post(raw_x, 2, name='sub_post')
+            m.sub_pre1 = sub_pre1
+            m.sub_pre = sub_pre
+            m.sub_fby1 = sub_fby1
+            m.sub_fby = sub_fby
+            m.sub_morph = ops.morph(raw_inits, raw_x, 3)
+          with case(False):
+            m.sub_pre1 = -1
+            m.sub_pre = -1
+            m.sub_fby1 = -1
+            m.sub_fby = -1
+            m.sub_morph = -1
+        fby_post_loop = ops.fby(
+            1, lambda: ops.post(fby_post_loop, 2) + 1, 3
+        )  # pylint: disable=undefined-variable
+        with reset(rst):
+          with match(sched) as rm:
+            with case(True):
+              rm.pre1 = ops.pre(raw_x, 1)
+              rm.pre = ops.pre(raw_x, 2)
+              rm.fby1 = ops.fby(raw_inits, raw_x, 1)
+              rm.fby = ops.fby(raw_inits, raw_x, 2)
+              ops.post(raw_x, 1, name='rst_post')
+              rm.morph = ops.morph(raw_inits, raw_x, 2)
+            with case(False):
+              rm.pre1 = -1
+              rm.pre = -1
+              rm.fby1 = -1
+              rm.fby = -1
+              rm.morph = -1
+
+        return {
+            'sub_pre1': m.sub_pre1,
+            'sub_pre': m.sub_pre,
+            'sub_fby1': m.sub_fby1,
+            'sub_fby': m.sub_fby,
+            'sub_morph': m.sub_morph,
+            'fby_post_loop': fby_post_loop,
+            'rst_pre1': rm.pre1,
+            'rst_pre': rm.pre,
+            'rst_fby1': rm.fby1,
+            'rst_fby': rm.fby,
+            'rst_morph': rm.morph,
+        }
+
+      return prog
+
+    self._assert_equivalent(
+        make_subclock_iterated_prog,
+        horizon=10,
+        semantics=(Semantics.SYNC, Semantics.KAHN),
+        streams=('sub_post', 'rst_post'),
     )
 
     for bad_n in (0, -2, True, 1.5):
       for fn in (
           lambda n=bad_n: pre(1, n),
-          lambda n=bad_n: pre_pervasive(1, n),
+          lambda n=bad_n: self.OPS.pre(1, n),
           lambda n=bad_n: fby(0, 1, n),
-          lambda n=bad_n: fby_pervasive(0, 1, n),
+          lambda n=bad_n: self.OPS.fby(0, 1, n),
           lambda n=bad_n: post(1, n),
-          lambda n=bad_n: post_pervasive(1, n),
+          lambda n=bad_n: self.OPS.post(1, n),
           lambda n=bad_n: morph(0, 1, n),
-          lambda n=bad_n: morph_pervasive(0, 1, n),
+          lambda n=bad_n: self.OPS.morph(0, 1, n),
       ):
         with self.assertRaisesRegex(ValueError, 'integer >= 1'):
           build_graph(fn, semantics=Semantics.SYNC)
+
+  def test_counter_tick_and_subclock_current_equivalence(self):
+    def make_prog(use_primitives: bool):
+      ops = self.get_ops(use_primitives)
+
+      def prog():
+        tick_seq = Stream([False, True, False, True, True, False, True, True])
+        dyn_tick = (counter(0) % 2) == 1
+        starts = Stream([10, 20, 30, 40, 50, 60, 70, 80])
+        maxs = Stream([1, 2, 10, 10, 10, 3, 10, 10])
+        rst = Stream([False, False, False, True, False, False, True, False])
+        gate = Stream([True, False, True, True, False, True, False, True])
+
+        base_t = ops.counter(start=0, tick=tick_seq)
+        stall_t = ops.counter(start=5, tick=False)
+        sat_t = ops.counter(start=0, max_val=2, tick=tick_seq)
+        dyn_t = ops.counter(start=0, max_val=maxs, tick=dyn_tick)
+        over_t = ops.counter(start=5, max_val=maxs, tick=tick_seq)
+        with reset(rst):
+          rst_t = ops.counter(start=starts, tick=tick_seq)
+          rst_max = ops.counter(start=0, max_val=2, tick=tick_seq)
+        with match(gate) as m:
+          with case(True):
+            m.sub_cnt = ops.counter(
+                start=1, tick=Stream([False, True, False, True, True])
+            )
+          with case(False):
+            m.sub_cnt = -1
+        with automaton(init='A') as fsm:
+          with state('A'):
+            until(rst, 'B')
+            fsm.cnt = ops.counter(start=0, tick=dyn_tick)
+          with state('B'):
+            until(rst, 'A')
+            fsm.cnt = ops.counter(start=100, tick=tick_seq)
+
+        # Direct subclock projection `current(b, when(b, x), default)` matches
+        # canonical Lustre `c = merge(b, sub, whennot(b, fby(default, c)))`.
+        nat = counter(0)
+        sub_odd = when(dyn_tick, nat)
+        if use_primitives:
+          cur_sub = current(dyn_tick, sub_odd, default=-1)
+          with reset(rst):
+            cur_sub_rst = current(dyn_tick, sub_odd, default=starts)
+        else:
+          cur_sub = merge(
+              dyn_tick,
+              sub_odd,
+              whennot(
+                  dyn_tick,
+                  fby(-1, lambda: cur_sub),  # pylint: disable=undefined-variable
+              ),
+          )
+          with reset(rst):
+            cur_sub_rst = merge(
+                dyn_tick,
+                sub_odd,
+                whennot(
+                    dyn_tick,
+                    fby(
+                        starts,
+                        lambda: cur_sub_rst,  # pylint: disable=undefined-variable
+                    ),
+                ),
+            )
+
+        return {
+            'base_t': base_t,
+            'stall_t': stall_t,
+            'sat_t': sat_t,
+            'dyn_t': dyn_t,
+            'over_t': over_t,
+            'rst_t': rst_t,
+            'rst_max': rst_max,
+            'sub_cnt': m.sub_cnt,
+            'fsm_cnt': fsm.cnt,
+            'cur_sub': cur_sub,
+            'cur_sub_rst': cur_sub_rst,
+        }
+
+      return prog
+
+    self._assert_equivalent(make_prog, horizon=8)
 
 
 if __name__ == '__main__':

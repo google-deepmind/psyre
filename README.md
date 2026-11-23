@@ -32,6 +32,10 @@ reactive stream programs.
   automaton and subgraph hierarchies, subclock annotations, feedback back-edge
   styling, and neighborhood highlighting.
 
+> **Note:** Psyre streams store values by reference without copying them or
+> enforcing runtime immutability. Treat values carried on streams as immutable;
+> the behavior of mutating values on streams is unspecified.
+
 ## Repository Layout
 
 - **Core package**: Stream representation, Stage-1 graph construction and pure
@@ -39,7 +43,7 @@ reactive stream programs.
   hierarchical automata lowering, static causality and clock analyses,
   whole-program graph optimization, Stage-2 runtime scheduler, post-run trace
   inspection, and interactive SVG visualization.
-- **Examples** (`examples/`):
+- **Examples** (`examples/src/`):
   - *Recurrent Neural Network & Perceptron*: Variable-depth unrolled RNN and
     perceptron with bidirectional reverse-mode automatic differentiation and
     multi-mode training/inference control.
@@ -53,13 +57,27 @@ reactive stream programs.
 - **Notebooks** (`notebooks/`): Interactive Colab/Jupyter walkthroughs covering
   canonical reactive idioms, the RNN model, the sparsely-gated Mixture of
   Experts, and the systolic array.
-- **Tests** (`tests/` and `examples/`): Unit test suites covering semantics,
-  lowering, static analyses, optimization, visualization, and all examples.
+- **Tests** (`tests/` and `examples/tests/`): Unit test suites covering
+  semantics, lowering, static analyses, optimization, visualization, and all
+  examples.
+- **Equations** (`equations/` — *highly experimental, work in progress*):
+  Everything under the `equations/` subdirectory (including the
+  `psyre_equations` / `Equations` metaclass prototype, `equations/tests/`,
+  `equations/examples/src/`, and `equations/examples/tests/`) is **highly
+  experimental and a work in progress**. It explores an opt-in, lambda-free
+  declarative syntax for recursive stream equations; APIs, semantics, and
+  internals may change or be removed without notice.
 
 ## Installation
 
+Psyre requires **Python >= 3.12**. Install the core package in editable mode,
+with optional extras for Graphviz visualization (`viz`) or the full test suite
+(`test`, which includes visualization dependencies):
+
 ```bash
-pip install -e ".[test]"
+pip install -e .          # core runtime (pure Python stdlib)
+pip install -e ".[viz]"   # + Graphviz/pydot schematic visualization
+pip install -e ".[test]"  # + pytest / absl-py test suite (includes [viz])
 ```
 
 Rendering interactive schematics also requires the Graphviz `dot` binary on your
@@ -70,6 +88,21 @@ system `PATH` (e.g., `apt install graphviz` or `brew install graphviz`).
 ```bash
 pytest
 ```
+
+## References
+
+- **Halbwachs, Caspi, Raymond & Pilaud (1991)** — *The Synchronous Data Flow Programming Language LUSTRE*. *Proceedings of the IEEE*, 79(9):1305–1320. https://doi.org/10.1109/5.97300 (Origin: Caspi, Pilaud, Halbwachs & Plaice, *POPL '87*, pp. 178–188, https://doi.org/10.1145/41625.41641.)
+- **Kahn (1974)** — *The Semantics of a Simple Language for Parallel Programming*. *Information Processing 74 (IFIP Congress '74)*, North-Holland, pp. 471–475. (Coroutine execution model: Kahn & MacQueen, *Coroutines and Networks of Parallel Processes*, *Information Processing 77 (IFIP '77)*, pp. 993–998.)
+- **Berry & Gonthier (1992)** — *The ESTEREL Synchronous Programming Language: Design, Semantics, Implementation*. *Science of Computer Programming*, 19(2):87–152. https://doi.org/10.1016/0167-6423(92)90005-V (See also Berry, *The Foundations of Esterel*, MIT Press, 2000, pp. 425–454, for the canonical ABRO benchmark.)
+- **Caspi & Pouzet (1996)** — *Synchronous Kahn Networks*. *ICFP '96*, pp. 226–238. https://doi.org/10.1145/232627.232651
+- **Hamon & Pouzet (2000)** — *Modular Resetting of Synchronous Data-Flow Programs*. *PPDP '00*, pp. 289–300. https://doi.org/10.1145/351268.351300
+- **Colaço & Pouzet (2003)** — *Clocks as First Class Abstract Types*. *EMSOFT '03*, LNCS 2855, Springer, pp. 134–155. https://doi.org/10.1007/978-3-540-45212-6_10
+- **Maraninchi & Rémond (2003)** — *Mode-Automata: A New Domain-Specific Construct for the Development of Safe Critical Systems*. *Science of Computer Programming*, 46(3):219–254. https://doi.org/10.1016/S0167-6423(02)00093-X
+- **Colaço, Pagano & Pouzet (2005)** — *A Conservative Extension of Synchronous Data-Flow with State Machines*. *EMSOFT '05*, pp. 173–182. https://doi.org/10.1145/1086228.1086261
+- **Cohen, Duranton, Eisenbeis, Pagetti, Plateau & Pouzet (2006)** — *N-Synchronous Kahn Networks: A Relaxed Model of Synchrony for Real-Time Systems*. *POPL '06*, pp. 180–193. https://doi.org/10.1145/1111037.1111054
+- **Colaço, Pagano & Pouzet (2017)** — *SCADE 6: A Formal Language for Embedded Critical Software Development (Invited Paper)*. *TASE 2017*, pp. 1–11. https://doi.org/10.1109/TASE.2017.8285623 (See also Pouzet, *Lucid Synchrone, version 3: Tutorial and Reference Manual*, 2006, https://www.di.ens.fr/~pouzet/lucid-synchrone/; Bourke, Brun & Pouzet, *PACMPL* 4(POPL), Art. 44, 2020, https://doi.org/10.1145/3371112; and Bourke, Pesin & Pouzet, *ACM TECS* 22(5s), Art. 137, 2023, https://doi.org/10.1145/3608102.)
+- **Potop-Butucaru, Cohen, Plotkin & Pompougnac (2023)** — *Bidirectional Reactive Programming for Machine Learning*. Preprint [arXiv:2311.16977](https://arxiv.org/abs/2311.16977) [cs.PL], 2023 (HAL: `hal-04354071`).
+- **Gaudelier, Cohen & Potop-Butucaru (2026)** — *Relaxed Activation Analysis of Dataflow Networks: A Clock Calculus for Machine Learning and Real-Time Scheduling*. *Proc. 29th Forum on Specification & Design Languages (FDL 2026)*, pp. 1–7. Extended preprint: [arXiv:2607.21797](https://arxiv.org/abs/2607.21797) [cs.PL].
 
 ## Security
 

@@ -11,20 +11,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pointwise mathematical stream primitives lifted via `@psyre_comb`."""
+"""Scalar pointwise mathematical stream primitives lifted via `@psyre_comb`.
+
+These wrap Python `math.*` functions for scalar numeric streams; for dense
+NumPy or JAX array streams, use `np.exp`/`np.tanh` (auto-lifted via NEP-13) or
+`@psyre_comb`-wrapped `jnp.*` operations instead.
+"""
 
 import math
+import random
 
-from psyre.common import psyre_comb  # pylint: disable=g-importing-member
+from psyre.common import (  # pylint: disable=g-importing-member,g-multiple-import
+    mark_builtin_scalar_op,
+    psyre_comb,
+)
 
 
-@psyre_comb
+@psyre_comb(pure=True)
 def exp(v):
   """Pointwise exponential stream function."""
   return math.exp(v)
 
 
 @psyre_comb
+def random_stream():
+  """Returns a random float in [0.0, 1.0) at each stream step."""
+  return random.random()
+
+
+@psyre_comb(pure=True)
 def tanh(v):
   """Pointwise hyperbolic tangent stream function."""
   return math.tanh(v)
+
+
+mark_builtin_scalar_op(exp)
+mark_builtin_scalar_op(random_stream)
+mark_builtin_scalar_op(tanh)

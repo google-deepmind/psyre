@@ -18,6 +18,8 @@ import gzip
 import json
 import logging
 import re
+import subprocess
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 from absl.testing import absltest
@@ -38,8 +40,16 @@ from psyre.common import (
     ifthenelse,
     logger,
     pre,
+    psyre_comb,
+    psyre_node,
+    reset,
     switch,
     when,
+)
+from psyre.match import (
+    case,
+    default,
+    match,
 )
 from psyre.stream import Stream
 
@@ -64,65 +74,64 @@ def _parse_edge_metadata(svg: str) -> list[dict[str, str]]:
   return edges
 
 
+def _delayed_edges(svg: str) -> list[dict[str, str]]:
+  """Returns rendered SVG edge metadata for delayed feedback edges."""
+  return [e for e in _parse_edge_metadata(svg) if '.delayed_next' in e['info']]
+
+
 class VisualizeTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
     logger.setLevel(logging.WARNING)
 
-  def test_fby_feedback_uses_constrained_dir_back_and_preserves_svg_src_dst(
-      self,
-  ):
+  def _assert_back_edges(self, dot_src: str, count: int) -> None:
+    dashed_lines = [
+        line.strip()
+        for line in dot_src.splitlines()
+        if '#7C3AED' in line and 'dashed' in line
+    ]
+    self.assertLen(dashed_lines, count)
+    for line in dashed_lines:
+      self.assertIn('dir="back"', line)
+      self.assertIn('constraint=true', line)
+
+  def test_feedback_edges_use_dir_back_and_preserve_svg_metadata(self):
     def counter_prog():
       x = fby(0, lambda: x + 1, name='acc')
       return {'x': x}
 
-    g = build_graph(counter_prog)
-    dot_src = visualize.build_pydot(g).to_string()
-    dashed_lines = [
-        line.strip()
-        for line in dot_src.splitlines()
-        if '#7C3AED' in line and 'dashed' in line
-    ]
-    self.assertLen(dashed_lines, 1)
-    self.assertIn('dir="back"', dashed_lines[0])
-    self.assertIn('constraint=true', dashed_lines[0])
-
-    for rankdir in ('LR', 'TB'):
-      svg = visualize.render_svg(g, rankdir=rankdir)
-      delayed = [
-          e for e in _parse_edge_metadata(svg) if '.delayed_next' in e['info']
-      ]
-      self.assertLen(delayed, 1)
-      fby_node = next(n for n in g.nodes if n.op == 'fby')
-      add_node = next(n for n in g.nodes if n.op != 'fby')
-      self.assertEqual(delayed[0]['src'], f'n_{add_node.id}')
-      self.assertEqual(delayed[0]['dst'], f'n_{fby_node.id}')
-
-  def test_pre_feedback_uses_constrained_dir_back(self):
     def pre_prog():
       p = pre(lambda: x, name='prev_x')
-      x = ifthenelse(Stream.once(True), 0, p + 1)
+      x = ifthenelse(Stream.once(0), 0, p + 1)
       return {'x': x}
 
-    g = build_graph(pre_prog)
-    dot_src = visualize.build_pydot(g).to_string()
-    dashed_lines = [
-        line.strip()
-        for line in dot_src.splitlines()
-        if '#7C3AED' in line and 'dashed' in line
-    ]
-    self.assertLen(dashed_lines, 1)
-    self.assertIn('dir="back"', dashed_lines[0])
-    self.assertIn('constraint=true', dashed_lines[0])
+    def mutual_prog():
+      x = fby(0, lambda: y + 1, name='x')
+      y = fby(10, lambda: x + 2, name='y')
+      return {'x': x, 'y': y}
 
-    svg = visualize.render_svg(g)
-    delayed = [
-        e for e in _parse_edge_metadata(svg) if '.delayed_next' in e['info']
-    ]
-    self.assertLen(delayed, 1)
-    pre_node = next(n for n in g.nodes if n.op == 'pre')
-    self.assertEqual(delayed[0]['dst'], f'n_{pre_node.id}')
+    cases = (
+        ('fby', counter_prog, 'fby', 1, ('LR', 'TB'), True),
+        ('pre', pre_prog, 'pre', 1, ('LR',), False),
+        ('mutual_fby', mutual_prog, 'fby', 2, ('LR',), False),
+    )
+    for label, prog, delay_op, count, rankdirs, check_src in cases:
+      g = build_graph(prog)
+      delay_keys = {f'n_{n.id}' for n in g.nodes if n.op == delay_op}
+      with self.subTest(case=label):
+        self._assert_back_edges(visualize.build_pydot(g).to_string(), count)
+        for rankdir in rankdirs:
+          svg = visualize.render_svg(g, rankdir=rankdir)
+          delayed = _delayed_edges(svg)
+          self.assertLen(delayed, count)
+          self.assertEqual({e['dst'] for e in delayed}, delay_keys)
+          if check_src:
+            add_node = next(n for n in g.nodes if n.op != delay_op)
+            self.assertEqual(delayed[0]['src'], f'n_{add_node.id}')
+
+    # Verify the `render_html` convenience wrapper without re-running the FSM.
+    self.assertIn('<svg', visualize.render_html(build_graph(counter_prog)))
 
   def test_forward_fby_stays_forward_and_self_loop_unconstrained(self):
     def prog():
@@ -132,31 +141,20 @@ class VisualizeTest(absltest.TestCase):
       return {'fwd': fwd, 'self_x': self_x}
 
     g = build_graph(prog)
-    dot_src = visualize.build_pydot(g).to_string()
-    fwd_node = next(n for n in g.nodes if n.name == 'fwd')
-    self_node = next(n for n in g.nodes if n.name == 'self_x')
-
-    fwd_lines = [
-        line.strip()
-        for line in dot_src.splitlines()
-        if f'psyre_e_{fwd_node.id}_p1' in line
-    ]
-    self.assertLen(fwd_lines, 1)
-    self.assertNotIn('dir="back"', fwd_lines[0])
-    self.assertIn('constraint=true', fwd_lines[0])
-    self.assertIn('style="solid"', fwd_lines[0])
-    self.assertIn('color="#334155"', fwd_lines[0])
-
-    self_lines = [
-        line.strip()
-        for line in dot_src.splitlines()
-        if f'psyre_e_{self_node.id}_p1' in line
-    ]
-    self.assertLen(self_lines, 1)
-    self.assertNotIn('dir="back"', self_lines[0])
-    self.assertIn('constraint=false', self_lines[0])
-    self.assertIn('style="dashed"', self_lines[0])
-    self.assertIn('color="#7C3AED"', self_lines[0])
+    dot_lines = visualize.build_pydot(g).to_string().splitlines()
+    for name, constraint, style, color in (
+        ('fwd', 'constraint=true', 'style="solid"', 'color="#334155"'),
+        ('self_x', 'constraint=false', 'style="dashed"', 'color="#7C3AED"'),
+    ):
+      node = next(n for n in g.nodes if n.name == name)
+      matched = [
+          l.strip() for l in dot_lines if f'psyre_e_{node.id}_p1' in l
+      ]
+      self.assertLen(matched, 1)
+      self.assertNotIn('dir="back"', matched[0])
+      self.assertIn(constraint, matched[0])
+      self.assertIn(style, matched[0])
+      self.assertIn(color, matched[0])
 
   def test_automaton_feedback_edges_stay_inside_cluster_and_render_html(self):
     def fsm_prog():
@@ -171,34 +169,13 @@ class VisualizeTest(absltest.TestCase):
       return {'y': fsm.y}
 
     g = build_graph(fsm_prog)
-    dot_src = visualize.build_pydot(g).to_string()
-    dashed_lines = [
-        line.strip()
-        for line in dot_src.splitlines()
-        if '#7C3AED' in line and 'dashed' in line
-    ]
-    self.assertLen(dashed_lines, 2)
-    for line in dashed_lines:
-      self.assertIn('dir="back"', line)
-      self.assertIn('constraint=true', line)
+    self._assert_back_edges(visualize.build_pydot(g).to_string(), 2)
 
-    html_out = visualize.render_html(g, title='test_fsm')
-    self.assertIn('<svg', html_out)
-
-  def test_mutual_fby_cycle_renders_without_dot_cycles(self):
-    def mutual_prog():
-      x = fby(0, lambda: y + 1, name='x')
-      y = fby(10, lambda: x + 2, name='y')
-      return {'x': x, 'y': y}
-
-    g = build_graph(mutual_prog)
-    svg = visualize.render_svg(g)
-    delayed = [
-        e for e in _parse_edge_metadata(svg) if '.delayed_next' in e['info']
-    ]
-    self.assertLen(delayed, 2)
-    fby_keys = {f'n_{n.id}' for n in g.nodes if n.op == 'fby'}
-    self.assertEqual({e['dst'] for e in delayed}, fby_keys)
+    viz = visualize.visualize_graph(g, title='abro_box')
+    self.assertIn('<svg', viz.svg)
+    self.assertIn('psyre-viz-card', viz.html)
+    self.assertIn('fsm_box_0', viz.dot)
+    self.assertIn('⊞ await_a', viz.dot)
 
   def test_multi_valued_when_and_switch_visualization(self):
     def prog():
@@ -218,27 +195,6 @@ class VisualizeTest(absltest.TestCase):
     self.assertIn('data-psyre-shape="selector-trapezoid"', svg)
     self.assertIn("match=='A'", svg)
 
-  def test_collapsed_automaton_and_visualize_graph_bundle(self):
-    def prog():
-      a = Stream([False, True, False], name='a')
-      r = Stream([False, False, True], name='r')
-      with automaton(init='WAIT', name='await_a') as fsm:
-        with state('WAIT', unless(r, 'WAIT')):
-          fsm.y = a
-          until(a, 'DONE')
-        with state('DONE', unless(r, 'WAIT')):
-          fsm.y = True
-      return {'y': fsm.y}
-
-    g = build_graph(prog)
-    collapsed_dot = visualize.build_pydot(g, collapse_automata=True).to_string()
-    self.assertIn('fsm_box_0', collapsed_dot)
-    self.assertIn('⊞ await_a', collapsed_dot)
-    viz = visualize.visualize_graph(g, title='abro_box')
-    self.assertIn('<svg', viz.svg)
-    self.assertIn('psyre-viz-card', viz.html)
-    self.assertIn('fsm_box_0', viz.dot)
-
   def test_large_graph_uses_net_ref_badges_and_renders_svg(self):
     def prog():
       x = Stream([1, 2, 3], name='x')
@@ -256,7 +212,7 @@ class VisualizeTest(absltest.TestCase):
     svg = visualize.render_svg(g)
     self.assertIn('<svg', svg)
 
-  def test_inline_static_and_once_stream_nodes_render_without_background_boxes(
+  def test_inline_static_stream_nodes_render_without_background_boxes(
       self,
   ):
     def prog():
@@ -274,14 +230,22 @@ class VisualizeTest(absltest.TestCase):
     root = ET.fromstring(svg)
     checked = 0
     for el in root.iter(f'{_SVG_NS}g'):
-      if el.get('class') == 'node' and el.get('data-psyre-kind') in (
-          'static_stream',
-          'once_stream',
+      if (
+          el.get('class') == 'node'
+          and el.get('data-psyre-kind') == 'static_stream'
       ):
         checked += 1
         self.assertIsNone(el.find(f'{_SVG_NS}path'))
         self.assertIsNone(el.find(f'{_SVG_NS}polygon'))
     self.assertGreater(checked, 0)
+    # Resettable `static_stream` node (`Stream.once(2)` inside `state('S0')`)
+    # renders with its sequence metadata inside the SVG tooltip.
+    self.assertIn('op=static_stream', svg)
+    # Large symbolic repetition (`Stream.once(10**8)`) formats compactly in DOT.
+    big_dot = visualize.build_pydot(
+        build_graph(lambda: Stream.once(10**8))
+    ).to_string()
+    self.assertIn(str(10**8), big_dot)
 
   def test_stream_sum_renders_multi_port_node_and_lazy_gzip_views(self):
     def prog():
@@ -321,6 +285,245 @@ class VisualizeTest(absltest.TestCase):
       decoded = gzip.decompress(base64.b64decode(b64_payload)).decode('utf-8')
       self.assertIn('<svg', decoded)
       self.assertIn('</svg>', decoded)
+
+  def test_dot_preserves_lowered_when_unique_activity_and_fsm_clusters(self):
+    # 1. Nested match() under reset(): every edge endpoint `n_X` must have a
+    #    matching node declaration (no dropped live `when` ghost ovals).
+    def nested_match_with_reset():
+      r = Stream([False, True, False, False], name='r')
+      c1 = Stream([True, True, False, True], name='c1')
+      c2 = Stream([1, 2, 1, 1], name='c2')
+      with reset(r):
+        with match(c1) as m1:
+          with case(True):
+            with match(c2) as m2:
+              with case(1):
+                m2.y = counter(0)
+              with default():
+                m2.y = 0
+            m1.out = m2.y
+          with case(False):
+            m1.out = 0
+      return m1.out
+
+    g_nested = build_graph(nested_match_with_reset, optimize=False)
+    dot_nested = visualize.build_pydot(g_nested).to_string()
+    declared = set(re.findall(r'\bn_(\d+)\s*\[', dot_nested))
+    referenced = set(re.findall(r'\bn_(\d+)(?::|\s*->)', dot_nested))
+    self.assertTrue(referenced.issubset(declared), referenced - declared)
+
+    # 2. Punctuation-stripped operators (`== 1` vs `!= 1`) must not collide
+    #    into a single activity cluster or duplicate DOM ID.
+    def match_case_vs_default():
+      sel = Stream([1, 2, 1, 2], name='sel')
+      with match(sel) as m:
+        with case(1):
+          m.o = counter(0) + 1
+        with default():
+          m.o = counter(10) + 2
+      return m.o
+
+    dot_act = visualize.build_pydot(
+        build_graph(match_case_vs_default)
+    ).to_string()
+    self.assertIn('sel == 1', dot_act)
+    self.assertIn('sel != 1', dot_act)
+    act_names = re.findall(r'subgraph\s+(cluster_act_\S+)', dot_act)
+    self.assertLen(act_names, 2)
+    self.assertLen(set(act_names), 2)
+    act_ids = re.findall(r'id="(psyre_act_cluster_[^"]+)"', dot_act)
+    self.assertLen(act_ids, 2)
+    self.assertLen(set(act_ids), 2)
+
+    # 3. Subgraph with divergent equal-depth subclocks computes longest common
+    #    prefix so the FSM/node cluster appears once, not duplicated.
+    @psyre_node('grp')
+    def divergent_box(w1: Stream, w2: Stream):
+      return w1 + 10, w2 + 20
+
+    def divergent_prog():
+      c1 = Stream([True, False, True], name='c1')
+      c2 = Stream([False, True, False], name='c2')
+      x = Stream([1, 2, 3], name='x')
+      return divergent_box(when(c1, x), when(c2, x))
+
+    dot_div = visualize.build_pydot(build_graph(divergent_prog)).to_string()
+    fsm_clusters = re.findall(r'subgraph\s+(cluster_fsm_0_\S+)', dot_div)
+    self.assertLen(fsm_clusters, 1)
+    fsm_ids = re.findall(r'id="(psyre_fsm_cluster_0)"', dot_div)
+    self.assertLen(fsm_ids, 1)
+
+    # 4. Non-NamedTuple tuple subclass output, `abs(Stream)`, and missing
+    #    `initial_view_key` fallback in `gui.build_visualization`.
+    class SubTuple(tuple):
+      pass
+
+    def subtuple_abs():
+      return SubTuple((abs(Stream([-1, 2], name='x')),))
+
+    svg_sub = visualize.render_svg(build_graph(subtuple_abs))
+    self.assertIn('<svg', svg_sub)
+    self.assertIn('|·|', svg_sub)
+    view_only = gui.SchematicBundle(
+        views={'only': gui.SchematicView(raw_svg=svg_sub, dot_src='digraph{}')},
+        initial_view_key='missing',
+        node_count=1,
+    )
+    self.assertIn('<svg', gui.build_visualization(view_only).svg)
+
+    # 5. Inline HTML `<script>` JSON payloads escape `</script>` and `<!--`.
+    evil_prefix = 'fsm</script><script>alert(1)</script><!--'
+    evil_bundle = gui.SchematicBundle(
+        views={
+            evil_prefix: gui.SchematicView(
+                raw_svg=svg_sub, dot_src='digraph{}'
+            )
+        },
+        fsm_prefixes=(evil_prefix,),
+        initial_view_key=evil_prefix,
+        node_count=1,
+    )
+    html_out = gui.render_bundle_html(evil_bundle)
+    self.assertNotIn('</script><script>', html_out)
+    self.assertNotIn('<!--', html_out)
+    self.assertIn('\\u003c/script\\u003e', html_out)
+
+  def test_user_operators_colliding_with_builtin_names(self):
+    # User operators colliding with builtin names (`merge`, `when`, `fby`,
+    # `ifthenelse`, `prefix_sum`, `buffer`, `counter`) render as ordinary
+    # combinational boxes rather than builtin schematic shapes/glyphs.
+    @psyre_comb
+    def merge(a, b):
+      return a + b
+
+    @psyre_comb
+    def when(a, b):  # pylint: disable=redefined-outer-name
+      return a + b
+
+    @psyre_comb
+    def fby(a, b):  # pylint: disable=redefined-outer-name
+      return a + b
+
+    @psyre_comb
+    def ifthenelse(a, b, c):  # pylint: disable=redefined-outer-name
+      return a + b + c
+
+    @psyre_comb
+    def prefix_sum(a):
+      return a
+
+    @psyre_comb
+    def buffer(a):
+      return a
+
+    @psyre_comb
+    def counter(a):  # pylint: disable=redefined-outer-name
+      return a
+
+    def user_named_prog():
+      s = Stream([1, 2], name='s')
+      return (
+          merge(s, s)
+          + when(s, s)
+          + fby(s, s)
+          + ifthenelse(s, s, s)
+          + prefix_sum(s)
+          + buffer(s)
+          + counter(s)
+      )
+
+    user_svg = visualize.render_svg(build_graph(user_named_prog))
+    self.assertIn('<svg', user_svg)
+    self.assertNotIn('delayed_next', user_svg)
+    self.assertNotIn('>Σ<', user_svg)
+    self.assertNotIn('>042<', user_svg)
+
+  def test_viewbox_contains_expanded_fby_square_and_validation_guards(self):
+    # Expanded `fby` square with a long name must remain inside the SVG viewBox.
+    def wide_fby_prog():
+      x = Stream([1, 2, 3], name='x')
+      return fby(0, x, name='very_long_state_register_name')
+
+    svg = visualize.render_svg(build_graph(wide_fby_prog))
+    root = ET.fromstring(svg)
+    vx, vy, vw, vh = (float(v) for v in root.get('viewBox', '').split())
+    graph_g = root.find(f'{_SVG_NS}g')
+    self.assertIsNotNone(graph_g)
+    m_tr = re.search(
+        r'translate\(\s*(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)\s*\)',
+        graph_g.get('transform', ''),
+    )
+    self.assertIsNotNone(m_tr)
+    gx, gy = float(m_tr.group(1)), float(m_tr.group(2))
+    found_square = False
+    for poly in root.iter(f'{_SVG_NS}polygon'):
+      if poly.get('data-psyre-shape') == 'fby-square':
+        found_square = True
+        for pair in poly.get('points', '').split():
+          px, py = (float(c) for c in pair.split(','))
+          self.assertGreaterEqual(px + gx, vx)
+          self.assertLessEqual(px + gx, vx + vw)
+          self.assertGreaterEqual(py + gy, vy)
+          self.assertLessEqual(py + gy, vy + vh)
+    self.assertTrue(found_square)
+
+    # Actionable errors on missing dot binary or invalid SVG output.
+    g_small = build_graph(lambda: counter(0))
+    with self.assertRaisesRegex(FileNotFoundError, 'Install Graphviz'):
+      visualize.render_svg(g_small, dot_prog='__nonexistent_dot_bin__')
+
+    empty_proc = subprocess.CompletedProcess(
+        ['dot'], 0, stdout=b'', stderr=b''
+    )
+    with mock.patch.object(
+        visualize.subprocess, 'run', return_value=empty_proc
+    ):
+      with self.assertRaisesRegex(RuntimeError, 'missing <svg>'):
+        visualize._run_dot_svg('digraph{}', 'dot')  # pylint: disable=protected-access
+
+    # Non-zero exit code with valid SVG logs a warning instead of crashing.
+    warn_proc = subprocess.CompletedProcess(
+        ['dot'], 1, stdout=svg.encode('utf-8'), stderr=b'font warning'
+    )
+    with mock.patch.object(
+        visualize.subprocess, 'run', return_value=warn_proc
+    ):
+      with self.assertLogs(logger, level='WARNING') as logs:
+        out_svg = visualize._run_dot_svg('digraph{}', 'dot')  # pylint: disable=protected-access
+      self.assertIn('<svg', out_svg)
+      self.assertTrue(any('font warning' in m for m in logs.output))
+
+    # Reject non-positive or non-int height_px.
+    for bad_h, exc in ((0, ValueError), (-50, ValueError), (True, TypeError)):
+      with self.assertRaises(exc):
+        gui.SchematicBundle(
+            views={'': gui.SchematicView(raw_svg=svg, dot_src='digraph{}')},
+            height_px=bad_h,  # type: ignore[arg-type]
+        )
+
+    # Reject unknown expanded_automata prefix and materialize valid combos.
+    def two_fsms():
+      def mk(name):
+        with automaton(init='A', name=name) as fsm:
+          with state('A'):
+            until(Stream.once(0), 'B')
+            fsm.y = 1
+          with state('B'):
+            fsm.y = 2
+        return fsm.y
+      return tuple(mk(f'm{i}') for i in range(5))
+
+    g_fsms = build_graph(two_fsms)
+    with self.assertRaisesRegex(ValueError, 'Unknown expanded_automata'):
+      visualize.build_pydot(g_fsms, expanded_automata=['typo'])
+    with self.assertRaisesRegex(ValueError, 'Unknown expanded_automata'):
+      visualize.visualize_graph(g_fsms, expanded_automata=['typo'])
+    viz_pair = visualize.visualize_graph(
+        g_fsms, expanded_automata=['m0', 'm2']
+    )
+    self.assertIn('⊟ m0', viz_pair.dot)
+    self.assertIn('⊟ m2', viz_pair.dot)
+    self.assertIn('⊞ m1', viz_pair.dot)
 
 
 if __name__ == '__main__':
