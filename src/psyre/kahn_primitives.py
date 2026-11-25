@@ -28,6 +28,7 @@ from psyre.common import (
     prepare_buffer,
     prepare_merge,
     prepare_when,
+    prepare_whennot,
     psyre_loop,
     pull,
     pull_all,
@@ -85,7 +86,7 @@ async def when(o_stream, c_stream, i_stream, *, selector=None):
     i_stream.skip()
 
 
-@psyre_loop
+@psyre_loop(prepare=prepare_whennot)
 async def whennot(o_stream, c_stream, i_stream):
   """Downsamples an input stream when the condition stream is false."""
   cond = await pull(c_stream)

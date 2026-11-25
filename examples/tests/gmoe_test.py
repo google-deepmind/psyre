@@ -32,6 +32,7 @@ from psyre.common import (
 )
 from examples.src import gmoe
 from examples.src import rnn
+from examples.tests.rnn_test import reference_rnn_perceptron
 from psyre.scheduler import Scheduler
 from psyre.stream import Stream
 from psyre.trace import (
@@ -75,31 +76,6 @@ def _ref_scalar_gmoe_loss(
   return out, (out - y) ** 2, g
 
 
-def _ref_rnn_perceptron(
-    x_seq: Sequence[float],
-    params: rnn.ParamValues,
-    num_cells: int,
-) -> float:
-  """Exact Python reference for variable-depth RNN + ReLU perceptron."""
-  dim = len(x_seq)
-  h_grid: list[list[float]] = []
-  for k in range(num_cells):
-    row: list[float] = []
-    for t in range(dim):
-      h_prev = 0.0 if k == 0 or t == 0 else h_grid[k - 1][t - 1]
-      row.append(
-          math.tanh(
-              params.rnn.wxh * x_seq[t]
-              + params.rnn.whh * h_prev
-              + params.rnn.bh
-          )
-      )
-    h_grid.append(row)
-  y_rnn = [h_grid[min(t, num_cells - 1)][t] for t in range(dim)]
-  z = params.per.bh[0] + math.sumprod(y_rnn, params.per.wxh)
-  return max(0.0, z)
-
-
 def _ref_chained_gmoe_loss(
     x_seq: Sequence[float],
     y_target: float,
@@ -115,7 +91,7 @@ def _ref_chained_gmoe_loss(
   out = 0.0
   for k in range(3):
     if g[k] != 0.0:
-      out += g[k] * _ref_rnn_perceptron(
+      out += g[k] * reference_rnn_perceptron(
           x_seq, params.experts[k], expert_cells[k]
       )
   return out, (out - y_target) ** 2, g

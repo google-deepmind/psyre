@@ -59,9 +59,9 @@ from psyre.common import (
     switch,
     when_selector_matches_const,
 )
-from psyre.common_payload import is_array_object
 from psyre.graph import Graph, Node
 from psyre.optimization import optimize_graph
+from psyre.payload import is_array_object
 from psyre.static_stream import static_stream
 from psyre.stream import Stream, resolve_stream
 
@@ -171,6 +171,14 @@ class GraphBuilder:
       args, kwargs = _prepare(*args, **kwargs)
     if o_stream is None:
       o_stream = Stream(name='' if name == '<lambda>' else name)
+    elif not isinstance(o_stream, Stream):
+      raise TypeError(
+          f'o_stream must be a Stream, got {type(o_stream).__name__}.'
+      )
+    elif o_stream.static:
+      raise TypeError(
+          f'o_stream cannot be a static Stream, got {o_stream}.'
+      )
     is_stateful = is_stateful_step_func(step_func)
     arms = arm_stack.get()
     prefixes = prefix_stack.get()
@@ -513,6 +521,7 @@ def lower_resets(graph: Graph, clocks: ClockAnalysis) -> Graph:
   derived: dict[tuple[bool, int, Clock], Stream] = {}
   base_bool_consts: dict[bool, Stream] = {}
   static_map: dict[tuple[int, Clock], Stream] = {}
+  synth_scope_cache: dict[tuple[Clock, ClockStep], ArmScope] = {}
   unmapped_synth_scopes: list[tuple[ArmScope, int, Clock]] = []
 
   def clock_arms(clk: Clock) -> tuple[ArmScope, ...]:
@@ -520,10 +529,18 @@ def lower_resets(graph: Graph, clocks: ClockAnalysis) -> Graph:
     curr_clk = BASE_CLOCK
     for step in clk.steps:
       orig_sel = step.selector
-      cond = static_map.get((orig_sel.id, curr_clk), orig_sel)
-      scope = ArmScope(cond=cond, selector=step.to_when_selector())
-      if cond is orig_sel and lowered.is_polymorphic_static(orig_sel):
-        unmapped_synth_scopes.append((scope, orig_sel.id, curr_clk))
+      key = (curr_clk, step)
+      scope = synth_scope_cache.get(key)
+      if scope is None:
+        cond = static_map.get((orig_sel.id, curr_clk), orig_sel)
+        scope = ArmScope(cond=cond, selector=step.to_when_selector())
+        synth_scope_cache[key] = scope
+        if cond is orig_sel and lowered.is_polymorphic_static(orig_sel):
+          unmapped_synth_scopes.append((scope, orig_sel.id, curr_clk))
+      else:
+        mapped = static_map.get((orig_sel.id, curr_clk))
+        if mapped is not None and scope.cond is not mapped:
+          scope.cond = mapped
       scopes.append(scope)
       curr_clk = curr_clk.on(step)
     return tuple(scopes)
@@ -628,7 +645,7 @@ def lower_resets(graph: Graph, clocks: ClockAnalysis) -> Graph:
     if cached is not None:
       return cached
     act_stream = activation_const(target_clk, False)
-    aligned_s = Stream(name=src.name)
+    aligned_s = Stream()
     s_node = lowered.add_node(
         op='static_stream',
         name=f'static_stream({src.name})' if src.name else 'static_stream',
@@ -770,6 +787,7 @@ def lower_resets(graph: Graph, clocks: ClockAnalysis) -> Graph:
               cloned_node, inputs=new_inputs, resets=new_resets
           )
       if static_map:
+        arm_scope_cache: dict[tuple[int, int], ArmScope] = {}
         for orig_node, cloned_node in zip(graph.nodes, orig_cloned):
           if not orig_node.arms:
             continue
@@ -780,7 +798,12 @@ def lower_resets(graph: Graph, clocks: ClockAnalysis) -> Graph:
             cond_s = graph.resolve_stream(scope.cond)
             mapped = static_map.get((cond_s.id, prefix_clk))
             if mapped is not None:
-              updated_arms.append(dataclasses.replace(scope, cond=mapped))
+              cache_key = (id(scope), mapped.id)
+              remapped = arm_scope_cache.get(cache_key)
+              if remapped is None:
+                remapped = dataclasses.replace(scope, cond=mapped)
+                arm_scope_cache[cache_key] = remapped
+              updated_arms.append(remapped)
               arms_changed = True
             else:
               updated_arms.append(scope)

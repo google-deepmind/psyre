@@ -66,6 +66,7 @@ from psyre.math import (
 )
 from psyre.scheduler import Scheduler
 from psyre.stream import Stream, StreamPort
+from tests import test_utils
 from psyre.trace import (
     is_absent,
     is_bottom,
@@ -246,60 +247,23 @@ class SyncTest(absltest.TestCase):
         [Absent, Absent, None, 20, Absent, None, 40],
     )
 
-    # Overflow (pull into occupied slot, including one holding `None`) and
-    # underflow (push from empty/reset `Bottom` slot) fail fast with
-    # `BufferError` so `Bottom` never leaks onto a `Stream`.
-    def overflow_size_one():
-      return buffer(
-          [10, 20],
-          [True, True],
-          [False, False],
-          size=1,
-      )
-
-    def overflow_none_slot():
-      return buffer(
-          [None, 1],
-          [True, True],
-          [False, False],
-          size=1,
-      )
-
-    def underflow_empty():
-      return buffer([10], [False], [True], size=1)
-
-    def underflow_after_none_drain():
-      return buffer(
-          [None],
-          [True, False, False],
-          [False, True, True],
-          size=1,
-      )
-
-    def underflow_after_reset():
-      rst = Stream([False, True])
-      ip = Stream([True, False])
-      op = Stream([False, True])
-      with reset(rst):
-        return buffer([10], ip, op, size=2)
-
+    # Overflow and underflow fail fast with `BufferError` (full matrix including
+    # `None` slots and resets is verified across SYNC/KAHN in pervasives_test).
     for prog, horizon, pattern in (
-        (overflow_size_one, 2, 'RingBuffer overflow'),
-        (overflow_none_slot, 2, 'RingBuffer overflow'),
-        (underflow_empty, 1, 'RingBuffer underflow'),
-        (underflow_after_none_drain, 3, 'RingBuffer underflow'),
-        (underflow_after_reset, 2, 'RingBuffer underflow'),
+        (
+            lambda: buffer([10, 20], [True, True], [False, False], size=1),
+            2,
+            'RingBuffer overflow',
+        ),
+        (
+            lambda: buffer([10], [False], [True], size=1),
+            1,
+            'RingBuffer underflow',
+        ),
     ):
-      with self.subTest(case=prog.__name__):
-        with self.assertRaises(ExceptionGroup) as eg:
-          Scheduler.run(prog, horizon=horizon, semantics=Semantics.SYNC)
-        self.assertTrue(
-            any(
-                isinstance(err, BufferError) and pattern in str(err)
-                for err in eg.exception.exceptions
-            ),
-            f'Expected BufferError matching {pattern!r}, got '
-            f'{eg.exception.exceptions!r}',
+      with self.subTest(pattern=pattern):
+        test_utils.assert_buffer_error(
+            self, prog, horizon, pattern, semantics=Semantics.SYNC
         )
 
   def test_once_stream_absent(self):
@@ -973,14 +937,6 @@ class SyncTest(absltest.TestCase):
 
   def test_absent_checks_use_identity_not_equality(self):
     @dataclasses.dataclass(frozen=True)
-    class _EqAll:
-      tag: str
-
-      def __eq__(self, other: object) -> bool:
-        del other
-        return True
-
-    @dataclasses.dataclass(frozen=True)
     class _AmbiguousEq:
       value: int
 
@@ -992,7 +948,7 @@ class SyncTest(absltest.TestCase):
     def identity(x: Any) -> Any:
       return x
 
-    eq_all = _EqAll('sentinel')
+    eq_all = test_utils.EqAll('sentinel')
     amb = _AmbiguousEq(7)
 
     for sem in (Semantics.SYNC, Semantics.KAHN):
@@ -1069,13 +1025,7 @@ class SyncTest(absltest.TestCase):
       buf.push()
 
     # Identity-based sentinel check tolerates objects with custom `__eq__`.
-    @dataclasses.dataclass(frozen=True)
-    class _EqAll:
-      def __eq__(self, other: object) -> bool:
-        del other
-        return True
-
-    tok = _EqAll()
+    tok = test_utils.EqAll()
     eq_buf = common.RingBuffer(1)
     eq_buf.pull(tok)
     with self.assertRaisesRegex(BufferError, 'RingBuffer overflow'):
@@ -1419,8 +1369,13 @@ class SyncTest(absltest.TestCase):
         subclock_post_reset_prog, horizon=15, semantics=Semantics.SYNC
     )
     self.assertFalse(Scheduler.deadlocked)
-    self.assertIn(-1, sub_sync)
-    self.assertIn(11, sub_sync)
+    # `rst` fires at ticks 4 (latched onto tick 5), 8, and 12; `sub_x` ticks on
+    # `gate=True` (0, 2, 3, 5, 6, 8, 9, 11, 12, 14) with values
+    # [10, 11, 12, 10, 11, 10, 11, 12, 10, 11], so `post(sub_x, n=1)` yields:
+    self.assertEqual(
+        sub_sync,
+        [11, -1, 12, 10, -1, 11, 10, -1, 11, 12, -1, 10, 11, -1, Bottom],
+    )
 
     # 4. Custom `@psyre_loop` rewinding `port.index` back to 0 must NOT have
     # its input stream evicted.

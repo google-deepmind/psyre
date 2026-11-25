@@ -20,7 +20,14 @@ IEEE*, 1991) and asynchronous Kahn Process Network execution (Kahn, IFIP 1974;
 Kahn & MacQueen, IFIP 1977).
 """
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+    Set as AbstractSet,
+)
 from typing import Any
 
 # pylint: disable=g-importing-member,g-multiple-import
@@ -28,6 +35,7 @@ from psyre.common import (
     ArmScope,
     BOOL_BINARY_OPS,
     BOOL_PRODUCER_OPS,
+    MergeSelector,
     Semantics,
     TagKey,
     WhenSelector,
@@ -37,9 +45,10 @@ from psyre.common import (
     is_step_of,
     is_tautological_selector,
     normalize_when_selector,
+    remap_arm_scopes,
     when_selector_matches_const,
 )
-from psyre.common_payload import is_builtin_scalar_value
+from psyre.payload import is_builtin_scalar_value
 from psyre.static_stream import is_static_stream_step
 from psyre.stream import Stream
 
@@ -74,6 +83,9 @@ _VALUE_FORWARD_PORTS: dict[str, tuple[slice, int]] = {
     'merge': (slice(1, None), 2),
     'switch': (slice(1, None), 2),
 }
+
+
+_UNRESOLVED_INDICATOR = object()
 
 
 def _unique_streams(streams: Iterable[Stream]) -> tuple[Stream, ...]:
@@ -322,6 +334,7 @@ class Graph:
     self._stream_aliases: dict[int, Stream] = {}
     self._base_clock_streams: set[int] = set()
     self._lowered_semantics: set[Semantics] = set()
+    self._arm_remap_cache: dict[int, ArmScope] = {}
     self._finalized = False
 
   @property
@@ -495,6 +508,148 @@ class Graph:
         when_selector_matches_const(selector, const_s.const_value, op=op)
     )
 
+  def resolve_clock_selector_step(
+      self,
+      cond_s: Stream,
+      selector: WhenSelector | None = None,
+      *,
+      op: str = 'when',
+      can_unwrap_when: Callable[[Node], bool] | None = None,
+      can_unwrap_node: Callable[[Node], bool] | None = None,
+      can_unwrap_poly: Callable[[Stream, Node], bool] | None = None,
+  ) -> tuple[Stream, tuple[bool, frozenset[TagKey], bool], bool] | None:
+    """Resolves a `when`/`whennot` selector to `(stream, norm, is_const_false)`.
+
+    Unwraps `when`/`whennot` chains, boolean `__invert__`, and boolean-constant
+    indicator `merge` nodes subject to caller rate guards.
+
+    Args:
+      cond_s: Selector stream evaluated at the `when`/`whennot` site.
+      selector: Optional `WhenSelector` describing matching values/negation.
+      op: Primitive name (`'when'` or `'whennot'`).
+      can_unwrap_when: Optional guard returning True when a `when`/`whennot`
+        producer may be unwrapped onto the caller's base clock.
+      can_unwrap_node: Optional guard returning True when a boolean invert or
+        indicator `merge` producer may be unwrapped.
+      can_unwrap_poly: Optional guard checking whether a polymorphic static
+        selector stream may be unwrapped across a producer node.
+
+    Returns:
+      `(canonical_stream, normalized_selector, is_const_false)`, or `None` when
+      the selector is statically always active (tautological or matching
+      constant).
+    """
+    if op == 'whennot':
+      selector = WhenSelector(is_boolean=True, negated=True)
+
+    def _indicator_merge(
+        prod: Node, expected: bool, seen: set[int]
+    ) -> tuple[Stream, tuple[bool, frozenset[TagKey], bool], bool] | None | Any:
+      lookup = prod.kwargs.get('lookup')
+      if not isinstance(lookup, MergeSelector):
+        return _UNRESOLVED_INDICATOR
+      arm_bools: list[bool] = []
+      for arm_stream in prod.inputs[1:]:
+        val = self.const_bool(arm_stream)
+        if val is None:
+          return _UNRESOLVED_INDICATOR
+        arm_bools.append(val)
+      sel_stream = self.unwrap_when(prod.inputs[0], can_unwrap=can_unwrap_when)
+      if lookup.is_boolean:
+        if arm_bools[0] == arm_bools[1]:
+          if arm_bools[0] == expected:
+            return None
+          return (
+              prod.output,
+              (True, frozenset({(True, expected)}), False),
+              False,
+          )
+        if can_unwrap_poly is not None and not can_unwrap_poly(
+            sel_stream, prod
+        ):
+          return _UNRESOLVED_INDICATOR
+        return _refine_bool(sel_stream, arm_bools[0] == expected, seen)
+      default_idx = lookup.default_index
+      negated = (
+          default_idx is not None and arm_bools[default_idx] == expected
+      )
+      tags = frozenset(
+          key
+          for key, idx in lookup.arms.items()
+          if (arm_bools[idx] == expected) != negated
+      )
+      if not negated and not tags:
+        return (
+            prod.output,
+            (True, frozenset({(True, expected)}), False),
+            False,
+        )
+      norm = self.normalize_when_selector(
+          sel_stream,
+          WhenSelector(is_boolean=False, values=tags, negated=negated),
+      )
+      if is_tautological_selector(norm):
+        return None
+      if can_unwrap_poly is not None and not can_unwrap_poly(sel_stream, prod):
+        return _UNRESOLVED_INDICATOR
+      return (sel_stream, norm, False)
+
+    def _refine_bool(
+        cond: Stream, truth: bool, seen: set[int]
+    ) -> tuple[Stream, tuple[bool, frozenset[TagKey], bool], bool] | None:
+      curr = self.resolve_stream(cond)
+      expected = truth
+      while curr.id not in seen:
+        seen.add(curr.id)
+        unwrapped = self.unwrap_when(curr, can_unwrap=can_unwrap_when)
+        if unwrapped is not curr:
+          curr = unwrapped
+          if curr.id in seen:
+            break
+          seen.add(curr.id)
+        cb = self.const_bool(curr)
+        if cb is not None:
+          if cb == expected:
+            return None
+          return (curr, (True, frozenset({(True, expected)}), False), True)
+        prod = self._producer.get(curr.id)
+        if prod is None:
+          break
+        if (
+            prod.is_stream_op('__invert__')
+            and len(prod.inputs) == 1
+            and (can_unwrap_node is None or can_unwrap_node(prod))
+            and self.is_bool_stream(prod.inputs[0])
+            and (
+                can_unwrap_poly is None
+                or can_unwrap_poly(prod.inputs[0], prod)
+            )
+        ):
+          curr = self.resolve_stream(prod.inputs[0])
+          expected = not expected
+          continue
+        if prod.is_primitive('merge') and (
+            can_unwrap_node is None or can_unwrap_node(prod)
+        ):
+          indicator = _indicator_merge(prod, expected, seen)
+          if indicator is not _UNRESOLVED_INDICATOR:
+            return indicator
+        break
+      return (curr, (True, frozenset({(True, expected)}), False), False)
+
+    if selector is None or selector.is_boolean:
+      truth = True if selector is None else not selector.negated
+      return _refine_bool(cond_s, truth, set())
+    sel_s = self.unwrap_when(cond_s, can_unwrap=can_unwrap_when)
+    norm = self.normalize_when_selector(sel_s, selector)
+    is_bool, vals, _ = norm
+    if is_bool and len(vals) == 1:
+      ((_, truth),) = tuple(vals)
+      return _refine_bool(cond_s, truth, set())
+    if self.is_always_active_when(sel_s, selector, norm=norm):
+      return None
+    return (sel_s, norm, False)
+
   def require_finalized(self) -> None:
     """Raises RuntimeError unless mark_finalized() has completed."""
     if not self._finalized:
@@ -535,6 +690,125 @@ class Graph:
     if self._output is not None:
       cloned.set_output(self._output)
     return cloned
+
+  def clone_streams(
+      self, *, exclude_ids: AbstractSet[int] = frozenset()
+  ) -> tuple['Graph', dict[int, Stream]]:
+    """Returns a fresh unfinalized `Graph` with cloned dynamic `Stream`s.
+
+    Static `Stream`s are shared (read-only); dynamic `Stream`s are freshly
+    allocated so the returned graph can be executed independently of `self`.
+    Preserves stream aliases and base-clock pins.
+
+    Args:
+      exclude_ids: Optional set of stream IDs omitted from the cloned graph
+        (for example, internal streams hidden inside a fused subgraph island).
+
+    Returns:
+      `(new_graph, stream_map)` mapping original `stream.id` to the stream
+      registered in `new_graph`.
+    """
+    self.require_finalized()
+    new_graph = Graph(semantics=self.semantics)
+    stream_map: dict[int, Stream] = {}
+    for stream in self._streams.values():
+      if stream.id in exclude_ids or stream.id in self._stream_aliases:
+        continue
+      if stream.static:
+        stream_map[stream.id] = stream
+        new_graph.add_stream(stream)
+      else:
+        dup = Stream._new_detached(name=stream.name)  # pylint: disable=protected-access
+        stream_map[stream.id] = dup
+        new_graph.add_stream(dup)
+      for alias in self.stream_names(stream):
+        if alias and alias != stream.name:
+          new_graph.add_stream_name(stream_map[stream.id], alias)
+      if self.is_base_clock_pinned(stream):
+        new_graph.pin_base_clock(stream_map[stream.id])
+    for old_id, target in self._stream_aliases.items():
+      resolved = self.resolve_stream(target)
+      mapped = stream_map.get(resolved.id)
+      if mapped is not None:
+        stream_map[old_id] = mapped
+    return new_graph, stream_map
+
+  def collect_root_streams(
+      self,
+      extra_roots: Iterable[Any] | None = None,
+      *,
+      include_output: bool = True,
+  ) -> list[Stream]:
+    """Collects unique root Streams from `output` and optional `extra_roots`."""
+    roots: list[Stream] = list(self.output_streams()) if include_output else []
+    seen: set[int] = {s.id for s in roots}
+
+    def add_unique(stream: Stream) -> None:
+      if stream.id not in seen:
+        seen.add(stream.id)
+        roots.append(stream)
+
+    if extra_roots is not None:
+      if isinstance(extra_roots, str):
+        raise TypeError(
+            'extra_roots must be an iterable of streams/nodes/names, not a '
+            'bare str.'
+        )
+      named_roots: list[str] = []
+      for item in extra_roots:
+        if isinstance(item, str):
+          named_roots.append(item)
+        elif isinstance(item, Node):
+          self.validate_node(item)
+          add_unique(self.resolve_stream(item.output))
+        elif isinstance(item, Stream):
+          add_unique(self.resolve_stream(item))
+        else:
+          raise TypeError(
+              'extra_roots elements must be Stream, Node, or str, got '
+              f'{type(item).__name__}.'
+          )
+      if named_roots:
+        for stream in self.resolve_named_streams(named_roots).values():
+          add_unique(stream)
+    return roots
+
+  def remap_arms(
+      self,
+      scopes: tuple[ArmScope, ...],
+      stream_map: Mapping[int, Stream],
+  ) -> tuple[ArmScope, ...]:
+    """Remaps `ArmScope` tokens, preserving per-scope identity across `self`."""
+    return remap_arm_scopes(
+        scopes, lambda s: stream_map.get(s.id, s), self._arm_remap_cache
+    )
+
+  def copy_node_into(
+      self,
+      node: Node,
+      stream_map: Mapping[int, Stream],
+      *,
+      step_func: Callable[..., Any] | None = None,
+      kwargs: Mapping[str, Any] | None = None,
+  ) -> Node:
+    """Appends a remapped copy of `node` into `self` using `stream_map`."""
+    remapped_arms = self.remap_arms(node.arms, stream_map)
+    copy_nd = self.add_node(
+        op=node.op,
+        name=node.name,
+        output=stream_map[node.output.id],
+        step_func=node.step_func if step_func is None else step_func,
+        kwargs=dict(node.kwargs if kwargs is None else kwargs),
+        is_stateful=node.is_stateful,
+        arms=remapped_arms,
+        prefixes=node.prefixes,
+    )
+    self.rewire_node(
+        copy_nd,
+        inputs=tuple(stream_map.get(s.id, s) for s in node.inputs),
+        resets=tuple(stream_map.get(r.id, r) for r in node.resets),
+    )
+    return copy_nd
 
   def validate_node(self, node: Node) -> None:
     """Verifies that this Graph is finalized and owns node."""
@@ -614,6 +888,10 @@ class Graph:
     if self._finalized:
       raise RuntimeError('Cannot add nodes to an already finalized Graph.')
     self.add_stream(output)
+    if output.static:
+      raise TypeError(
+          f'Node output stream {output} cannot be a static Stream.'
+      )
     if output.id in self._producer:
       raise ValueError(
           f'Stream {output} already has producer {self._producer[output.id]}.'

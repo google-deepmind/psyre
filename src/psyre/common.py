@@ -45,12 +45,15 @@ import types
 from typing import Any, Protocol
 
 # pylint: disable=g-importing-member,g-multiple-import
-from psyre.common_payload import (
+from psyre.payload import (
     CALL_PLAN_KWARG,
     PlanNode,
     is_array_object,
+    is_callable_target,
     is_int_ge,
+    is_lazy_thunk_obj,
     is_numpy_bool,
+    is_numpy_bool_array_scalar,
     is_zero_arg_function,
     normalize_static_argnames,
     normalize_static_argnums,
@@ -61,7 +64,7 @@ from psyre.common_payload import (
 )
 # Re-exported for internal/downstream modules (`graph`, `match`, `visualize`,
 # `static_stream`, `scheduler`, examples).
-from psyre.common_payload import (  # pylint: disable=unused-import
+from psyre.payload import (  # pylint: disable=unused-import
     is_namedtuple,
     validate_non_negative_int,
 )
@@ -170,19 +173,25 @@ TagKey = tuple[bool, Any]
 BOOL_DOMAIN: frozenset[TagKey] = frozenset({(True, True), (True, False)})
 
 
+def _normalize_bool_tag(value: Any) -> Any:
+  """Unwraps NumPy `bool_` scalars and 0-D bool `np.ndarray`s to `bool`."""
+  if is_numpy_bool(value):
+    return bool(value)
+  if is_numpy_bool_array_scalar(value):
+    return bool(value.item())
+  return value
+
+
 def tag_key(tag: Any) -> TagKey:
   """Returns a type-disambiguated key separating bools from ints."""
-  if is_numpy_bool(tag):
-    return (True, bool(tag))
-  return (isinstance(tag, bool), tag)
+  norm = _normalize_bool_tag(tag)
+  return (isinstance(norm, bool), norm)
 
 
 def matches_tag(selector_value: Any, target_tag: Any) -> bool:
   """Checks whether selector_value matches target_tag without bool/int mixup."""
-  if is_numpy_bool(target_tag):
-    target_tag = bool(target_tag)
-  if is_numpy_bool(selector_value):
-    selector_value = bool(selector_value)
+  target_tag = _normalize_bool_tag(target_tag)
+  selector_value = _normalize_bool_tag(selector_value)
   if isinstance(target_tag, bool) or target_tag is None:
     return selector_value is target_tag
   if isinstance(selector_value, bool) or selector_value is None:
@@ -574,6 +583,13 @@ def prepare_buffer(
   return (i_stream, i_p_stream, o_p_stream), {'size': size}
 
 
+def prepare_whennot(
+    c_stream: Any, i_stream: Any
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+  """Validates `whennot` arguments and returns positional stream ports."""
+  return (c_stream, i_stream), {}
+
+
 def prepare_current(
     b_stream: Any, i_stream: Any, default: Any = None
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -599,6 +615,8 @@ def prepare_prefix_sum(
 
 def unwrap_inst_func(fn: Callable[..., Any]) -> Callable[..., Any]:
   """Returns the underlying Python function for a `@psyre_comb` wrapper."""
+  if is_lazy_thunk_obj(fn):
+    return fn
   return getattr(fn, '_psyre_inst_func', fn)
 
 
@@ -731,6 +749,30 @@ arm_stack: contextvars.ContextVar[tuple[ArmScope, ...]] = (
 )
 
 
+def remap_arm_scopes(
+    scopes: tuple[ArmScope, ...],
+    resolve_cond: Callable[[Any], Any],
+    cache: dict[int, ArmScope],
+    *,
+    reset_depth_offset: int = 0,
+) -> tuple[ArmScope, ...]:
+  """Remaps `ArmScope` tokens while preserving per-scope object identity."""
+  if not scopes:
+    return ()
+  out: list[ArmScope] = []
+  for sc in scopes:
+    mapped = cache.get(id(sc))
+    if mapped is None:
+      mapped = dataclasses.replace(
+          sc,
+          cond=resolve_cond(sc.cond),
+          reset_depth=sc.reset_depth + reset_depth_offset,
+      )
+      cache[id(sc)] = mapped
+    out.append(mapped)
+  return tuple(out)
+
+
 @dataclasses.dataclass(frozen=True)
 class CapturedEnv:
   """Captured Stage-1 arm, prefix, and reset stacks for match/automaton."""
@@ -835,6 +877,9 @@ active_block: contextvars.ContextVar[BlockContext | None] = (
 )
 
 
+_BLOCK_HANDLE_RESERVED_ATTRS = frozenset({'keys', 'items', 'values', 'get'})
+
+
 class BlockHandle(Mapping[str, Any]):
   """Namespace binding per-arm outputs and exposing merged output Streams."""
 
@@ -856,7 +901,7 @@ class BlockHandle(Mapping[str, Any]):
 
   def __setattr__(self, name: str, value: Any) -> None:
     ctx = self._ctx
-    if name.startswith('_'):
+    if name.startswith('_') or name in _BLOCK_HANDLE_RESERVED_ATTRS:
       raise AttributeError(
           f'Attribute {name!r} is reserved on {ctx.kind}() handles.'
       )
@@ -894,6 +939,17 @@ class BlockHandle(Mapping[str, Any]):
 
   def __len__(self) -> int:
     return len(self._finalized_outputs())
+
+
+@contextlib.contextmanager
+def activate_block_context(ctx: BlockContext) -> Iterator[BlockHandle]:
+  """Activates `ctx` on `active_block` and yields its `BlockHandle`."""
+  handle = BlockHandle(ctx)
+  block_token = active_block.set(ctx)
+  try:
+    yield handle
+  finally:
+    active_block.reset(block_token)
 
 
 def require_open_arm_context(expected_kind: str, caller: str) -> BlockContext:
@@ -1126,8 +1182,8 @@ def require_builder() -> Any:
 
 
 def _require_callable_target(target: Any, decorator_name: str) -> None:
-  """Rejects non-callable targets passed to `@psyre_*` decorators."""
-  if not callable(target):
+  """Rejects non-callable targets and deferred `LazyThunk`s."""
+  if not is_callable_target(target):
     raise TypeError(
         f'{decorator_name} expects a callable target, got '
         f'{type(target).__name__}.'
@@ -1153,6 +1209,12 @@ def psyre_loop(
       )
 
     setattr(wrapper, '_psyre_step_func', fn)
+    functools.update_wrapper(
+        wrapper,
+        fn,
+        assigned=('__module__', '__name__', '__qualname__', '__doc__'),
+        updated=(),
+    )
     return wrapper
 
   return decorate if step_func is None else decorate(step_func)
@@ -1176,6 +1238,70 @@ def make_comb_step_func(
     setattr(step_func, '_psyre_pure', True)
   setattr(step_func, '_psyre_inst_func', inst_func)
   return step_func
+
+
+_COMB_STEP_CODE = make_comb_step_func(bool).__code__
+
+
+def _same_inst_callable(fa: Any, fb: Any) -> bool:
+  """Returns True when two underlying combinational callables are identical."""
+  if fa is fb:
+    return True
+  if type(fa) is not type(fb):
+    return False
+  if isinstance(fa, types.MethodType):
+    return fa.__func__ is fb.__func__ and fa.__self__ is fb.__self__
+  if isinstance(fa, types.BuiltinMethodType):
+    # Checking `__self__ is __self__` first guarantees CPython compares bound C
+    # methods (e.g. `np.add.reduce`) without invoking user `__eq__`.
+    return (
+        fa.__self__ is fb.__self__
+        and fa.__name__ == fb.__name__
+        and fa == fb
+    )
+  return False
+
+
+def same_step_func(a: Callable[..., Any], b: Callable[..., Any]) -> bool:
+  """Returns True when two Stage-2 `step_func`s execute the same operator."""
+  if a is b:
+    return True
+  if (
+      getattr(a, '__code__', None) is not _COMB_STEP_CODE
+      or getattr(b, '__code__', None) is not _COMB_STEP_CODE
+  ):
+    return False
+  fa = getattr(a, '_psyre_inst_func', None)
+  fb = getattr(b, '_psyre_inst_func', None)
+  if fa is None or fb is None or not _same_inst_callable(fa, fb):
+    return False
+  # Preserve backend/metadata tags (e.g. `_psyre_pure`, `_psyre_returns_scalar`,
+  # `_psyre_jax_backend`, `_psyre_jax_primitive`) strictly during CSE.
+  da = getattr(a, '__dict__', {})
+  db = getattr(b, '__dict__', {})
+  if da.keys() != db.keys():
+    return False
+  return all(k == '_psyre_inst_func' or da[k] is db[k] for k in da)
+
+
+def emit_comb_node(
+    step_func: Callable[..., Any],
+    dyn_inputs: tuple[Any, ...],
+    node_kwargs: Mapping[str, Any],
+    *,
+    name: str,
+    nout: int = 1,
+) -> Any:
+  """Registers a combinational node on the active `GraphBuilder` and unpacks."""
+  builder = require_builder()
+  raw_out = builder.add_loop_node(
+      step_func,
+      _prepare=lambda *_, **__: (dyn_inputs, dict(node_kwargs)),
+      name=name,
+  )
+  if nout > 1:
+    return tuple(raw_out[i] for i in range(nout))
+  return raw_out
 
 
 def _wrap_partitioned_step(
@@ -1294,9 +1420,20 @@ def psyre_comb(
         nout=nout,
         decorator_name='psyre_comb',
     )
-    if pure:
-      setattr(wrapper, '_psyre_pure', True)
+    functools.update_wrapper(
+        wrapper,
+        inst_func,
+        assigned=('__module__', '__name__', '__qualname__', '__doc__'),
+        updated=(),
+    )
+    setattr(wrapper, '_psyre_pure', bool(pure))
     setattr(wrapper, '_psyre_inst_func', inst_func)
+    if argnums:
+      setattr(wrapper, '_psyre_static_argnums', argnums)
+    if argnames:
+      setattr(wrapper, '_psyre_static_argnames', argnames)
+    if nout is not None:
+      setattr(wrapper, '_psyre_nout', nout)
     return wrapper
 
   return decorate if func is None else decorate(func)
@@ -1361,7 +1498,7 @@ def psyre_sequ(
     step_func.__name__ = callable_name(fn)
     setattr(step_func, '_psyre_stateful', True)
     setattr(step_func, '_psyre_is_sequ', True)
-    return _wrap_partitioned_step(
+    wrapper = _wrap_partitioned_step(
         step_func,
         prepare=prepare,
         argnums=argnums,
@@ -1371,6 +1508,13 @@ def psyre_sequ(
         decorator_name='psyre_sequ',
         reject_dynamic_kwargs=True,
     )
+    functools.update_wrapper(
+        wrapper,
+        fn,
+        assigned=('__module__', '__name__', '__qualname__', '__doc__'),
+        updated=(),
+    )
+    return wrapper
 
   return decorate if inst_func is None else decorate(inst_func)
 

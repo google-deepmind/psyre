@@ -66,6 +66,7 @@ from psyre.match import (
 )
 from psyre.scheduler import Scheduler
 from psyre.stream import Stream
+from tests import test_utils
 from psyre.trace import present_values
 
 # pylint: enable=g-importing-member,g-multiple-import
@@ -86,15 +87,11 @@ class ClockTest(absltest.TestCase):
 
   def _assert_no_sentinels(self, trace):
     """Asserts an unpadded trace contains neither Absent nor Bottom."""
-    self.assertTrue(
-        all(v is not Absent and v is not Bottom for v in trace),
-        f'Unexpected Absent/Bottom sentinel in trace: {trace!r}',
-    )
+    test_utils.assert_no_sentinels(self, trace)
 
   def _assert_sync_kahn_elision(self, sync_tr, kahn_tr):
     """Asserts SYNC and KAHN agree after Absent/Bottom elision."""
-    self._assert_no_sentinels(kahn_tr)
-    self.assertEqual(present_values(sync_tr), kahn_tr)
+    test_utils.assert_absent_bottom_elision(self, sync_tr, kahn_tr)
 
   def _assert_lower_resets_idempotent(self, g, clocks=None):
     """Checks `lower_resets` causality, clock soundness, and idempotency."""
@@ -380,7 +377,7 @@ class ClockTest(absltest.TestCase):
     def conflicting_external_stream():
       c = Stream([True, False, True, False])
       shared = Stream()
-      return shared + 1, merge(c, shared, whennot(c, [1, 2, 3, 4]))
+      return shared + counter(), merge(c, shared, whennot(c, [1, 2, 3, 4]))
 
     def cross_activity_reset():
       c = Stream([True, False, True, False])
@@ -1228,10 +1225,203 @@ class ClockTest(absltest.TestCase):
       return when(m, c)
 
     check_clocks(build_graph(cyclic_indicator_merge, optimize=False))
-    try:
-      check_clocks(build_graph(cyclic_wrapped_indicator, optimize=False))
-    except ClockError:
-      pass
+    check_clocks(build_graph(cyclic_wrapped_indicator, optimize=False))
+
+    # Unbound external `Stream()` inference must be declaration-order invariant
+    # and must not freeze on Sweep-1 speculative clocks of delayed producers.
+    for make_prog in (
+        lambda: (
+            (c := Stream([True, False, True, False])),
+            (u := Stream()),
+            u + 1,
+            merge(c, u, whennot(c, [1, 2, 3, 4])),
+        )[-2:],
+        lambda: (
+            (c := Stream([True, False, True, False])),
+            (u := Stream()),
+            merge(c, u, whennot(c, [1, 2, 3, 4])),
+            u + 1,
+        )[-2:],
+        lambda: (
+            (c := Stream([True, False, True, False])),
+            (u := Stream()),
+            merge(c, u + 1, whennot(c, [1, 2, 3, 4])),
+        )[-1],
+        lambda: (
+            (c := Stream([True, False, True, False])),
+            (u := Stream()),
+            (a := u + 1),
+            merge(c, a + u, whennot(c, [1, 2, 3, 4])),
+        )[-1],
+    ):
+      g_ext = build_graph(make_prog, optimize=False)
+      check_clocks(g_ext)
+
+    def ext_through_reset_fby_into_merge():
+      c = Stream([True, False, True, False])
+      u = Stream()
+      with reset(False):
+        f = fby(0, u)
+      return merge(c, f, whennot(c, [1, 2, 3, 4]))
+
+    check_clocks(build_graph(ext_through_reset_fby_into_merge, optimize=False))
+
+    for use_thunk in (False, True):
+      def ext_with_delayed_fby(thunk=use_thunk):
+        outer = Stream([True, False, True, False])
+        u = Stream()
+        a = u + 1
+        if thunk:
+          with reset(False):
+            d = fby(0, lambda: inner)  # pylint: disable=undefined-variable
+          inner = when(outer, counter())
+        else:
+          inner = when(outer, counter())
+          with reset(False):
+            d = fby(0, inner)
+        return a, d + u
+
+      g_ext_fby = build_graph(ext_with_delayed_fby, optimize=False)
+      clks_ext_fby = check_clocks(g_ext_fby)
+      self.assertEqual(
+          clks_ext_fby.stream_clock(g_ext_fby.output[0]),
+          clks_ext_fby.stream_clock(g_ext_fby.output[1]),
+      )
+      self.assertNotEqual(
+          clks_ext_fby.stream_clock(g_ext_fby.output[0]),
+          BASE_CLOCK,
+      )
+
+    for use_thunk in (False, True):
+      def ext_merge_delayed_selector(thunk=use_thunk):
+        outer = Stream([True, False, True, False])
+        if thunk:
+          with reset(False):
+            sel = fby(True, lambda: inner_sel)  # pylint: disable=undefined-variable
+          inner_sel = when(outer, Stream([True, False, False, True]))
+        else:
+          inner_sel = when(outer, Stream([True, False, False, True]))
+          with reset(False):
+            sel = fby(True, inner_sel)
+        u1 = Stream()
+        u2 = Stream()
+        return merge(sel, u1 + 1, u2)
+
+      check_clocks(build_graph(ext_merge_delayed_selector, optimize=False))
+
+    # Cyclic `fby` feeding an unbound `Stream()` into `merge`, nested `current`
+    # consumers sharing one unbound `Stream()` (both declaration orders), and
+    # `match(u)` where unbound `u` is constrained downstream by `merge`.
+    def cyclic_fby_with_ext_in_merge():
+      c = Stream([True, False, True, False])
+      u = Stream()
+      with reset(False):
+        f = fby(0, lambda: f + u)  # pylint: disable=undefined-variable
+      return merge(c, f, whennot(c, [1, 2, 3, 4]))
+
+    check_clocks(build_graph(cyclic_fby_with_ext_in_merge, optimize=False))
+
+    for base_first in (True, False):
+      def nested_currents_shared_ext(outer_first=base_first):
+        outer = Stream([True, False, True, False], name='outer')
+        u = Stream(name='u')
+        if outer_first:
+          c1 = current(Stream(True), u, default=-1)
+          with reset(False):
+            c2 = current(when(outer, True), u, default=-1)
+        else:
+          with reset(False):
+            c2 = current(when(outer, True), u, default=-1)
+          c1 = current(Stream(True), u, default=-1)
+        return c1, c2
+
+      g_cur = build_graph(nested_currents_shared_ext, optimize=False)
+      clks_cur = check_clocks(g_cur)
+      u_s = g_cur.resolve_named_streams(('u',))['u']
+      self.assertEqual(str(clks_cur.stream_clock(u_s)), '. on outer')
+
+    def match_on_ext_constrained_by_outer_merge():
+      outer = Stream([True, False, True, False], name='outer')
+      u = Stream(name='u')
+      v = Stream(name='v')
+      with match(u) as m:
+        with case(True):
+          arm = v + 1
+          arm.name = 'true_arm'
+          m.y = arm
+        with case(False):
+          m.y = 0
+      return merge(outer, m.y, whennot(outer, [1, 2, 3, 4]))
+
+    g_mu = build_graph(match_on_ext_constrained_by_outer_merge, optimize=False)
+    clks_mu = check_clocks(g_mu)
+    mu_map = g_mu.resolve_named_streams(('u', 'v', 'true_arm'))
+    self.assertEqual(str(clks_mu.stream_clock(mu_map['u'])), '. on outer')
+    self.assertEqual(str(clks_mu.stream_clock(mu_map['v'])), '. on outer')
+    self.assertEqual(
+        str(clks_mu.stream_clock(mu_map['true_arm'])),
+        '. on outer on (u == True)',
+    )
+
+    # True base-vs-subclock conflicts on an unbound `Stream()` must fail in
+    # both declaration orders, and `u + when(c, u)` must report a clock
+    # mismatch rather than an internal cycle error.
+    for make_bad in (
+        lambda: (
+            (c := Stream([True, False, True, False])),
+            (u := Stream()),
+            u + counter(),
+            merge(c, u, whennot(c, [1, 2, 3, 4])),
+        )[-2:],
+        lambda: (
+            (c := Stream([True, False, True, False])),
+            (u := Stream()),
+            merge(c, u, whennot(c, [1, 2, 3, 4])),
+            u + counter(),
+        )[-2:],
+    ):
+      with self.assertRaises(ClockError):
+        check_clocks(build_graph(make_bad, optimize=False))
+
+    with self.assertRaisesRegex(ClockError, 'incompatible input clocks'):
+      check_clocks(
+          build_graph(
+              lambda: (
+                  (c := Stream([True, False, True, False])),
+                  (u := Stream()),
+                  u + when(c, u),
+              )[-1],
+              optimize=False,
+          )
+      )
+
+    # Forward-thunk subclock `fby` before producer + `when(~c, ...)` inside
+    # nested `match` must lower cleanly without spurious double-sampling.
+    def fwd_fby_and_neg_when_in_match():
+      c = counter() % 2 == 0
+      a = counter() != 3
+      with reset(False):
+        f = fby(0, lambda: w)  # pylint: disable=undefined-variable
+      w = when(c, counter())
+      wn = when(~c, counter())
+      with match(c) as m1:
+        with case(True):
+          m1.y = f + 1
+        with case(False):
+          with match(a) as m2:
+            with case(True):
+              m2.z = wn + 1
+            with case(False):
+              m2.z = 0
+          m1.y = m2.z
+      return m1.y
+
+    g_fwd = build_graph(fwd_fby_and_neg_when_in_match, optimize=False)
+    check_clocks(g_fwd)
+    self.assertEqual(
+        Scheduler.run_graph(g_fwd, horizon=6),
+        [1, 2, 1, 0, 3, 6],
+    )
 
   def test_cse_preserves_distinct_one_periodic_when_selector_clocks(self):
     def two_const_matches():
@@ -1282,14 +1472,31 @@ class ClockTest(absltest.TestCase):
     g_tagged = build_graph(two_never_tagged_whens, optimize=True)
     check_clocks(g_tagged)
 
-    # Instantaneous self-sampling cycle must fail clock convergence cleanly.
+    # Self-sampling `when` (including constant-True payload) and delayed
+    # `when`-`fby` clock cycles must fail occurs check / convergence cleanly.
     def self_sampling_when():
       x = when(lambda: x, 0)  # pylint: disable=undefined-variable
       return x
 
-    g_self = build_graph(self_sampling_when, optimize=False)
-    with self.assertRaisesRegex(ClockError, 'did not converge'):
-      check_clocks(g_self)
+    def self_sampling_when_true():
+      x = when(lambda: x, True)  # pylint: disable=undefined-variable
+      return x
+
+    def delayed_when_fby_cycle():
+      c = Stream([True, False, True, False])
+      a = when(c, lambda: b)  # pylint: disable=undefined-variable
+      with reset(False):
+        b = fby(0, a)
+      return b
+
+    for bad_cycle in (
+        self_sampling_when,
+        self_sampling_when_true,
+        delayed_when_fby_cycle,
+    ):
+      g_self = build_graph(bad_cycle, optimize=False)
+      with self.assertRaisesRegex(ClockError, 'did not converge'):
+        check_clocks(g_self)
 
   def test_static_streams_aligned_to_consumer_clock_and_scope(self):
     # 1. Static periodic streams are uniformly clock-polymorphic (`∀ 'a. 'a`):
@@ -2208,13 +2415,9 @@ class ClockTest(absltest.TestCase):
       check_clocks(g)
     self.assertNotIn('enclosing activity clock', str(ctx.exception))
 
-    class _FakeArray:
-      shape = (1,)
-      dtype = 'bool'
-
     def array_const_reset():
       c = Stream.periodic([], [True, False])
-      with reset(Stream.constant(_FakeArray())):
+      with reset(Stream.constant(test_utils.FakeArray())):
         with match(c) as m:
           with case(True):
             m.y = counter(0)

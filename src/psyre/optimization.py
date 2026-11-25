@@ -23,14 +23,14 @@ IEEE*, 1991; Caspi & Pouzet, ICFP 1996; Colaço & Pouzet, EMSOFT 2003).
 import collections
 from collections.abc import Iterable
 import dataclasses
-import math
+import types
 from typing import Any
 
 from psyre import analysis
 from psyre import clock
 from psyre import common
-from psyre import common_payload
 from psyre import graph as graph_lib
+from psyre import payload
 from psyre import static_stream as static_stream_lib
 from psyre import stream as stream_lib
 
@@ -50,54 +50,10 @@ _BOOL_STREAM_OPS = (
 _MAX_TAG_DOMAIN_SIZE = 256
 
 
-def _zero_sign(value: Any) -> Any:
-  """Returns a hashable signed-zero discriminator for floats/complex scalars."""
-  if isinstance(value, float):
-    return math.copysign(1.0, value) if value == 0.0 else 0.0
-  if isinstance(value, complex):
-    return (
-        math.copysign(1.0, value.real) if value.real == 0.0 else 0.0,
-        math.copysign(1.0, value.imag) if value.imag == 0.0 else 0.0,
-    )
-  if common_payload.is_numpy_scalar(value):
-    py_val = value.item()
-    if isinstance(py_val, (float, complex)):
-      return _zero_sign(py_val)
-  return 0.0
-
-
-def _exact_value_key(value: Any) -> Any | None:
-  """Returns a hashable exact key separating types and signed zeros, or None."""
-  if common_payload.is_nan_scalar(value):
-    return None
-  if common_payload.is_array_object(value):
-    return None
-  cls = type(value)
-  if isinstance(value, tuple):
-    parts = tuple(_exact_value_key(item) for item in value)
-    if any(p is None for p in parts):
-      return None
-    return (cls, parts)
-  if isinstance(value, frozenset):
-    items = [_exact_value_key(item) for item in value]
-    if any(p is None for p in items):
-      return None
-    try:
-      return (cls, frozenset(items))
-    except (TypeError, ValueError, RuntimeError):
-      return None
-  key = (cls, value, _zero_sign(value))
-  try:
-    hash(key)
-  except (TypeError, ValueError, RuntimeError):
-    return None
-  return key
-
-
 def _same_kwarg_value(a: Any, b: Any) -> bool:
   """Returns True iff two static node kwarg values are safely equivalent."""
   if a is b:
-    return not common_payload.is_nan_scalar(a)
+    return not payload.is_nan_scalar(a)
   if type(a) is not type(b):
     return False
   if callable(a) and not isinstance(
@@ -107,7 +63,7 @@ def _same_kwarg_value(a: Any, b: Any) -> bool:
     # `WhenSelector` and `MergeSelector` are frozen value dataclasses whose
     # `__call__` should still compare structurally via `same_const_value`.
     return False
-  if isinstance(a, (common_payload.CombCallPlan, common_payload.PlanNode)):
+  if isinstance(a, (payload.CombCallPlan, payload.PlanNode)):
     return all(
         _same_kwarg_value(getattr(a, field.name), getattr(b, field.name))
         for field in dataclasses.fields(a)
@@ -122,20 +78,13 @@ def _same_kwarg_value(a: Any, b: Any) -> bool:
     return len(a) == len(b) and all(
         _same_kwarg_value(x, y) for x, y in zip(a, b)
     )
-  if isinstance(a, frozenset):
-    if len(a) != len(b):
-      return False
-    # Compare elements by exact type/zero-sign keys so `frozenset({1})` never
-    # matches `frozenset({True})` and `{0.0}` never matches `{-0.0}`.
-    key_a = _exact_value_key(a)
-    key_b = _exact_value_key(b)
-    if key_a is None or key_b is None:
-      return False
-    try:
-      return bool(key_a == key_b)
-    except (TypeError, ValueError, RuntimeError):
-      return False
-  if common_payload.is_array_object(a) or isinstance(a, (list, dict, set)):
+  if isinstance(a, types.MappingProxyType):
+    return (
+        len(a) == len(b)
+        and a.keys() == b.keys()
+        and all(_same_kwarg_value(a[k], b[k]) for k in a)
+    )
+  if payload.is_array_object(a):
     return False
   return static_stream_lib.same_const_value(a, b)
 
@@ -153,7 +102,7 @@ def _same_kwargs(
 
 def _tag_value_key(value: Any) -> Any | None:
   """Returns a hashable exact key separating types and signed zeros, or None."""
-  key = _exact_value_key(value)
+  key = payload.exact_value_key(value)
   if key is None:
     return None
   try:
@@ -163,54 +112,12 @@ def _tag_value_key(value: Any) -> Any | None:
   return key
 
 
-def _normalize_extra_roots(
-    extra_roots: Iterable[Any] | None,
-) -> list[Any] | None:
-  """Validates `extra_roots` and materializes it into a list (or None)."""
-  if extra_roots is None:
-    return None
-  if isinstance(extra_roots, str):
-    raise TypeError(
-        'extra_roots must be an iterable of streams/nodes/names, not a bare '
-        'str.'
-    )
-  return list(extra_roots)
-
-
 def _collect_root_streams(
     graph: Graph,
     extra_roots: Iterable[Any] | None = None,
 ) -> list[Stream]:
   """Collects unique root Streams from graph.output and optional extra_roots."""
-  roots: list[Stream] = list(graph.output_streams())
-  seen: set[int] = {s.id for s in roots}
-
-  def add_stream(stream: Stream) -> None:
-    if stream.id not in seen:
-      seen.add(stream.id)
-      roots.append(stream)
-
-  extra_list = _normalize_extra_roots(extra_roots)
-  if extra_list is not None:
-    named_roots: list[str] = []
-    for item in extra_list:
-      if isinstance(item, str):
-        named_roots.append(item)
-      elif isinstance(item, Node):
-        graph.validate_node(item)
-        add_stream(item.output)
-      elif isinstance(item, Stream):
-        add_stream(graph.resolve_stream(item))
-      else:
-        raise TypeError(
-            'extra_roots elements must be Stream, Node, or '
-            f'str, got {type(item).__name__}.'
-        )
-    if named_roots:
-      for stream in graph.resolve_named_streams(named_roots).values():
-        add_stream(stream)
-
-  return roots
+  return graph.collect_root_streams(extra_roots)
 
 
 def find_live_nodes(
@@ -791,7 +698,7 @@ def _same_pure_node(graph: Graph, a: Node, b: Node) -> bool:
             b.inputs[0], b.kwargs.get('selector'), op=b.op
         )
     )
-  if a.op != b.op or a.step_func is not b.step_func:
+  if a.op != b.op or not common.same_step_func(a.step_func, b.step_func):
     return False
   if a.is_primitive('merge', 'switch'):
     la, lb = a.kwargs.get('lookup'), b.kwargs.get('lookup')
@@ -819,6 +726,31 @@ def _same_pure_node(graph: Graph, a: Node, b: Node) -> bool:
         a.inputs[1 + la.default_index], b.inputs[1 + lb.default_index]
     ):
       return False
+    if a.is_primitive('switch'):
+      if len(a.inputs) != len(b.inputs):
+        return False
+      used_a = set(la.arms.values())
+      if la.default_index is not None:
+        used_a.add(la.default_index)
+      used_b = set(lb.arms.values())
+      if lb.default_index is not None:
+        used_b.add(lb.default_index)
+      if len(used_a) != len(a.inputs) - 1 or len(used_b) != len(b.inputs) - 1:
+        extra_a = [
+            a.inputs[1 + i]
+            for i in range(len(a.inputs) - 1)
+            if i not in used_a
+        ]
+        extra_b = [
+            b.inputs[1 + i]
+            for i in range(len(b.inputs) - 1)
+            if i not in used_b
+        ]
+        if len(extra_a) != len(extra_b) or not all(
+            stream_lib.same_stream_or_const(ha, hb)
+            for ha, hb in zip(extra_a, extra_b)
+        ):
+          return False
     return all(
         stream_lib.same_stream_or_const(
             a.inputs[1 + idx], b.inputs[1 + lb.arms[tag_k]]
@@ -930,7 +862,12 @@ def optimize_graph(
     The optimized `graph`.
   """
   graph.require_finalized()
-  extra_list = _normalize_extra_roots(extra_roots)
+  if isinstance(extra_roots, str):
+    raise TypeError(
+        'extra_roots must be an iterable of streams/nodes/names, not a bare '
+        'str.'
+    )
+  extra_list = None if extra_roots is None else list(extra_roots)
   protected_nodes = frozenset(
       item for item in (extra_list or ()) if isinstance(item, Node)
   )

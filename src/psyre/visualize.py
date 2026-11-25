@@ -102,7 +102,7 @@ _DOT_INSTALL_HINT = (
 
 
 def _get_dot_binary(dot_prog: str | None = None) -> str:
-  """Resolves the Graphviz `dot` executable from runfiles or system PATH."""
+  """Resolves the Graphviz `dot` executable from bundled path or PATH."""
   if dot_prog is not None:
     return dot_prog
   bundled = os.path.abspath(
@@ -139,7 +139,7 @@ def _run_dot_svg(dot_src: str, prog: str) -> str:
         f'{err_msg or "missing <svg> output"}'
     )
   if proc.returncode != 0:
-    # Retain Borg/Colab noisy font warnings when dot still produced valid SVG.
+    # Retain noisy headless/container font warnings when dot wrote valid SVG.
     common.logger.warning(
         'Graphviz dot exited with code %d while emitting SVG: %s',
         proc.returncode,
@@ -235,12 +235,17 @@ def _format_static_stream(stream: stream_lib.Stream) -> str:
 
 def _node_automaton_prefix(node: graph_lib.Node) -> str:
   """Returns the slash-separated automaton scope prefix of `node` (or '')."""
-  return _parent_prefix(node.name)
+  return '/'.join(seg for seg, _ in node.prefixes) if node.prefixes else ''
 
 
 def _node_local_name(node: graph_lib.Node) -> str:
   """Returns the local name of `node` with any automaton prefix stripped."""
-  return node.name.rsplit('/', 1)[-1] if node.name else ''
+  if not node.name:
+    return ''
+  pfx = _node_automaton_prefix(node)
+  if pfx and node.name.startswith(f'{pfx}/'):
+    return node.name[len(pfx) + 1 :]
+  return node.name
 
 
 def _has_custom_node_name(node: graph_lib.Node) -> bool:
@@ -1246,6 +1251,51 @@ class _DotBuilder:
         )
     )
 
+  def _add_data_edge(
+      self,
+      parent: pydot.Dot | pydot.Cluster,
+      src_ep: str,
+      dst_ep: str,
+      e_dom: str,
+      info_text: str,
+      *,
+      color: str,
+      style: str,
+      penwidth: str,
+      is_inline: bool,
+      constraint: str,
+      label: str = '',
+      weight: str = '',
+      reverse_in_dot: bool = False,
+  ) -> None:
+    """Emits a data/selector/feedback edge and registers its DOM metadata."""
+    self.info_by_dom_id[e_dom] = info_text
+    if is_inline:
+      self.static_edge_to_node[e_dom] = f"psyre_{src_ep.split(':', 1)[0]}"
+    edge_attrs: dict[str, Any] = {
+        'id': _quote_dot(e_dom),
+        'color': _quote_dot(color),
+        'style': _quote_dot(style),
+        'penwidth': penwidth,
+        'arrowsize': '0.65' if is_inline else '0.7',
+        'constraint': constraint,
+    }
+    if label:
+      edge_attrs.update({
+          'label': _quote_dot(f' {label} '),
+          'fontname': _FONT,
+          'fontsize': '9',
+          'fontcolor': _quote_dot(color),
+      })
+    if weight:
+      edge_attrs['weight'] = weight
+    if reverse_in_dot:
+      edge_attrs['dir'] = _quote_dot('back')
+      self.reversed_edge_ids.add(e_dom)
+      parent.add_edge(pydot.Edge(dst_ep, src_ep, **edge_attrs))
+    else:
+      parent.add_edge(pydot.Edge(src_ep, dst_ep, **edge_attrs))
+
   def _classify_input_edge(
       self,
       node: graph_lib.Node,
@@ -1328,7 +1378,7 @@ class _DotBuilder:
         self._get_container(pfx, ctx.base_act[pfx])
     for node in sorted(
         self.visible_nodes,
-        key=lambda n: (n.name.count('/'), len(ctx.clocks.node_clock(n))),
+        key=lambda n: (len(n.prefixes), len(ctx.clocks.node_clock(n))),
     ):
       self._get_container(
           _node_automaton_prefix(node), _activity_key(node, ctx.clocks)
@@ -1499,25 +1549,20 @@ class _DotBuilder:
           e_dom = f'psyre_e_{box_dot}_in{in_idx}'
           in_idx += 1
           s_clk = str(self.ctx.clocks.stream_clock(stream))
-          self.info_by_dom_id[e_dom] = (
-              f'edge -> {pfx} | stream=S_{stream.id} | clock={s_clk}'
-          )
-          if is_inline:
-            self.static_edge_to_node[e_dom] = f'psyre_{src_key}'
           is_back = prod is not None and prod.id > member.id
           if not is_back and not is_inline and src_key != box_dot:
             self.constrained_adj.setdefault(src_key, set()).add(box_dot)
-          edge_parent.add_edge(
-              pydot.Edge(
-                  src_ep,
-                  dst_ep,
-                  id=_quote_dot(e_dom),
-                  color=_quote_dot('#7C3AED' if is_back else '#334155'),
-                  style=_quote_dot('dashed' if is_back else 'solid'),
-                  penwidth='1.5' if is_back else '1.4',
-                  arrowsize='0.65' if is_inline else '0.7',
-                  constraint='false' if is_back else 'true',
-              )
+          self._add_data_edge(
+              edge_parent,
+              src_ep,
+              dst_ep,
+              e_dom,
+              f'edge -> {pfx} | stream=S_{stream.id} | clock={s_clk}',
+              color='#7C3AED' if is_back else '#334155',
+              style='dashed' if is_back else 'solid',
+              penwidth='1.5' if is_back else '1.4',
+              is_inline=is_inline,
+              constraint='false' if is_back else 'true',
           )
 
   def _prepopulate_constrained_adj(self) -> None:
@@ -1666,39 +1711,33 @@ class _DotBuilder:
         role = 'selector'
       else:
         role = f'in[{port_idx}]'
-      self.info_by_dom_id[e_dom] = (
-          f'edge -> {_node_full_display_name(node)}.{role} | '
-          f'stream=S_{stream.id} | clock={s_clk}'
-      )
-      edge_attrs: dict[str, Any] = {
-          'id': _quote_dot(e_dom),
-          'color': _quote_dot(edge_color),
-          'style': _quote_dot(edge_style),
-          'penwidth': penwidth,
-          'arrowsize': '0.65' if info.is_inline_src else '0.7',
-          'constraint': constraint,
-          'fontname': _FONT,
-          'fontsize': '9',
-          'fontcolor': _quote_dot(edge_color),
-      }
-      if info.is_inline_src:
-        self.static_edge_to_node[e_dom] = f'psyre_{src_key}'
-      elif info.is_fby_immediate:
-        edge_attrs['weight'] = '10'
-      elif reverse_in_dot:
-        edge_attrs['dir'] = _quote_dot('back')
-        edge_attrs['weight'] = '2'
-      if edge_label:
-        edge_attrs['label'] = _quote_dot(f' {edge_label} ')
       is_local = constraint == 'true' and (
           info.use_net_ref or info.is_inline_src or info.same_cluster
       )
-      edge_parent = node_container if is_local else self.dot
-      if reverse_in_dot:
-        self.reversed_edge_ids.add(e_dom)
-        edge_parent.add_edge(pydot.Edge(dst_ep, src_ep, **edge_attrs))
+      if info.is_inline_src:
+        edge_weight = ''
+      elif info.is_fby_immediate:
+        edge_weight = '10'
+      elif reverse_in_dot:
+        edge_weight = '2'
       else:
-        edge_parent.add_edge(pydot.Edge(src_ep, dst_ep, **edge_attrs))
+        edge_weight = ''
+      self._add_data_edge(
+          node_container if is_local else self.dot,
+          src_ep,
+          dst_ep,
+          e_dom,
+          f'edge -> {_node_full_display_name(node)}.{role} | '
+          f'stream=S_{stream.id} | clock={s_clk}',
+          color=edge_color,
+          style=edge_style,
+          penwidth=penwidth,
+          is_inline=info.is_inline_src,
+          constraint=constraint,
+          label=edge_label,
+          weight=edge_weight,
+          reverse_in_dot=reverse_in_dot,
+      )
 
     for rst_idx, rst_s in self._visible_resets(node):
       rst_prod = self.graph.producer(rst_s)
@@ -1949,9 +1988,14 @@ def _build_schematic_view(
   return builder.to_schematic_view(_run_dot_svg(dot_src, prog), dot_src)
 
 
+def _encode_state_segment(prefix: str) -> str:
+  """Percent-escapes `%` and `|` inside a single expansion state prefix."""
+  return prefix.replace('%', '%25').replace('|', '%7C')
+
+
 def _canonical_state_key(expanded: Iterable[str]) -> str:
   """Returns the canonical `|`-joined state key for an expanded prefix set."""
-  return '|'.join(sorted(set(expanded)))
+  return '|'.join(_encode_state_segment(p) for p in sorted(set(expanded)))
 
 
 def _build_schematic_bundle(

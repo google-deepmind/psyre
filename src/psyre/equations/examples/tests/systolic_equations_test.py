@@ -11,23 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the `psyre_equations`-based GMoE and GMoE-RNN models."""
+"""Unit tests for the `psyre_equations`-based 4x4 systolic array."""
 
 from absl.testing import absltest
 
-# pylint: disable=g-importing-member,g-multiple-import
-from equations.examples.src import gmoe_equations
-from equations.examples.src import rnn_equations
-from examples.tests import gmoe_test
-
-# pylint: enable=g-importing-member,g-multiple-import
+from psyre.equations.examples.src import systolic_equations
+from examples.tests import systolic_test
 
 
-class GmoeEquationsTest(gmoe_test.GmoeTest):
-  """Runs the shared GMoE test suite against `gmoe_equations` + `rnn_equations`."""
+class SystolicEquationsTest(systolic_test.SystolicTest):
+  """Runs the shared systolic test suite against `systolic_equations`."""
 
-  GMOE = gmoe_equations
-  RNN = rnn_equations
+  MOD = systolic_equations
 
 
 if __name__ == '__main__':

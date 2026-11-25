@@ -24,7 +24,6 @@ from absl.testing import absltest
 # pylint: disable=g-importing-member,g-multiple-import
 from psyre.common import (
     Absent,
-    Bottom,
     Semantics,
     logger,
     when,
@@ -36,6 +35,7 @@ from psyre.match import (
 )
 from psyre.scheduler import Scheduler
 from psyre.stream import Stream
+from tests import test_utils
 from psyre.trace import (
     is_absent,
     is_present,
@@ -57,13 +57,12 @@ def _build_sample_dataset() -> list[tuple[list[float], float]]:
   ]
 
 
-def _reference_eval_loss(
+def reference_rnn_perceptron(
     x_seq: Sequence[float],
-    y_target: float,
     params: Any,
     num_cells: int | None = None,
 ) -> float:
-  """Computes exact mathematical RNN + ReLU perceptron squared loss."""
+  """Computes exact mathematical RNN + ReLU perceptron prediction."""
   dim = len(x_seq)
   cells = dim if num_cells is None else num_cells
   h_grid: list[list[float]] = []
@@ -81,7 +80,17 @@ def _reference_eval_loss(
     h_grid.append(row)
   y_rnn = [h_grid[min(t, cells - 1)][t] for t in range(dim)]
   dot_acc = params.per.bh[0] + math.sumprod(y_rnn, params.per.wxh)
-  y_pred = max(0.0, dot_acc)
+  return max(0.0, dot_acc)
+
+
+def _reference_eval_loss(
+    x_seq: Sequence[float],
+    y_target: float,
+    params: Any,
+    num_cells: int | None = None,
+) -> float:
+  """Computes exact mathematical RNN + ReLU perceptron squared loss."""
+  y_pred = reference_rnn_perceptron(x_seq, params, num_cells=num_cells)
   return (y_pred - y_target) ** 2
 
 
@@ -178,8 +187,12 @@ class ModelTest(absltest.TestCase):
       )
       return train_out, infer_out, trained
 
-    random.seed(7)
-    train_out, infer_out, saved_params = run_train_and_eval(samples)
+    saved_rng = random.getstate()
+    try:
+      random.seed(7)
+      train_out, infer_out, saved_params = run_train_and_eval(samples)
+    finally:
+      random.setstate(saved_rng)
     train_modes, train_traces, train_losses, train_eval_losses = train_out
     infer_modes, infer_traces, infer_train_losses, eval_losses = infer_out
 
@@ -245,10 +258,14 @@ class ModelTest(absltest.TestCase):
     perturbed_samples = list(samples)
     perturbed_samples[3] = (perturbed_samples[3][0], 10.0)
 
-    random.seed(7)
-    alt_train_out, alt_infer_out, alt_params = run_train_and_eval(
-        perturbed_samples
-    )
+    saved_rng = random.getstate()
+    try:
+      random.seed(7)
+      alt_train_out, alt_infer_out, alt_params = run_train_and_eval(
+          perturbed_samples
+      )
+    finally:
+      random.setstate(saved_rng)
     alt_train_losses = present_values(alt_train_out[2])
     self.assertEqual(alt_train_losses, present_train_losses)
     self.assertEqual(alt_params, saved_params)
@@ -358,24 +375,18 @@ class ModelTest(absltest.TestCase):
         Scheduler.run(main, horizon=total_horizon, semantics=Semantics.KAHN)
     )
     self.assertFalse(Scheduler.deadlocked)
-    def _assert_no_sentinels(trace: list[Any]) -> None:
-      self.assertTrue(
-          all(v is not Absent and v is not Bottom for v in trace),
-          f'Unexpected Absent/Bottom sentinel in KAHN trace: {trace!r}',
-      )
-
     for k_tr in (k_modes, k_switch, k_train_losses, k_eval_losses):
-      _assert_no_sentinels(k_tr)
+      test_utils.assert_no_sentinels(self, k_tr)
     self.assertEqual(k_modes, modes)
     self.assertEqual(k_switch, switch_trace)
     self.assertEqual(k_train_losses, present_train_losses)
     self.assertEqual(k_eval_losses, pre_eval_losses)
-
-    def _assert_param_elision(k_tr: list[Any], s_tr: list[Any]) -> None:
-      _assert_no_sentinels(k_tr)
-      self.assertEqual(k_tr, present_values(s_tr))
-
-    k_params.map(_assert_param_elision, param_traces)
+    k_params.map(
+        lambda k_tr, s_tr: test_utils.assert_absent_bottom_elision(
+            self, s_tr, k_tr
+        ),
+        param_traces,
+    )
 
   def test_normalize_params_requires_shared_rnn_scalars(self):
     mod = self.MOD
@@ -406,6 +417,17 @@ class ModelTest(absltest.TestCase):
     ):
       Scheduler.run(
           run_matched_inference_without_params,
+          horizon=mod.DIMENSION,
+      )
+    with self.assertRaisesRegex(ValueError, 'dataset must be non-empty'):
+      Scheduler.run(
+          lambda: mod.inference_machine(
+              dataset=[],
+              params=mod.ModelParams(
+                  rnn=mod.RnnParams(wxh=0.1, whh=0.1, bh=0.0),
+                  per=mod.PerceptronParams(wxh=[0.1] * mod.DIMENSION, bh=0.0),
+              ),
+          ),
           horizon=mod.DIMENSION,
       )
 

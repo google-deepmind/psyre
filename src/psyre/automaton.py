@@ -45,6 +45,7 @@ from psyre.common import (
     MergeSelector,
     TagKey,
     UNSET,
+    activate_block_context,
     active_block,
     fby,
     ifthenelse,
@@ -59,7 +60,6 @@ from psyre.common import (
     tag_key,
     when,
 )
-from psyre.common_payload import is_array_object
 from psyre.match import (
     bind_thunk_env,
     finalize_named_outputs,
@@ -68,6 +68,7 @@ from psyre.match import (
     validate_discrete_tag,
     validate_exhaustiveness,
 )
+from psyre.payload import is_array_object
 from psyre.static_stream import StaticSequence
 from psyre.stream import Stream
 
@@ -83,6 +84,7 @@ class _Transition:
   reset: Any
   env: CapturedEnv = dataclasses.field(default_factory=CapturedEnv.capture)
   consumed: bool = False
+  owner: BlockContext | None = None
 
 
 def until(
@@ -115,7 +117,7 @@ def unless(
         'unless() cannot be called inside a state() body; pass unless(...) '
         'directly to state(tag, unless(...)).'
     )
-  clause = _Transition(cond=cond, target=target, reset=reset)
+  clause = _Transition(cond=cond, target=target, reset=reset, owner=ctx)
   ctx.unconsumed_unless.append(clause)
   return clause
 
@@ -258,7 +260,7 @@ def automaton(
     raise TypeError(
         f'automaton(name=...) must be a str, got {type(name).__name__}.'
     )
-  if init is not UNSET and not isinstance(init, Stream):
+  if init is not UNSET and not isinstance(init, Stream) and not is_thunk(init):
     validate_discrete_tag(init, 'automaton(init=...)')
   curr_builder = require_builder()
   fsm_prefix = name if name else f'fsm_{curr_builder.next_fsm_id()}'
@@ -269,12 +271,8 @@ def automaton(
         enclosing_env=enclosing_env,
         init=init,
     )
-    handle = BlockHandle(ctx)
-    block_token = active_block.set(ctx)
-    try:
+    with activate_block_context(ctx) as handle:
       yield handle
-    finally:
-      active_block.reset(block_token)
 
     if any(not clause.consumed for clause in ctx.unconsumed_unless):
       raise RuntimeError(
@@ -394,9 +392,16 @@ def state(
           'Extra arguments to state() must be unless(...) clauses, got '
           f'{type(clause).__name__}.'
       )
-    clause.consumed = True
+    if clause.owner is not ctx:
+      raise RuntimeError(
+          'unless() clause cannot be passed to a state() of a different '
+          'automaton().'
+      )
+    if clause.consumed:
+      raise RuntimeError(
+          'unless() clause cannot be reused across multiple states.'
+      )
 
-  ctx.claimed_tags.append(tag)
   arm = MatchArm(values=(tag,), is_wildcard=False)
   arm_scope = ArmScope(selector=make_arm_selector(arm))
   arm_record = ArmRecord(
@@ -415,4 +420,7 @@ def state(
         yield sampled
   finally:
     ctx.active_arm = None
+  for clause in unless_clauses:
+    clause.consumed = True
+  ctx.claimed_tags.append(tag)
   ctx.arm_records.append(arm_record)

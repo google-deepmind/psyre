@@ -37,8 +37,6 @@ from psyre.clock import (
     check_clocks,
 )
 from psyre.common import (
-    Absent,
-    Bottom,
     Semantics,
     buffer,
     counter,
@@ -67,7 +65,7 @@ from psyre.match import (
 from psyre.scheduler import Scheduler
 from psyre.static_stream import StaticWord
 from psyre.stream import Stream
-from psyre.trace import present_values
+from tests import test_utils
 
 # pylint: enable=g-importing-member,g-multiple-import
 
@@ -726,11 +724,9 @@ class PervasivesTest(absltest.TestCase):
     )
     for key, sync_vals in sync_traces.items():
       with self.subTest(absent_elision=key):
-        kahn_vals = kahn_traces[key]
-        self.assertTrue(
-            all(v is not Absent and v is not Bottom for v in kahn_vals)
+        test_utils.assert_absent_bottom_elision(
+            self, sync_vals, kahn_traces[key]
         )
-        self.assertEqual(present_values(sync_vals), kahn_vals)
 
     # Verify overflow and underflow fail fast with BufferError for both
     # primitive `buffer` and derived `buffer_pervasive` (including `None`).
@@ -787,19 +783,12 @@ class PervasivesTest(absltest.TestCase):
         op_fn = buffer if use_prim else self.OPS.buffer
         for sem in (Semantics.SYNC, Semantics.KAHN):
           with self.subTest(case=label, primitive=use_prim, semantics=sem):
-            with self.assertRaises(ExceptionGroup) as eg:
-              Scheduler.run(
-                  lambda fn=builder_fn, op=op_fn: fn(op),
-                  horizon=hz,
-                  semantics=sem,
-              )
-            self.assertTrue(
-                any(
-                    isinstance(err, BufferError) and word in str(err)
-                    for err in eg.exception.exceptions
-                ),
-                f'Expected BufferError({word!r}), got '
-                f'{eg.exception.exceptions!r}',
+            test_utils.assert_buffer_error(
+                self,
+                lambda fn=builder_fn, op=op_fn: fn(op),
+                hz,
+                word,
+                semantics=sem,
             )
 
   def test_buffer_pervasive_supersampled_reset_and_validation(self):

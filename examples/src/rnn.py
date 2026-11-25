@@ -35,6 +35,7 @@ from psyre.common import (
     current,
     fby,
     ifthenelse,
+    is_namedtuple,
     merge,
     morph,
     post,
@@ -97,6 +98,52 @@ class HyperParams:
       raise ValueError(f'max_steps must be >= 1, got {self.max_steps}.')
 
 
+def map_fields(tree: Any, fn: Callable[..., Any], *others: Any) -> Any:
+  """Applies `fn` field-wise across a NamedTuple `tree` and parallel trees."""
+  return type(tree)(*(fn(*col) for col in zip(tree, *others)))
+
+
+def select_params(cond: Stream, then_params: Any, else_params: Any) -> Any:
+  """Selects leaf-wise between two parameter trees under boolean `cond`."""
+  return then_params.map(
+      lambda upd, old: ifthenelse(cond, upd, old), else_params
+  )
+
+
+def sample_params(cond: Stream, params: Any) -> Any:
+  """Downsamples every leaf stream of `params` onto subclock `cond`."""
+  return params.map(lambda p: when(cond, p))
+
+
+def delay_tree(
+    template: Any,
+    source: Any,
+    delay_fn: Callable[[Any, Any], Stream],
+    *,
+    by_getter: bool = False,
+) -> Any:
+  """Recursively delays every leaf of a NamedTuple/tuple parameter tree."""
+  if isinstance(template, tuple):
+    if by_getter:
+
+      def _child(idx: int) -> Any:
+        return delay_tree(
+            template[idx],
+            lambda: source()[idx],
+            delay_fn,
+            by_getter=True,
+        )
+
+      items = tuple(_child(i) for i in range(len(template)))
+    else:
+      items = tuple(
+          delay_tree(template[i], source[i], delay_fn)
+          for i in range(len(template))
+      )
+    return type(template)(*items) if is_namedtuple(template) else items
+  return delay_fn(template, source)
+
+
 class RnnParams[T](NamedTuple):
   """Parameters (wxh, whh, bh) of the 1-layer recurrent neural network."""
 
@@ -113,7 +160,7 @@ class RnnParams[T](NamedTuple):
       self, fn: Callable[..., U], *others: 'RnnParams[Any]'
   ) -> 'RnnParams[U]':
     """Applies fn field-wise across self and any parallel RnnParams."""
-    return RnnParams(*(fn(*col) for col in zip(self, *others)))
+    return map_fields(self, fn, *others)
 
 
 class PerceptronParams[T](NamedTuple):
@@ -131,7 +178,7 @@ class PerceptronParams[T](NamedTuple):
       self, fn: Callable[..., U], *others: 'PerceptronParams[Any]'
   ) -> 'PerceptronParams[U]':
     """Applies fn field-wise across self and any parallel PerceptronParams."""
-    return PerceptronParams(*(fn(*col) for col in zip(self, *others)))
+    return map_fields(self, fn, *others)
 
 
 class ModelParams[RnnT, PerT](NamedTuple):
@@ -206,17 +253,17 @@ class HierarchicalOutput(NamedTuple):
   eval_loss: Stream | None
 
 
-def _pass_final(dimension: int = DIMENSION) -> Stream:
+def pass_final(dimension: int = DIMENSION) -> Stream:
   """Emits True on the final coordinate (dimension - 1) of a pass."""
   return Stream.once(dimension - 1)
 
 
-def _pass_reset_word(dimension: int = DIMENSION) -> StaticWord:
+def pass_reset_word(dimension: int = DIMENSION) -> StaticWord:
   """Returns the periodic `dimension`-cycle pass-start reset pattern."""
   return StaticWord(True) + repeat(False, dimension - 1)
 
 
-def _pass_end_word(dimension: int = DIMENSION) -> StaticWord:
+def pass_end_word(dimension: int = DIMENSION) -> StaticWord:
   """Returns the periodic `dimension`-cycle pass-end pulse pattern."""
   return repeat(False, dimension - 1) + True
 
@@ -259,7 +306,7 @@ def sum_stream(
   """Broadcasts the sum of one pass of x as a constant stream."""
   if dimension < 1:
     raise ValueError(f'dimension must be >= 1, got {dimension}.')
-  pass_end = _pass_final(dimension) if end is None else end
+  pass_end = pass_final(dimension) if end is None else end
   return backfill(
       prefix_sum(x),
       pass_end,
@@ -385,7 +432,7 @@ def grad_per_layer(
   # obtained as `total - prefix_sum_prev`. Only bias `bh[0]` seeds `prefix_sum`,
   # so `morph(dp, 0.0)` emits `dp[0]` at tick 0 and `0.0` afterward.
   ps = prefix_sum(dz)
-  end = _pass_final(dimension) if final is None else final
+  end = pass_final(dimension) if final is None else final
   total = backfill(ps, end, max_span=dimension - 1, shift_back=shift_back)
   dp = total - fby(0.0, ps)
   return y, dp * per.wxh, PerceptronParams(wxh=dp * x, bh=morph(dp, 0.0))
@@ -460,7 +507,7 @@ def grad_model(
     dimension: int = DIMENSION,
 ) -> tuple[Stream, Stream, ParamStreams]:
   """Computes predictions, loss, and parameter gradients over one pass."""
-  dloss = ifthenelse(_pass_final(dimension), 1.0, 0.0)
+  dloss = ifthenelse(pass_final(dimension), 1.0, 0.0)
   y_pred, _, grads = grad_rnn_perceptron(
       x,
       params,
@@ -490,7 +537,7 @@ def apply_grads(
   )
 
 
-def _random_param_streams() -> ParamStreams:
+def random_param_streams() -> ParamStreams:
   """Generates initial random parameter streams with shared RNN scalars."""
   first = Stream.once(0)
   return ModelParams.build(
@@ -502,17 +549,21 @@ def _random_param_streams() -> ParamStreams:
 def simple_model(
     *,
     hyperparams: HyperParams = HyperParams(lr=0.1),
+    grad_model_fn: Callable[..., tuple[Stream, Stream, ParamStreams]] | None = (
+        None
+    ),
 ) -> SimpleModelOutput:
   """Runs the forward pass and one iteration of gradient descent."""
   x = Stream.periodic([], [1.0, 2.0, -1.0, 0.0, 1.0])
   y_true = 42.0
-  params = _random_param_streams()
+  params = random_param_streams()
+  build_grad = grad_model if grad_model_fn is None else grad_model_fn
 
   y_pred_fwd = forward(x, params)
   y_pred_fwd.name = 'y_pred_fwd'
   loss_fwd = loss(y_pred_fwd, y_true)
   loss_fwd.name = 'loss_fwd'
-  y_pred, loss_bwd, grads = grad_model(x, y_true, params)
+  y_pred, loss_bwd, grads = build_grad(x, y_true, params)
   y_pred.name = 'y_pred'
   loss_bwd.name = 'loss_bwd'
   next_params = apply_grads(params, grads, hyperparams.lr)
@@ -525,7 +576,7 @@ def simple_model(
   )
 
 
-def _to_param_float(raw_value: Any, field_name: str) -> float:
+def to_param_float(raw_value: Any, field_name: str) -> float:
   """Converts a non-bool numeric parameter value to float."""
   if isinstance(raw_value, bool):
     raise TypeError(
@@ -561,10 +612,10 @@ def _normalize_param_values(
         f'{label} {field_name!r} must be {expected}, not '
         f'{type(raw_value).__name__}.'
     )
-  return [_to_param_float(item, field_name) for item in raw_value]
+  return [to_param_float(item, field_name) for item in raw_value]
 
 
-def _normalize_param_scalar(raw_value: Any, field_name: str) -> float:
+def normalize_param_scalar(raw_value: Any, field_name: str) -> float:
   """Normalizes a shared scalar parameter entry (float or length-1 sequence)."""
   values = _normalize_param_values(
       raw_value, field_name, label='Shared parameter', expected='numeric'
@@ -577,7 +628,7 @@ def _normalize_param_scalar(raw_value: Any, field_name: str) -> float:
   return values[0]
 
 
-def _normalize_param_vector(
+def normalize_param_vector(
     raw_value: Any,
     field_name: str,
     *,
@@ -609,9 +660,9 @@ def normalize_params(
   """Validates and normalizes model parameters into `ParamValues`."""
   _validate_dimension(dimension)
   return ModelParams(
-      rnn=params.rnn.map(_normalize_param_scalar, _PARAM_LABELS.rnn),
+      rnn=params.rnn.map(normalize_param_scalar, _PARAM_LABELS.rnn),
       per=params.per.map(
-          lambda val, lbl: _normalize_param_vector(
+          lambda val, lbl: normalize_param_vector(
               val, lbl, dimension=dimension
           ),
           _PARAM_LABELS.per,
@@ -619,7 +670,7 @@ def normalize_params(
   )
 
 
-def _extract_present_window(
+def extract_present_window(
     values: Sequence[Any],
     label: str,
     *,
@@ -636,14 +687,14 @@ def _extract_present_window(
   return extracted[-dimension:]
 
 
-def _extract_shared_scalar(
+def extract_shared_scalar(
     values: Sequence[Any],
     label: str,
     *,
     dimension: int = DIMENSION,
 ) -> float:
   """Extracts and validates a pass-constant scalar parameter from a trace."""
-  window = _extract_present_window(values, label, dimension=dimension)
+  window = extract_present_window(values, label, dimension=dimension)
   if any(val != window[0] for val in window):
     raise ValueError(
         f'Shared parameter {label!r} is not constant across pass: {window!r}.'
@@ -660,13 +711,11 @@ def extract_params(
   _validate_dimension(dimension)
   return ModelParams(
       rnn=traces.rnn.map(
-          lambda seq, lbl: _extract_shared_scalar(
-              seq, lbl, dimension=dimension
-          ),
+          lambda seq, lbl: extract_shared_scalar(seq, lbl, dimension=dimension),
           _PARAM_LABELS.rnn,
       ),
       per=traces.per.map(
-          lambda seq, lbl: _extract_present_window(
+          lambda seq, lbl: extract_present_window(
               seq, lbl, dimension=dimension
           ),
           _PARAM_LABELS.per,
@@ -674,7 +723,7 @@ def extract_params(
   )
 
 
-def _vector_stream(in_pass: Stream, values: Sequence[float]) -> Stream:
+def vector_stream(in_pass: Stream, values: Sequence[float]) -> Stream:
   """Selects values[in_pass] at each local coordinate of a pass."""
   return switch(
       in_pass,
@@ -694,7 +743,7 @@ def _parse_pass_values(
     raise TypeError(
         f'{label} must be a numeric sequence, not {type(raw_values).__name__}.'
     )
-  values = [_to_param_float(item, label) for item in raw_values]
+  values = [to_param_float(item, label) for item in raw_values]
   if len(values) != dimension:
     raise ValueError(f'{label} has length {len(values)}, expected {dimension}.')
   return values
@@ -709,10 +758,10 @@ def _parse_pass_stream(
   values = _parse_pass_values(raw_values, label)
   if in_pass is None:
     return Stream.periodic([], values)
-  return _vector_stream(in_pass, values)
+  return vector_stream(in_pass, values)
 
 
-def _dataset_words(
+def dataset_words(
     samples: Sequence[tuple[Sequence[float], float | Sequence[float]]],
     *,
     dimension: int = DIMENSION,
@@ -740,7 +789,7 @@ def _dataset_words(
       )
     else:
       y_parts.append(
-          repeat(_to_param_float(raw_y, f'Dataset target {idx}'), dimension)
+          repeat(to_param_float(raw_y, f'Dataset target {idx}'), dimension)
       )
   return concat(*x_parts), concat(*y_parts)
 
@@ -759,37 +808,22 @@ def dataset_streams(
     ):
       y_stream = _parse_pass_stream(raw_y, in_pass, f'Dataset target {idx}')
     else:
-      y_stream = Stream(_to_param_float(raw_y, f'Dataset target {idx}'))
+      y_stream = Stream(to_param_float(raw_y, f'Dataset target {idx}'))
     streams.append(LabeledStream(x=x_stream, y=y_stream))
   return streams
 
 
-def _delay_pass(source: Any, init: Any = 0.0) -> Stream:
+def delay_pass(source: Any, init: Any = 0.0) -> Stream:
   """Delays defined values of source by one pass at automaton scope."""
   return last(source, init=init, n=DIMENSION)
 
 
-def _delay_params(get_params: Callable[[], ParamStreams]) -> ParamStreams:
-  """Delays all parameter streams in get_params() by one pass via last()."""
-  return ModelParams(
-      rnn=RnnParams(
-          wxh=_delay_pass(lambda: get_params().rnn.wxh),
-          whh=_delay_pass(lambda: get_params().rnn.whh),
-          bh=_delay_pass(lambda: get_params().rnn.bh),
-      ),
-      per=PerceptronParams(
-          wxh=_delay_pass(lambda: get_params().per.wxh),
-          bh=_delay_pass(lambda: get_params().per.bh),
-      ),
-  )
-
-
-def _zero_param_streams() -> ParamStreams:
+def zero_param_streams() -> ParamStreams:
   """Returns placeholder zero `ParamStreams` for `Mode.INFERENCE`."""
   return ModelParams.build(lambda: Stream(0.0))
 
 
-def _periodic_param_streams(params: ModelParams[Any, Any]) -> ParamStreams:
+def periodic_param_streams(params: ModelParams[Any, Any]) -> ParamStreams:
   """Streams shared RNN scalars and periodic perceptron vectors."""
   normalized = normalize_params(params)
   return ModelParams(
@@ -798,7 +832,7 @@ def _periodic_param_streams(params: ModelParams[Any, Any]) -> ParamStreams:
   )
 
 
-def _leave_one_out_samples[T](
+def leave_one_out_samples[T](
     samples: Sequence[T],
     holdout_index: int,
 ) -> list[T]:
@@ -822,22 +856,24 @@ def _inference_streams(
   """Returns `(loss, emit_loss)` streams from the nested inference automaton."""
   if params is None:
     raise ValueError('params is required for inference_machine.')
-  x_word, y_word = _dataset_words(dataset)
+  if not dataset:
+    raise ValueError('dataset must be non-empty.')
+  x_word, y_word = dataset_words(dataset)
 
   with automaton(name='infer') as infer:
     with state(InferenceState.INIT):
-      until(_pass_final(), InferenceState.EVAL)
+      until(pass_final(), InferenceState.EVAL)
       infer.loss = 0.0
       infer.emit_loss = False
     with state(InferenceState.EVAL):
-      pass_reset = Stream.periodic([], _pass_reset_word())
+      pass_reset = Stream.periodic([], pass_reset_word())
       sample_x = Stream.periodic(x_word, [0.0])
       sample_y = Stream.periodic(y_word, [0.0])
-      eval_params = _periodic_param_streams(params)
+      eval_params = periodic_param_streams(params)
       with reset(pass_reset):
         infer.loss = loss(forward(sample_x, eval_params), sample_y)
       infer.emit_loss = Stream.periodic(
-          repeat(_pass_end_word(), len(dataset)), [False]
+          repeat(pass_end_word(), len(dataset)), [False]
       )
 
   return infer.loss, infer.emit_loss
@@ -850,7 +886,7 @@ def inference_machine(
   """Nested automaton state machine for inference mode (init and eval).
 
   Args:
-    dataset: Sequence of `(x_seq, y_target)` examples.
+    dataset: Non-empty sequence of `(x_seq, y_target)` examples.
     params: Initial model parameters evaluated during inference.
 
   Returns:
@@ -875,22 +911,27 @@ def _training_streams(
     )
   if init_state == TrainingState.INIT_LOAD and params is None:
     raise ValueError('params is required for TrainingState.INIT_LOAD.')
-  train_dataset = _leave_one_out_samples(dataset, hyperparams.holdout_index)
-  x_word, y_word = _dataset_words(train_dataset)
+  train_dataset = leave_one_out_samples(dataset, hyperparams.holdout_index)
+  x_word, y_word = dataset_words(train_dataset)
 
   with automaton(init=init_state.name, name='train') as train:
-    prev = _delay_params(lambda: train.params)
+    prev = delay_tree(
+        _PARAM_LABELS,
+        lambda: train.params,
+        lambda _, src: delay_pass(src),
+        by_getter=True,
+    )
     with state(init_state.name):
-      until(_pass_final(), TrainingState.GRAD_DESCENT.name)
+      until(pass_final(), TrainingState.GRAD_DESCENT.name)
       if init_state == TrainingState.INIT_RANDOM:
-        train.params = _random_param_streams()
+        train.params = random_param_streams()
       else:
         assert params is not None
-        train.params = _periodic_param_streams(params)
+        train.params = periodic_param_streams(params)
       train.loss = 0.0
       train.emit_loss = False
     with state(TrainingState.GRAD_DESCENT.name):
-      pass_reset = Stream.periodic([], _pass_reset_word())
+      pass_reset = Stream.periodic([], pass_reset_word())
       sample_x = Stream.periodic([], x_word)
       sample_y = Stream.periodic([], y_word)
       active_step = Stream.periodic(
@@ -900,11 +941,9 @@ def _training_streams(
         _, train.loss, grads = grad_model(sample_x, sample_y, prev)
         updated = apply_grads(prev, grads, hyperparams.lr)
       train.emit_loss = Stream.periodic(
-          repeat(_pass_end_word(), hyperparams.max_steps), [False]
+          repeat(pass_end_word(), hyperparams.max_steps), [False]
       )
-      train.params = updated.map(
-          lambda upd, old: ifthenelse(active_step, upd, old), prev
-      )
+      train.params = select_params(active_step, updated, prev)
 
   return train.params, train.loss, train.emit_loss
 
@@ -915,6 +954,8 @@ def training_machine(
     *,
     init_state: TrainingState = TrainingState.INIT_RANDOM,
     hyperparams: HyperParams = HyperParams(),
+    training_streams_fn: Callable[..., tuple[ParamStreams, Stream, Stream]]
+    | None = None,
 ) -> TrainingOutput:
   """Nested automaton state machine for training mode (init and BPTT).
 
@@ -924,11 +965,15 @@ def training_machine(
     init_state: Initial state (`TrainingState.INIT_RANDOM` or
       `TrainingState.INIT_LOAD`).
     hyperparams: Training hyperparameters (`lr`, `max_steps`, `holdout_index`).
+    training_streams_fn: Optional builder overriding `_training_streams`.
 
   Returns:
     `TrainingOutput(params, train_loss)`.
   """
-  train_params, loss_bwd, emit_loss = _training_streams(
+  build_train = (
+      _training_streams if training_streams_fn is None else training_streams_fn
+  )
+  train_params, loss_bwd, emit_loss = build_train(
       dataset,
       params,
       init_state=init_state,
@@ -948,6 +993,8 @@ def hierarchical_model(
     switch_mode: Stream | None = None,
     train_init_state: TrainingState = TrainingState.INIT_RANDOM,
     hyperparams: HyperParams = HyperParams(),
+    training_streams_fn: Callable[..., tuple[ParamStreams, Stream, Stream]]
+    | None = None,
 ) -> HierarchicalOutput:
   """High-level automaton machine orchestrating training and inference modes.
 
@@ -962,10 +1009,14 @@ def hierarchical_model(
     train_init_state: Initial nested training state (`TrainingState.INIT_RANDOM`
       or `TrainingState.INIT_LOAD`).
     hyperparams: Training hyperparameters (`lr`, `max_steps`, `holdout_index`).
+    training_streams_fn: Optional builder overriding `_training_streams`.
 
   Returns:
     `HierarchicalOutput(mode, params, train_loss, eval_loss)`.
   """
+  build_train = (
+      _training_streams if training_streams_fn is None else training_streams_fn
+  )
   if switch_mode is None:
     if initial_mode == Mode.TRAINING:
       train_out = training_machine(
@@ -973,6 +1024,7 @@ def hierarchical_model(
           params=params,
           init_state=train_init_state,
           hyperparams=hyperparams,
+          training_streams_fn=build_train,
       )
       return HierarchicalOutput(
           mode=Stream(Mode.TRAINING),
@@ -996,7 +1048,7 @@ def hierarchical_model(
     with state(Mode.TRAINING) as mode:
       until(switch_mode, Mode.INFERENCE)
       top.mode = mode
-      top.params, top.loss, top.emit_loss = _training_streams(
+      top.params, top.loss, top.emit_loss = build_train(
           dataset=dataset,
           params=params,
           init_state=train_init_state,
@@ -1005,7 +1057,7 @@ def hierarchical_model(
     with state(Mode.INFERENCE) as mode:
       until(switch_mode, Mode.TRAINING)
       top.mode = mode
-      top.params = _zero_param_streams()
+      top.params = zero_param_streams()
       top.loss, top.emit_loss = _inference_streams(
           dataset=dataset,
           params=params,
@@ -1014,7 +1066,7 @@ def hierarchical_model(
   is_training = top.mode == Mode.TRAINING
   return HierarchicalOutput(
       mode=top.mode,
-      params=top.params.map(lambda p: when(is_training, p)),
+      params=sample_params(is_training, top.params),
       train_loss=when(
           is_training & top.emit_loss, top.loss, name='train_loss'
       ),

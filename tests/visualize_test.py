@@ -525,6 +525,129 @@ class VisualizeTest(absltest.TestCase):
     self.assertIn('⊟ m2', viz_pair.dot)
     self.assertIn('⊞ m1', viz_pair.dot)
 
+  def test_prefixes_pipe_keys_trapezoid_tips_cluster_paths_and_html_export(
+      self,
+  ):
+    # 1. `_node_automaton_prefix` reads `node.prefixes`, not `node.name` '/'.
+    def slash_and_unnamed_prog():
+      x = Stream([1, 2, 3], name='x')
+      top_slash = fby(0, x, name='foo/bar')
+      with automaton(init='A', name='a|b') as fsm:
+        with state('A'):
+          until(Stream.once(0), 'B')
+          fsm.y = fby(0, x, name='')
+        with state('B'):
+          fsm.y = 1
+      return {'top': top_slash, 'y': fsm.y}
+
+    g_pfx = build_graph(slash_and_unnamed_prog, optimize=False)
+    dot_pfx = visualize.build_pydot(g_pfx, collapse_automata=True).to_string()
+    self.assertNotIn('⊞ foo', dot_pfx)
+    self.assertNotIn('⊟ foo', dot_pfx)
+    self.assertIn('⊞ a|b', dot_pfx)
+    # Unnamed `fby` inside `a|b` must be hidden inside the collapsed box.
+    fby_in_fsm = [
+        n for n in g_pfx.nodes if n.op == 'fby' and n.prefixes and not n.name
+    ]
+    self.assertLen(fby_in_fsm, 1)
+    self.assertNotIn(f'n_{fby_in_fsm[0].id} [', dot_pfx)
+
+    # 2. `'|'` in automaton name escapes to `%7C`, avoiding key collision with
+    #    distinct `'a'` and `'b'` automata, and `save_html` includes UTF-8 meta.
+    viz = visualize.visualize_graph(g_pfx, title='pipe_test')
+    self.assertIn('a%7Cb', viz.html)
+    self.assertIn('rawTarget.closest("g.edge")', viz.html)
+    self.assertNotIn('<!DOCTYPE html>', viz._repr_html_())  # pylint: disable=protected-access
+    saved_path = viz.save_html()
+    with open(saved_path, encoding='utf-8') as f:
+      saved_html = f.read()
+    self.assertTrue(saved_html.startswith('<!DOCTYPE html>\n<meta charset='))
+
+    # 3. LR `when`/`whennot` trapezoid selector arrow tip lands on the slanted
+    #    top midpoint `0.5*(pts[0].y + pts[1].y)` (not `min(ys)`).
+    def trap_prog():
+      x = Stream([1, 2, 3], name='x')
+      w = when(Stream([True, False], name='sel_w'), x)
+      wn = when(Stream([True, False], name='sel_wn'), x, negated=True)
+      return {'w': w, 'wn': wn}
+
+    svg_trap = visualize.render_svg(build_graph(trap_prog), rankdir='LR')
+    root_trap = ET.fromstring(svg_trap)
+    nodes_by_key = {
+        g.get('data-psyre-key', ''): g
+        for g in root_trap.iter(f'{_SVG_NS}g')
+        if g.get('class') == 'node'
+    }
+    checked_tips = 0
+    for edge_g in root_trap.iter(f'{_SVG_NS}g'):
+      if (
+          edge_g.get('class') != 'edge'
+          or edge_g.get('data-psyre-dst-port') != 'n'
+      ):
+        continue
+      dst_g = nodes_by_key.get(edge_g.get('data-psyre-dst', ''))
+      if dst_g is None or dst_g.get('data-psyre-kind') not in (
+          'when',
+          'whennot',
+      ):
+        continue
+      dst_poly = dst_g.find(f'.//{_SVG_NS}polygon')
+      edge_poly = edge_g.find(f'.//{_SVG_NS}polygon')
+      self.assertIsNotNone(dst_poly)
+      self.assertIsNotNone(edge_poly)
+      dpts = [
+          tuple(float(v) for v in p.split(','))
+          for p in dst_poly.get('points', '').split()
+      ]
+      epts = [
+          tuple(float(v) for v in p.split(','))
+          for p in edge_poly.get('points', '').split()
+      ]
+      expected_top = 0.5 * (dpts[0][1] + dpts[1][1])
+      if dst_g.get('data-psyre-kind') == 'whennot':
+        expected_top -= 6.4
+      # Arrow tip is the middle vertex (`epts[1]`) of the 4-point arrowhead.
+      self.assertAlmostEqual(epts[1][1], expected_top, places=1)
+      checked_tips += 1
+    self.assertEqual(checked_tips, 2)
+
+    # 4. Rounded `<path>` clusters widen leftward for long inline labels.
+    synthetic_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">'
+        '<g id="graph0" class="graph" transform="translate(0 100)">'
+        '<polygon points="0,0 200,0 200,-100 0,-100"/>'
+        '<g id="clust1" class="cluster">'
+        '<path d="M52,-90 L188,-90 C194,-90 200,-84 200,-78 '
+        'L200,-22 C200,-16 194,-10 188,-10 L52,-10 C46,-10 40,-16 40,-22 '
+        'L40,-78 C40,-84 46,-90 52,-90"/>'
+        '<g id="psyre_n_1" class="node"><title>n_1</title>'
+        '<polygon points="50,-60 90,-60 90,-40 50,-40"/></g>'
+        '<g id="psyre_c_1" class="node"><title>c_1</title>'
+        '<text x="70" y="-75">very_long_inline_stream_label</text></g>'
+        '<g id="psyre_e_1" class="edge"><title>c_1-&gt;n_1:n</title>'
+        '<path d="M70,-70 L70,-60"/>'
+        '<polygon points="67,-65 70,-60 73,-65 67,-65"/></g>'
+        '</g></g></svg>'
+    )
+    post_root = ET.fromstring(
+        gui.render_view_svg(
+            gui.SchematicView(
+                raw_svg=synthetic_svg,
+                dot_src='digraph{}',
+                static_edge_to_node={'psyre_e_1': 'psyre_c_1'},
+            )
+        )
+    )
+    coord_re = re.compile(r'(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)')
+    post_min_xs = [
+        min(float(x) for x, _ in coord_re.findall(p.get('d', '')))
+        for g in post_root.iter(f'{_SVG_NS}g')
+        if g.get('class') == 'cluster'
+        and (p := g.find(f'{_SVG_NS}path')) is not None
+    ]
+    self.assertLen(post_min_xs, 1)
+    self.assertLess(post_min_xs[0], 40.0)
+
 
 if __name__ == '__main__':
   absltest.main()

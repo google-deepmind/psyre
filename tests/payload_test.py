@@ -15,11 +15,12 @@
 
 # pylint: disable=used-before-assignment
 
+import ast
 import dataclasses
 import enum
 import functools
 import logging
-import sys
+import pathlib
 import types
 from typing import Any, NamedTuple
 
@@ -45,13 +46,17 @@ from psyre.common import (
     psyre_comb,
     psyre_sequ,
     reset,
+    same_step_func,
     scan,
     switch,
     when,
     when_selector_matches_const,
     whennot,
 )
-from psyre.common_payload import (
+from psyre.equations import psyre_equations
+from psyre.match import case, default, match
+from psyre.optimization import optimize_graph
+from psyre.payload import (
     CALL_PLAN_KWARG,
     is_array_object,
     is_nan_scalar,
@@ -60,9 +65,6 @@ from psyre.common_payload import (
     register_pytree_node,
     unregister_pytree_node,
 )
-from equations import psyre_equations
-from psyre.match import case, default, match
-from psyre.optimization import optimize_graph
 from psyre.scheduler import Scheduler
 from psyre.static_stream import StaticSequence, StaticWord, same_const_value
 from psyre.stream import Stream, resolve_stream
@@ -188,8 +190,29 @@ class PayloadInteropTest(absltest.TestCase):
   """Zero-dependency tests for Psyre payload & lifting prerequisites."""
 
   def test_no_hard_numpy_or_jax_import_and_exports(self):
-    self.assertNotIn('numpy', sys.modules)
-    self.assertNotIn('jax', sys.modules)
+    # Check module ASTs directly so the test stays valid both in isolated runs
+    # and in multi-file `pytest` sessions where `array_interop_test.py` may
+    # already have imported `numpy`/`jax` into `sys.modules`.
+    # Avoid `.resolve()` so symlink-farm trees keep sibling `.py` files visible
+    # inside the same directory.
+    pkg_dir = pathlib.Path(psyre.__file__).parent
+    module_paths = sorted(pkg_dir.glob('*.py')) + sorted(
+        (pkg_dir / 'equations').glob('*.py')
+    )
+    self.assertGreaterEqual(len(module_paths), 10)
+    forbidden = frozenset({'numpy', 'jax'})
+    for mod_path in module_paths:
+      tree = ast.parse(
+          mod_path.read_text(encoding='utf-8'), filename=str(mod_path)
+      )
+      for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+          for alias in node.names:
+            root = alias.name.split('.', 1)[0]
+            self.assertNotIn(root, forbidden, msg=f'{mod_path}: {alias.name}')
+        elif isinstance(node, ast.ImportFrom) and node.module:
+          root = node.module.split('.', 1)[0]
+          self.assertNotIn(root, forbidden, msg=f'{mod_path}: {node.module}')
     for name in (
         'is_pure_step_func',
         'register_pytree_node',
@@ -605,6 +628,58 @@ class PayloadInteropTest(absltest.TestCase):
 
     sf = make_comb_step_func(raw, pure=True)
     self.assertIn('inst_func', sf.__code__.co_freevars)
+
+    # Distinct combinational closures wrapping the same callable match via
+    # `same_step_func` and CSE without closure caching, while distinct
+    # receivers, custom callables, or mismatched backend tags stay distinct.
+    sf2 = make_comb_step_func(raw, pure=True)
+    self.assertIsNot(sf, sf2)
+    self.assertTrue(same_step_func(sf, sf2))
+
+    sf_tagged = make_comb_step_func(raw, pure=True)
+    setattr(sf_tagged, '_psyre_jax_backend', True)
+    self.assertFalse(same_step_func(sf, sf_tagged))
+
+    class _Scale:
+
+      def __init__(self, k: int):
+        self.k = k
+
+      def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Scale)
+
+      def apply(self, a: int) -> int:
+        return a * self.k
+
+    s1, s2 = _Scale(2), _Scale(3)
+    self.assertTrue(
+        same_step_func(
+            make_comb_step_func(s1.apply, pure=True),
+            make_comb_step_func(s1.apply, pure=True),
+        )
+    )
+    self.assertFalse(
+        same_step_func(
+            make_comb_step_func(s1.apply, pure=True),
+            make_comb_step_func(s2.apply, pure=True),
+        )
+    )
+
+    f1 = psyre_comb(raw, pure=True)
+    f2 = psyre_comb(raw, pure=True)
+    m1a = psyre_comb(s1.apply, pure=True)
+    m1b = psyre_comb(s1.apply, pure=True)
+    m2 = psyre_comb(s2.apply, pure=True)
+
+    def cse_same_callable_prog():
+      x = Stream([1, 2, 3])
+      return f1(x), f2(x), m1a(x), m1b(x), m2(x)
+
+    g_cse = build_graph(cse_same_callable_prog, optimize=True)
+    o_f1, o_f2, o_m1a, o_m1b, o_m2 = g_cse.output
+    self.assertIs(o_f1, o_f2)
+    self.assertIs(o_m1a, o_m1b)
+    self.assertIsNot(o_m1a, o_m2)
 
   def test_psyre_comb_nout_pytree_static_args_and_custom_node(self):
     @psyre_comb(pure=True, nout=2)

@@ -11,33 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lambda-free declarative Psyre equations package (experimental, WIP).
+"""Unit tests for the `psyre_equations`-based GMoE and GMoE-RNN models."""
 
-Note: `psyre.equations` is highly experimental and a work in progress; APIs,
-semantics, and internals may change or be removed without notice. Inspired by
-Lustre/Lucid Synchrone recursive equations (Halbwachs et al., 1991; Caspi &
-Pouzet, 1996; Pouzet, 2006).
-"""
+from absl.testing import absltest
 
 # pylint: disable=g-importing-member,g-multiple-import
-from equations.equations import (
-    CircularEquationError,
-    EquationScope,
-    Equations,
-    PsyreEquations,
-    Thunk,
-    psyre_equations,
-    resolve_value,
-)
+from psyre.equations.examples.src import gmoe_equations
+from psyre.equations.examples.src import rnn_equations
+from examples.tests import gmoe_test
 
 # pylint: enable=g-importing-member,g-multiple-import
 
-__all__ = (
-    'CircularEquationError',
-    'EquationScope',
-    'Equations',
-    'PsyreEquations',
-    'Thunk',
-    'psyre_equations',
-    'resolve_value',
-)
+
+class GmoeEquationsTest(gmoe_test.GmoeTest):
+  """Runs the shared GMoE test suite against `gmoe_equations` + `rnn_equations`."""
+
+  GMOE = gmoe_equations
+  RNN = rnn_equations
+
+
+if __name__ == '__main__':
+  absltest.main()

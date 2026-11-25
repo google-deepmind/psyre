@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Declarative lambda-free Psyre equations (experimental, work in progress).
+"""Declarative lambda-free Psyre equations (experimental).
 
-Note: Everything under `psyre/equations/` is highly experimental; APIs,
-semantics, and internals may change or be removed without notice. Inspired by
-Lustre/Lucid Synchrone recursive node equations (Halbwachs et al., 1991; Caspi
-& Pouzet, 1996; Pouzet, 2006).
+Note: Everything under `psyre/equations/` is experimental; APIs, semantics, and
+internals may change or be removed without notice. Inspired by Lustre/Lucid
+Synchrone recursive node equations (Halbwachs et al., 1991; Caspi & Pouzet,
+1996; Pouzet, 2006).
 
 Provides a context manager (`psyre_equations`) and metaclass (`Equations`)
 allowing Psyre stream equations to refer to variables and
@@ -64,6 +64,7 @@ from psyre.common import (
     LazyThunk,
     Semantics,
     active_builder,
+    active_scheduler,
     force_thunk,
     format_tag,
     is_building,
@@ -72,13 +73,15 @@ from psyre.common import (
     prefix_stack,
     push_prefix,
 )
-from psyre.common_payload import (
+from psyre.graph import Graph
+from psyre.optimization import optimize_graph
+from psyre.payload import (
     NUMPY_UFUNC_METHODS,
     reject_numpy_inplace_ufunc,
     reject_numpy_mutating_func,
+    strip_null_out,
+    ufunc_nout,
 )
-from psyre.graph import Graph
-from psyre.optimization import optimize_graph
 from psyre.stream import Stream
 
 # pylint: enable=g-importing-member,g-multiple-import
@@ -148,6 +151,12 @@ def _resolve_tree(
   # flattening), also descend into `slice` objects and force eagerly.
   if isinstance(value, _LazyBlockHandle):
     return value._handle  # pylint: disable=protected-access
+  if isinstance(value, slice):
+    return slice(
+        _resolve_tree(value.start, owner_scope, active, via_thunk=via_thunk),
+        _resolve_tree(value.stop, owner_scope, active, via_thunk=via_thunk),
+        _resolve_tree(value.step, owner_scope, active, via_thunk=via_thunk),
+    )
   if owner_scope is not None:
     if isinstance(value, LazyThunk):
       resolved = (
@@ -160,12 +169,8 @@ def _resolve_tree(
       return _resolve_tree(resolved, owner_scope, active, via_thunk=True)
   else:
     if isinstance(value, LazyThunk):
-      return force_thunk(value)
-    if isinstance(value, slice):
-      return slice(
-          _resolve_tree(value.start, None, active),
-          _resolve_tree(value.stop, None, active),
-          _resolve_tree(value.step, None, active),
+      return _resolve_tree(
+          force_thunk(value), None, active, via_thunk=True
       )
   if isinstance(value, BlockHandle) or not isinstance(
       value, (tuple, list, Mapping)
@@ -174,7 +179,7 @@ def _resolve_tree(
   seen = set() if active is None else active
   obj_id = id(value)
   if obj_id in seen:
-    if owner_scope is not None and via_thunk:
+    if via_thunk:
       raise CircularEquationError(
           'Instantaneous circular container reference while resolving '
           f'{type(value).__name__}.'
@@ -273,7 +278,7 @@ class Thunk(LazyThunk):
     )
 
   def __getattr__(self, name: str) -> Thunk:
-    if _is_dunder(name):
+    if _is_dunder(name) or name.startswith('_psyre_'):
       raise AttributeError(name)
     return Thunk(
         lambda: getattr(self.__psyre_force__(), name),
@@ -312,7 +317,7 @@ class Thunk(LazyThunk):
     label = uname if method == '__call__' else f'{uname}.{method}'
     target = ufunc if method == '__call__' else getattr(ufunc, method)
     shared = _defer_call(target, label, inputs, kwargs)
-    nout = getattr(ufunc, 'nout', 1) if method == '__call__' else 1
+    nout = ufunc_nout(ufunc, method)
     if nout > 1:
       return tuple(shared[idx] for idx in range(nout))
     return shared
@@ -345,7 +350,7 @@ def _defer_call(
     kwargs: Mapping[str, Any],
 ) -> Thunk:
   """Builds a `Thunk` deferring `target(*args, **kwargs)` (dropping `out`)."""
-  clean_kwargs = {k: v for k, v in kwargs.items() if k != 'out'}
+  clean_kwargs = strip_null_out(kwargs)
   arg_desc = ', '.join(_format_desc_operand(arg) for arg in args)
 
   def _apply() -> Any:
@@ -367,11 +372,13 @@ def _make_binop(
     other_desc = _format_desc_operand(other)
     if reflected:
       return Thunk(
-          lambda: op(resolve_value(other), self.__psyre_force__()),
+          lambda: op(
+              _resolve_tree(resolve_value(other)), self.__psyre_force__()
+          ),
           desc=f'({other_desc} {op.__name__} {desc})',
       )
     return Thunk(
-        lambda: op(self.__psyre_force__(), resolve_value(other)),
+        lambda: op(self.__psyre_force__(), _resolve_tree(resolve_value(other))),
         desc=f'({desc} {op.__name__} {other_desc})',
     )
 
@@ -426,7 +433,7 @@ class _LazyBlockHandle(Mapping[str, Any]):
     object.__setattr__(self, '_handle', handle)
 
   def __getattr__(self, name: str) -> Any:
-    if _is_dunder(name):
+    if _is_dunder(name) or name.startswith('_'):
       raise AttributeError(name)
     handle = self._handle
     ctx = handle._ctx  # pylint: disable=protected-access
@@ -468,9 +475,12 @@ class EquationScope(dict):
     self._auto_name = auto_name
     self._assigned_names: frozenset[str] | None = None
     self._forward_refs: dict[str, Thunk] = {}
+    self._binding_prefixes: dict[str, tuple[tuple[str, int], ...]] = {}
     if initial:
       for key, val in initial.items():
-        if auto_name and isinstance(val, Stream) and not val.name:
+        if isinstance(val, BlockHandle):
+          val = _LazyBlockHandle(val)
+        elif auto_name and isinstance(val, Stream):
           self.name_stream(key, val)
         super().__setitem__(key, val)
 
@@ -503,7 +513,11 @@ class EquationScope(dict):
     if prod is not None:
       leaf = prod.name.rsplit('/', 1)[-1]
       if prod.prefixes == cur_prefixes and (
-          not stream.name or leaf == prod.op
+          not stream.name
+          or (
+              leaf == prod.op
+              and stream.name.rsplit('/', 1)[-1] == prod.op
+          )
       ):
         stream.name = prod.name = qualified
         return
@@ -526,6 +540,10 @@ class EquationScope(dict):
           )
         val = dict.__getitem__(self, k)
         if isinstance(val, _LazyBlockHandle):
+          if not val._handle._ctx.finalized:  # pylint: disable=protected-access
+            raise _DeferredError(
+                f'Block handle {k!r} is not finalized until its block exits.'
+            )
           return val._handle  # pylint: disable=protected-access
         return val
 
@@ -547,6 +565,8 @@ class EquationScope(dict):
           )
       if isinstance(value, BlockHandle):
         value = _LazyBlockHandle(value)
+      elif isinstance(value, Thunk):
+        self._binding_prefixes[key] = prefix_stack.get()
       elif self._auto_name and isinstance(value, Stream):
         self.name_stream(key, value)
     super().__setitem__(key, value)
@@ -651,7 +671,13 @@ class Equations(type):
       if resolved is not val:
         resolved = _resolve_tree(resolved, namespace)
         if auto_name and isinstance(resolved, Stream):
-          with val._env.restore():  # pylint: disable=protected-access
+          bind_pfx = namespace._binding_prefixes.get(key)  # pylint: disable=protected-access
+          env = (
+              dataclasses.replace(val._env, prefixes=bind_pfx)  # pylint: disable=protected-access
+              if bind_pfx is not None
+              else val._env  # pylint: disable=protected-access
+          )
+          with env.restore():
             namespace.name_stream(key, resolved)
         dict.__setitem__(namespace, key, resolved)
 
@@ -672,7 +698,7 @@ class Equations(type):
           leaf_bindings.append((key, val))
         else:
           _resolve_binding(key, val)
-      elif isinstance(val, (tuple, list, Mapping)) and not isinstance(
+      elif isinstance(val, (tuple, list, Mapping, slice)) and not isinstance(
           val, BlockHandle
       ):
         container_bindings.append((key, val))
@@ -746,6 +772,7 @@ def psyre_equations(
       `optimize` is not a `bool`.
     ValueError: If nested inside an active `GraphBuilder` with conflicting
       `semantics`, or with explicit `optimize`/`extra_roots`.
+    RuntimeError: If entered while a Stage-2 `Scheduler` run is active.
   """
   if not isinstance(name, str):
     raise TypeError(
@@ -770,6 +797,13 @@ def psyre_equations(
     owner_frame = owner_frame.f_back
   existing = active_builder.get()
   owns_builder = existing is None
+  if owns_builder:
+    sched = active_scheduler.get()
+    if sched is not None and sched.is_active_run():
+      raise RuntimeError(
+          'Re-entrant psyre_equations() inside an active Stage-2 run is not '
+          'allowed.'
+      )
   if not owns_builder:
     if semantics is not None and semantics != existing.semantics:
       raise ValueError(

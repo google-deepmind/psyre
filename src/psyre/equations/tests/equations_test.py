@@ -41,7 +41,7 @@ from psyre.common import (
     reset,
     scan,
 )
-from equations import (
+from psyre.equations import (
     CircularEquationError,
     Equations,
     Thunk,
@@ -424,7 +424,7 @@ class EquationsTest(absltest.TestCase):
     # Concurrent threads entering/exiting psyre_equations() alongside threads
     # defining plain classes must never raise or leak the hook.
     errors: list[BaseException] = []
-    barrier = threading.Barrier(4)
+    barrier = threading.Barrier(4, timeout=10.0)
 
     def equations_worker() -> None:
       try:
@@ -465,7 +465,8 @@ class EquationsTest(absltest.TestCase):
     for thread in threads:
       thread.start()
     for thread in threads:
-      thread.join()
+      thread.join(timeout=10.0)
+      self.assertFalse(thread.is_alive(), 'Worker thread timed out.')
 
     self.assertEmpty(errors)
     self.assertIs(builtins.__build_class__, orig_build_class)

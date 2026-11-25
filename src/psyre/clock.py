@@ -362,18 +362,82 @@ class ClockAnalysis:
     )
 
 
+class _ClockVar:
+  """Mutable union-find clock variable (`α`) for Colaço-Pouzet unification."""
+
+  __slots__ = ('link',)
+
+  def __init__(self):
+    self.link: '_ClockTerm | None' = None
+
+
+class _BaseTerm:
+  """Singleton representing the global base clock (`.`)."""
+
+  __slots__ = ()
+
+
+_BASE_TERM = _BaseTerm()
+_TRUE_SELECTOR = WhenSelector(is_boolean=True, negated=False)
+
+
+class _OnTerm:
+  """Lazy subclock refinement `base on (cond, selector)`."""
+
+  __slots__ = ('base', 'cond', 'selector', 'owner_id')
+
+  def __init__(
+      self,
+      base: '_ClockTerm',
+      cond: Stream,
+      selector: WhenSelector | None,
+      owner_id: int | None = None,
+  ):
+    self.base = base
+    self.cond = cond
+    self.selector = selector
+    self.owner_id = owner_id
+
+
+_ClockTerm = _BaseTerm | _ClockVar | _OnTerm
+_RootTerm = _BaseTerm | _ClockVar
+_Decomposed = tuple[_RootTerm, tuple[ClockStep, ...], tuple[_ClockTerm, ...]]
+
+
+def _dec_is_prefix(a: _Decomposed, b: _Decomposed) -> bool:
+  """Returns True when decomposed clock term `a` is a prefix of `b`."""
+  r1, s1, _ = a
+  r2, s2, _ = b
+  if r1 is _BASE_TERM and not s1:
+    # Every concrete clock is rooted at `.`, so `.` prefixes every clock term.
+    return True
+  return r1 is r2 and len(s1) <= len(s2) and s2[: len(s1)] == s1
+
+
+def _dec_is_equal(a: _Decomposed, b: _Decomposed) -> bool:
+  """Returns True when decomposed clock terms `a` and `b` are equal."""
+  return a[0] is b[0] and a[1] == b[1]
+
+
 class _ClockAnalyzer:
-  """Infers and validates Lustre-style syntactic stream clocks."""
+  """Infers and validates Lustre-style clocks via Colaço-Pouzet unification."""
 
   def __init__(self, graph: Graph):
     self._graph = graph
-    self._ext_clocks: dict[int, Clock] = {}
+    self._all_vars: list[_ClockVar] = []
+    self._node_terms: dict[int, _ClockTerm] = {}
+    self._stream_terms: dict[int, _ClockTerm] = {}
     self._node_clocks: dict[int, Clock] = {}
     self._stream_clocks: dict[int, Clock] = {}
     self._port_clocks: dict[tuple[int, int], Clock] = {}
     self._reset_clocks: dict[tuple[int, int], Clock] = {}
     self._arm_prefix_clocks: dict[int, tuple[Clock, ...]] = {}
     self._selector_labels: dict[int, str] = self._compute_selector_labels()
+
+  def _fresh_var(self) -> _ClockVar:
+    var = _ClockVar()
+    self._all_vars.append(var)
+    return var
 
   def _compute_selector_labels(self) -> dict[int, str]:
     """Computes human-readable selector labels from explicit stream names."""
@@ -394,53 +458,431 @@ class _ClockAnalyzer:
     """Returns the disambiguated human-readable label for stream."""
     return self._selector_labels.get(stream.id, f'S_{stream.id}')
 
+  def _find(self, term: _ClockTerm) -> _ClockTerm:
+    """Follows union-find links with path compression."""
+    if isinstance(term, _ClockVar) and term.link is not None:
+      root = self._find(term.link)
+      term.link = root
+      return root
+    return term
+
+  def _resolve_step(
+      self,
+      base_dec: _Decomposed,
+      cond_s: Stream,
+      selector: WhenSelector | None,
+      owner_id: int | None,
+      resolving: frozenset[int],
+  ) -> ClockStep | None:
+    """Canonicalizes `(cond_s, selector)` on `base_dec`, or None if trivial."""
+    inner_resolving = (
+        resolving | {owner_id} if owner_id is not None else resolving
+    )
+
+    def can_unwrap_when(prod: Node) -> bool:
+      if prod.id in inner_resolving:
+        return False
+      curr_term = self._stream_terms.get(prod.output.id)
+      if curr_term is None:
+        return False
+      payload = prod.inputs[1]
+      if (
+          self._graph.is_polymorphic_static(payload)
+          and not payload.is_one_periodic
+      ):
+        return False
+      curr_dec = self._decompose(curr_term, inner_resolving | {prod.id})
+      return _dec_is_prefix(curr_dec, base_dec)
+
+    def can_unwrap_node(prod: Node) -> bool:
+      if prod.id in inner_resolving:
+        return False
+      prod_term = self._node_terms.get(prod.id)
+      if prod_term is None:
+        return False
+      prod_dec = self._decompose(prod_term, inner_resolving | {prod.id})
+      return _dec_is_prefix(prod_dec, base_dec)
+
+    def can_unwrap_poly(sel_s: Stream, prod: Node) -> bool:
+      # A non-1-periodic polymorphic static stream on a strict ancestor clock
+      # `prod_clk < base` advances on `prod_clk`'s ticks, *not* on `base`'s
+      # ticks; collapsing across `prod` onto `sel_s` would lose that rate.
+      if (
+          not self._graph.is_polymorphic_static(sel_s)
+          or sel_s.is_one_periodic
+      ):
+        return True
+      if prod.id in inner_resolving:
+        return False
+      prod_term = self._node_terms.get(prod.id)
+      if prod_term is None:
+        return False
+      prod_dec = self._decompose(prod_term, inner_resolving | {prod.id})
+      return _dec_is_equal(prod_dec, base_dec)
+
+    resolved = self._graph.resolve_clock_selector_step(
+        cond_s,
+        selector,
+        can_unwrap_when=can_unwrap_when,
+        can_unwrap_node=can_unwrap_node,
+        can_unwrap_poly=can_unwrap_poly,
+    )
+    if resolved is None:
+      return None
+    sel_stream, norm, is_const_false = resolved
+    if is_tautological_selector(norm):
+      return None
+    label: str | None = None
+    if is_const_false:
+      cur_label = self._label(sel_stream)
+      if cur_label == f'S_{sel_stream.id}':
+        label = repr(self._graph.const_bool(sel_stream))
+    is_bool, vals, neg = norm
+    return ClockStep(
+        sel_stream,
+        vals,
+        negated=neg,
+        is_boolean=is_bool,
+        selector_label=self._label(sel_stream) if label is None else label,
+    )
+
+  def _decompose(
+      self,
+      term: _ClockTerm,
+      resolving: frozenset[int] = frozenset(),
+  ) -> _Decomposed:
+    """Reduces `term` lazily to `(root, steps, prefix_terms)`."""
+    t = self._find(term)
+    if isinstance(t, (_BaseTerm, _ClockVar)):
+      return (t, (), (t,))
+    base_dec = self._decompose(t.base, resolving)
+    step = self._resolve_step(
+        base_dec, t.cond, t.selector, t.owner_id, resolving
+    )
+    if step is None:
+      return base_dec
+    root, steps, prefixes = base_dec
+    return (root, steps + (step,), prefixes + (t,))
+
+  def _materialize(self, term: _ClockTerm) -> Clock:
+    """Converts a grounded `_ClockTerm` into a concrete `Clock`."""
+    _, steps, _ = self._decompose(term)
+    return Clock(steps=steps)
+
+  def _raise_mismatch(
+      self,
+      s1: tuple[ClockStep, ...],
+      s2: tuple[ClockStep, ...],
+      node: Node,
+      mismatch: tuple[str, Stream] | None,
+  ) -> None:
+    """Raises a descriptive `ClockError` for incompatible clock step chains."""
+    c1, c2 = Clock(steps=s1), Clock(steps=s2)
+    if mismatch is not None:
+      desc, stream = mismatch
+      raise ClockError(
+          f'{desc} {self._label(stream)} has clock {c1}, expected {c2}.',
+          node=node,
+      )
+    if not node.arms or c1.is_prefix_of(c2) or c2.is_prefix_of(c1):
+      suffix = ''
+    else:
+      suffix = ' (incompatible with enclosing activity clock)'
+    raise ClockError(
+        f'incompatible input clocks {c1} vs {c2}{suffix}.',
+        node=node,
+    )
+
+  def _unify(
+      self,
+      t1: _ClockTerm,
+      t2: _ClockTerm,
+      *,
+      node: Node,
+      mismatch: tuple[str, Stream] | None = None,
+      is_output: bool = False,
+  ) -> None:
+    """Unifies two `_ClockTerm`s with lazy step reduction and occurs check."""
+    r1, s1, p1 = self._decompose(t1)
+    r2, s2, p2 = self._decompose(t2)
+    m, n = len(s1), len(s2)
+    while m > 0 and n > 0:
+      if s1[m - 1] != s2[n - 1]:
+        self._raise_mismatch(s1, s2, node, mismatch)
+      m -= 1
+      n -= 1
+    if m == 0 and n == 0:
+      if r1 is r2:
+        return
+      if isinstance(r1, _ClockVar):
+        r1.link = r2
+      elif isinstance(r2, _ClockVar):
+        r2.link = r1
+      return
+    root, target = (r1, p2[n]) if m == 0 else (r2, p1[m])
+    if r1 is r2:
+      if is_output or node.is_primitive('fby', 'pre'):
+        raise ClockError(
+            'cyclic clock dependency did not converge.', node=node
+        )
+      self._raise_mismatch(s1, s2, node, mismatch)
+    if isinstance(root, _ClockVar):
+      root.link = target
+      return
+    self._raise_mismatch(s1, s2, node, mismatch)
+
+  def _trace_arms_terms(
+      self, arms: Sequence[ArmScope]
+  ) -> tuple[_ClockTerm, tuple[_ClockTerm, ...]]:
+    """Computes symbolic subclock and per-arm selector evaluation terms."""
+    term: _ClockTerm = _BASE_TERM
+    prefixes: list[_ClockTerm] = []
+    for scope in arms:
+      cond_s = self._graph.resolve_stream(scope.cond)
+      if not self._graph.is_polymorphic_static(cond_s):
+        cond_term = self._stream_terms[cond_s.id]
+        if _dec_is_prefix(self._decompose(term), self._decompose(cond_term)):
+          term = cond_term
+      prefixes.append(term)
+      term = _OnTerm(term, cond_s, scope.selector)
+    return term, tuple(prefixes)
+
+  def _has_arm_scope(self, node: Node) -> bool:
+    """True when `node`'s default clock inherits enclosing `ArmScope`s."""
+    # Zero-input stateless nodes (e.g. `random_stream()`) have no input carrying
+    # `Absent`, so they stay on `BASE_CLOCK` and are sampled by `when` later.
+    return bool(node.arms and (node.is_stateful or node.inputs))
+
+  def _default_node_term(self, node: Node) -> _ClockTerm:
+    """Computes default scope clock term from enclosing `arms` / `resets`."""
+    arms_term = (
+        self._trace_arms_terms(node.arms)[0]
+        if self._has_arm_scope(node)
+        else None
+    )
+    if node.inherits_reset_clock() and node.resets:
+      reset_items: list[tuple[_ClockTerm, _Decomposed]] = []
+      arms_dec = (
+          self._decompose(arms_term) if arms_term is not None else None
+      )
+      for r in node.resets:
+        if self._graph.is_polymorphic_static(r):
+          continue
+        r_term = self._stream_terms[r.id]
+        r_dec = self._decompose(r_term)
+        if arms_dec is None or _dec_is_prefix(arms_dec, r_dec):
+          reset_items.append((r_term, r_dec))
+      if reset_items:
+        return max(
+            reset_items,
+            key=lambda item: (
+                len(item[1][1]),
+                isinstance(item[1][0], _ClockVar),
+            ),
+        )[0]
+    if arms_term is not None:
+      return arms_term
+    return _BASE_TERM
+
+  def _has_free_scope_var(self, node: Node) -> bool:
+    """True if `node`'s scope default depends on an unresolved `_ClockVar`."""
+    streams: list[Stream] = []
+    if node.inherits_reset_clock():
+      streams.extend(node.resets)
+    if len(node.arms) > 1:
+      streams.extend(
+          self._graph.resolve_stream(scope.cond) for scope in node.arms[1:]
+      )
+    return any(
+        not self._graph.is_polymorphic_static(s)
+        and isinstance(self._decompose(self._stream_terms[s.id])[0], _ClockVar)
+        for s in streams
+    )
+
+  def _subclock_port_terms(
+      self, node: Node, node_term: _ClockTerm
+  ) -> list[tuple[int, Stream, _ClockTerm, str]]:
+    """Returns `(port_idx, stream, expected_term, desc)` for subclock ports."""
+    if node.is_primitive('merge'):
+      s_stream = node.inputs[0]
+      lookup: MergeSelector = node.kwargs['lookup']
+      return [
+          (
+              1 + idx,
+              arm_stream,
+              _OnTerm(node_term, s_stream, lookup.arm_selector(idx)),
+              f'merge arm {idx}',
+          )
+          for idx, arm_stream in enumerate(node.inputs[1:])
+      ]
+    if node.is_primitive('buffer'):
+      return [(
+          0,
+          node.inputs[0],
+          _OnTerm(node_term, node.inputs[1], _TRUE_SELECTOR),
+          'buffer input',
+      )]
+    return []
+
   def run(self) -> ClockAnalysis:
     """Computes node and stream clocks across the finalized Graph."""
     order = causal_node_order(self._graph)
-    pinned_ext = {
-        s.id: BASE_CLOCK
-        for s in self._graph.streams
-        if self._graph.producer(s) is None
-        and self._graph.is_base_clock_pinned(s)
-    }
-    # Iterate to fixed point so delayed `fby`/`pre` feedback cycles propagate
-    # clocks along every acyclic chain plus one settling pass for indicator
-    # merges/`~` selectors (`len(order) + 3` upper bound). Reset `_ext_clocks`
-    # from `pinned_ext` each sweep so stale speculative bindings cannot persist.
-    last_changed: Node | None = None
-    for _ in range(len(order) + 3):
-      prev_ext = dict(self._ext_clocks)
-      self._ext_clocks = dict(pinned_ext)
-      changed = False
-      for node in order:
-        node_clk, out_clk = self._infer_node_clocks(node)
-        if (
-            self._node_clocks.get(node.id) != node_clk
-            or self._stream_clocks.get(node.output.id) != out_clk
-        ):
-          self._node_clocks[node.id] = node_clk
-          self._stream_clocks[node.output.id] = out_clk
-          last_changed = node
-          changed = True
-      if not changed and self._ext_clocks == prev_ext:
-        break
-    else:
-      raise ClockError(
-          'cyclic clock dependency did not converge.',
-          node=last_changed,
+    causal_pos = {node.id: idx for idx, node in enumerate(order)}
+
+    # Phase 0 (Elaboration): polymorphic static streams have no shared var
+    # (each use instantiates a fresh variable), base-pinned streams get
+    # `_BASE_TERM`, unbound dynamic `Stream()`s get a shared `_ClockVar`, and
+    # every node gets a `_ClockVar` (plus an output var for clock-changing ops).
+    for stream in self._graph.streams:
+      if self._graph.producer(stream) is None:
+        if self._graph.is_polymorphic_static(stream):
+          continue
+        self._stream_terms[stream.id] = (
+            _BASE_TERM
+            if self._graph.is_base_clock_pinned(stream)
+            else self._fresh_var()
+        )
+    for node in order:
+      node_var = self._fresh_var()
+      self._node_terms[node.id] = node_var
+      self._stream_terms[node.output.id] = (
+          self._fresh_var()
+          if node.is_primitive('when', 'whennot', 'buffer')
+          else node_var
       )
 
+    # Phase 1a: unify `rate_inputs()`, clock-changing outputs, and un-scoped
+    # input-free nodes (anchored to `_BASE_TERM`).
+    scoped_defaults: list[Node] = []
+    for node in order:
+      node_term = self._node_terms[node.id]
+      dyn_ins = [
+          s
+          for s in node.rate_inputs()
+          if not self._graph.is_polymorphic_static(s)
+      ]
+      for s in dyn_ins:
+        self._unify(node_term, self._stream_terms[s.id], node=node)
+      if not dyn_ins:
+        has_dyn_resets = node.inherits_reset_clock() and any(
+            not self._graph.is_polymorphic_static(r) for r in node.resets
+        )
+        if self._has_arm_scope(node) or has_dyn_resets:
+          scoped_defaults.append(node)
+        else:
+          self._unify(node_term, _BASE_TERM, node=node)
+      if node.is_primitive('when', 'whennot'):
+        sel = (
+            WhenSelector(is_boolean=True, negated=True)
+            if node.op == 'whennot'
+            else node.kwargs.get('selector')
+        )
+        self._unify(
+            self._stream_terms[node.output.id],
+            _OnTerm(node_term, node.inputs[0], sel, owner_id=node.id),
+            node=node,
+            is_output=True,
+        )
+      elif node.is_primitive('buffer'):
+        self._unify(
+            self._stream_terms[node.output.id],
+            _OnTerm(
+                node_term, node.inputs[2], _TRUE_SELECTOR, owner_id=node.id
+            ),
+            node=node,
+            is_output=True,
+        )
+
+    # Phase 1b: anchor input-free scoped nodes whose scope terms are already
+    # determined (ordered by arm nesting depth, then causal order).
+    scoped_defaults.sort(key=lambda n: (len(n.arms), causal_pos[n.id]))
+    deferred_scoped: list[Node] = []
+    for node in scoped_defaults:
+      if self._has_free_scope_var(node):
+        deferred_scoped.append(node)
+      else:
+        self._unify(
+            self._node_terms[node.id],
+            self._default_node_term(node),
+            node=node,
+        )
+
+    # Phase 1c: unify subclocked input ports (`merge` arms, `buffer` input 0).
+    for node in order:
+      node_term = self._node_terms[node.id]
+      for _, port_stream, expected_term, desc in self._subclock_port_terms(
+          node, node_term
+      ):
+        if not self._graph.is_polymorphic_static(port_stream):
+          self._unify(
+              self._stream_terms[port_stream.id],
+              expected_term,
+              node=node,
+              mismatch=(desc, port_stream),
+          )
+
+    # Phase 1d: anchor input-free scoped nodes whose dynamic resets/nested arms
+    # depended on constraints resolved in Phase 1c.
+    for node in deferred_scoped:
+      self._unify(
+          self._node_terms[node.id],
+          self._default_node_term(node),
+          node=node,
+      )
+
+    # Phase 2 (Grounding): default any still-free clock variables to their
+    # enclosing scope default, deepest `current` consumer, or `_BASE_TERM`.
+    scoped_nodes = [
+        n
+        for n in order
+        if self._has_arm_scope(n) or (n.inherits_reset_clock() and n.resets)
+    ]
+    scoped_nodes.sort(key=lambda n: (len(n.arms), causal_pos[n.id]))
+    for node in scoped_nodes:
+      if isinstance(self._find(self._node_terms[node.id]), _ClockVar):
+        default_term = self._default_node_term(node)
+        default_root, default_steps, _ = self._decompose(default_term)
+        if default_root is not _BASE_TERM or default_steps:
+          self._unify(self._node_terms[node.id], default_term, node=node)
+    current_nodes = [
+        n
+        for n in order
+        if n.is_primitive('current')
+        and len(n.inputs) >= 2
+        and not self._graph.is_polymorphic_static(n.inputs[1])
+    ]
+    current_nodes.sort(
+        key=lambda n: len(self._decompose(self._node_terms[n.id])[1]),
+        reverse=True,
+    )
+    for node in current_nodes:
+      node_term = self._node_terms[node.id]
+      i_root = self._decompose(self._stream_terms[node.inputs[1].id])[0]
+      n_root = self._decompose(node_term)[0]
+      if isinstance(i_root, _ClockVar) and i_root is not n_root:
+        self._unify(i_root, node_term, node=node)
+    for var in self._all_vars:
+      root = self._find(var)
+      if isinstance(root, _ClockVar):
+        root.link = _BASE_TERM
+
+    # Phase 3 (Materialization & Validation): convert grounded terms into
+    # concrete `Clock`s and validate prefix/reset/scope constraints.
     poly_idx = 0
     for stream in self._graph.streams:
       if self._graph.producer(stream) is None:
         if self._graph.is_polymorphic_static(stream):
           self._stream_clocks[stream.id] = Clock.polymorphic(poly_idx)
           poly_idx += 1
-        elif stream.id in self._ext_clocks:
-          self._stream_clocks[stream.id] = self._ext_clocks[stream.id]
         else:
-          self._stream_clocks[stream.id] = BASE_CLOCK
-
+          self._stream_clocks[stream.id] = self._materialize(
+              self._stream_terms[stream.id]
+          )
+    for node in order:
+      self._node_clocks[node.id] = self._materialize(self._node_terms[node.id])
+      self._stream_clocks[node.output.id] = self._materialize(
+          self._stream_terms[node.output.id]
+      )
     for node in order:
       self._validate_node_clocks(node)
     return ClockAnalysis(
@@ -452,362 +894,36 @@ class _ClockAnalyzer:
         arm_prefix_clocks=self._arm_prefix_clocks,
     )
 
-  def _append_norm_step(
-      self,
-      base: Clock,
-      selector: Stream,
-      norm: tuple[bool, frozenset[TagKey], bool],
-      *,
-      label: str | None = None,
-  ) -> Clock:
-    """Appends a canonical ClockStep to base (or returns base if trivial)."""
-    if is_tautological_selector(norm):
-      return base
-    is_bool, vals, neg = norm
-    return base.on(
-        ClockStep(
-            selector,
-            vals,
-            negated=neg,
-            is_boolean=is_bool,
-            selector_label=self._label(selector) if label is None else label,
-        )
-    )
-
-  def _bool_step(
-      self,
-      base: Clock,
-      stream: Stream,
-      truth: bool,
-      *,
-      label: str | None = None,
-  ) -> Clock:
-    """Appends a boolean `on` / `on not` ClockStep onto `base`."""
-    return self._append_norm_step(
-        base, stream, (True, frozenset({(True, truth)}), False), label=label
-    )
-
-  def _unwrap_sampled_selector(self, stream: Stream, base: Clock) -> Stream:
-    """Unwraps `when`/`whennot` nodes sampling a parent selector onto base."""
-
-    def can_unwrap(prod: Node) -> bool:
-      curr_clk = self._stream_clocks.get(prod.output.id)
-      payload = prod.inputs[1]
-      return (
-          curr_clk is not None
-          and curr_clk.is_prefix_of(base)
-          and (
-              not self._graph.is_polymorphic_static(payload)
-              or payload.is_one_periodic
-          )
+  def _validate_node_clocks(self, node: Node) -> None:
+    """Validates all instantaneous, subclock, current, and reset clocks."""
+    if node.arms:
+      _, prefix_terms = self._trace_arms_terms(node.arms)
+      self._arm_prefix_clocks[node.id] = tuple(
+          self._materialize(t) for t in prefix_terms
       )
-
-    return self._graph.unwrap_when(stream, can_unwrap=can_unwrap)
-
-  def _can_unwrap_poly_selector(
-      self, selector: Stream, prod_clk: Clock | None, base: Clock
-  ) -> bool:
-    """Returns True when substituting `selector` on `base` preserves rate."""
-    # A non-1-periodic polymorphic static stream on a strict ancestor clock
-    # `prod_clk < base` advances on `prod_clk`'s ticks, *not* on `base`'s
-    # ticks; collapsing across `prod` onto `selector` would lose the
-    # intermediate sampling rate.
-    return (
-        prod_clk == base
-        or not self._graph.is_polymorphic_static(selector)
-        or selector.is_one_periodic
-    )
-
-  def _indicator_merge_step(
-      self, base: Clock, prod: Node, expected: bool, seen: set[int]
-  ) -> Clock | None:
-    """Collapses a boolean-constant indicator `merge` into one `ClockStep`."""
-    # Matches Lustre/Heptagon `match` outputs whose arms are all 1-periodic
-    # truthy/falsy constants (e.g., `merge(s, {A: True, B: False})`), folding
-    # `on flag` back to the equivalent predicate directly on `s`.
-    lookup = prod.kwargs.get('lookup')
-    if not isinstance(lookup, MergeSelector):
-      return None
-    arm_bools: list[bool] = []
-    for arm_stream in prod.inputs[1:]:
-      val = self._graph.const_bool(arm_stream)
-      if val is None:
-        return None
-      arm_bools.append(val)
-    prod_clk = self._node_clocks.get(prod.id)
-    sel_stream = self._unwrap_sampled_selector(prod.inputs[0], base)
-    if lookup.is_boolean:
-      if arm_bools[0] == arm_bools[1]:
-        if arm_bools[0] == expected:
-          return base
-        return self._bool_step(base, prod.output, expected)
-      if not self._can_unwrap_poly_selector(sel_stream, prod_clk, base):
-        return None
-      return self._refine_clock(
-          base, sel_stream, arm_bools[0] == expected, seen=seen
-      )
-    default_idx = lookup.default_index
-    negated = (
-        default_idx is not None and arm_bools[default_idx] == expected
-    )
-    tags = frozenset(
-        key
-        for key, idx in lookup.arms.items()
-        if (arm_bools[idx] == expected) != negated
-    )
-    if not negated and not tags:
-      return self._bool_step(base, prod.output, expected)
-    norm = self._graph.normalize_when_selector(
-        sel_stream,
-        WhenSelector(is_boolean=False, values=tags, negated=negated),
-    )
-    if is_tautological_selector(norm):
-      return base
-    if not self._can_unwrap_poly_selector(sel_stream, prod_clk, base):
-      return None
-    return self._append_norm_step(base, sel_stream, norm)
-
-  def _refine_clock(
-      self,
-      base: Clock,
-      cond: Stream,
-      truth: bool,
-      *,
-      seen: set[int] | None = None,
-  ) -> Clock:
-    """Refines base by sampling when cond evaluates to truth."""
-    active_seen = set() if seen is None else seen
-    curr = cond
-    expected = truth
-    while curr.id not in active_seen:
-      active_seen.add(curr.id)
-      unwrapped = self._unwrap_sampled_selector(curr, base)
-      if unwrapped is not curr:
-        curr = unwrapped
-        if curr.id in active_seen:
-          break
-        active_seen.add(curr.id)
-      const_bool = self._graph.const_bool(curr)
-      if const_bool is not None:
-        if const_bool == expected:
-          return base
-        label = self._label(curr)
-        if label == f'S_{curr.id}':
-          label = repr(const_bool)
-        return self._bool_step(base, curr, expected, label=label)
-      prod = self._graph.producer(curr)
-      if prod is None:
-        break
-      prod_clk = self._node_clocks.get(prod.id)
-      if (
-          prod.is_stream_op('__invert__')
-          and len(prod.inputs) == 1
-          and prod_clk is not None
-          and prod_clk.is_prefix_of(base)
-          and self._graph.is_bool_stream(prod.inputs[0])
-          and self._can_unwrap_poly_selector(prod.inputs[0], prod_clk, base)
-      ):
-        curr = prod.inputs[0]
-        expected = not expected
-        continue
-      if (
-          prod.is_primitive('merge')
-          and prod_clk is not None
-          and prod_clk.is_prefix_of(base)
-      ):
-        indicator = self._indicator_merge_step(
-            base, prod, expected, active_seen
-        )
-        if indicator is not None:
-          return indicator
-      break
-    return self._bool_step(base, curr, expected)
-
-  def _refine_by_selector(
-      self, base: Clock, cond_s: Stream, selector: WhenSelector | None
-  ) -> Clock:
-    """Refines base using a WhenSelector (or plain boolean when if None)."""
-    if selector is None or selector.is_boolean:
-      truth = True if selector is None else not selector.negated
-      return self._refine_clock(base, cond_s, truth)
-    sel_s = self._unwrap_sampled_selector(cond_s, base)
-    norm = self._graph.normalize_when_selector(sel_s, selector)
-    is_bool, vals, _ = norm
-    if is_bool and len(vals) == 1:
-      ((_, truth),) = tuple(vals)
-      return self._refine_clock(base, cond_s, truth)
-    if self._graph.is_always_active_when(sel_s, selector, norm=norm):
-      return base
-    return self._append_norm_step(base, sel_s, norm)
-
-  def _trace_arms_clock(
-      self, arms: Sequence[ArmScope]
-  ) -> tuple[Clock, tuple[Clock, ...]]:
-    """Computes final subclock and per-arm selector evaluation clocks."""
-    clk = BASE_CLOCK
-    prefixes: list[Clock] = []
-    for scope in arms:
-      cond_s = self._graph.resolve_stream(scope.cond)
-      if not self._graph.is_polymorphic_static(cond_s):
-        cond_clk = self._bind_or_lookup_stream_clock(cond_s, BASE_CLOCK)
-        if clk.is_prefix_of(cond_clk):
-          clk = cond_clk
-      prefixes.append(clk)
-      clk = self._refine_by_selector(clk, cond_s, scope.selector)
-    return clk, tuple(prefixes)
-
-  def _arms_clock(self, arms: Sequence[ArmScope]) -> Clock:
-    """Computes the nested subclock implied by Stage-1 ArmScopes."""
-    return self._trace_arms_clock(arms)[0]
-
-  def _bind_or_lookup_stream_clock(
-      self, stream: Stream, default_ext_clk: Clock = BASE_CLOCK
-  ) -> Clock:
-    """Returns concrete stream's clock (dynamic/external/base-pinned)."""
-    if self._graph.producer(stream) is None:
-      return self._ext_clocks.setdefault(stream.id, default_ext_clk)
-    return self._stream_clocks.get(stream.id, BASE_CLOCK)
-
-  def _default_node_clock(self, node: Node) -> Clock:
-    """Computes fallback clock when inputs are all polymorphic or absent."""
-    # Zero-input stateless nodes (e.g. `random_stream()`) have no input carrying
-    # `Absent`, so they stay on `BASE_CLOCK` and are sampled by `when` later.
-    arms_clk = (
-        self._arms_clock(node.arms)
-        if node.arms and (node.is_stateful or node.inputs)
-        else None
-    )
-    if node.inherits_reset_clock() and node.resets:
-      reset_clks = [
-          self._bind_or_lookup_stream_clock(r, BASE_CLOCK)
-          for r in node.resets
-          if not self._graph.is_polymorphic_static(r)
-      ]
-      if arms_clk is not None:
-        reset_clks = [c for c in reset_clks if arms_clk.is_prefix_of(c)]
-      if reset_clks:
-        return max(reset_clks, key=len)
-    if arms_clk is not None:
-      return arms_clk
-    return BASE_CLOCK
-
-  def _unify_inputs(
-      self,
-      streams: Sequence[Stream],
-      node: Node,
-      *,
-      validate: bool = False,
-  ) -> Clock:
-    """Unifies concrete clocks of streams and returns the agreed Clock."""
-    agreed: Clock | None = None
-    unbound_ext: list[Stream] = []
-    for stream in streams:
+    node_clk = self._node_clocks[node.id]
+    for stream in node.rate_inputs():
       if self._graph.is_polymorphic_static(stream):
         continue
-      if self._graph.producer(stream) is not None:
-        if stream.id not in self._stream_clocks:
-          continue
-        eff_clk = self._stream_clocks[stream.id]
-      elif stream.id in self._ext_clocks:
-        eff_clk = self._ext_clocks[stream.id]
-      else:
-        unbound_ext.append(stream)
-        continue
-      if agreed is None:
-        agreed = eff_clk
-      elif agreed != eff_clk:
-        if validate:
-          if (
-              not node.arms
-              or agreed.is_prefix_of(eff_clk)
-              or eff_clk.is_prefix_of(agreed)
-          ):
-            suffix = ''
-          else:
-            suffix = ' (incompatible with enclosing activity clock)'
-          raise ClockError(
-              f'incompatible input clocks {agreed} vs {eff_clk}{suffix}.',
-              node=node,
-          )
-        elif agreed.is_prefix_of(eff_clk):
-          agreed = eff_clk
-    if agreed is None:
-      agreed = self._default_node_clock(node)
-    for stream in unbound_ext:
-      self._ext_clocks[stream.id] = agreed
-    return agreed
-
-  def _subclock_ports(
-      self, node: Node, node_clk: Clock
-  ) -> list[tuple[int, Stream, Clock, str]]:
-    """Returns `(port_idx, stream, expected_clk, desc)` for subclocked ports."""
-    if node.is_primitive('merge'):
-      s_stream = node.inputs[0]
-      lookup: MergeSelector = node.kwargs['lookup']
-      return [
-          (
-              1 + idx,
-              arm_stream,
-              self._refine_by_selector(
-                  node_clk, s_stream, lookup.arm_selector(idx)
-              ),
-              f'merge arm {idx}',
-          )
-          for idx, arm_stream in enumerate(node.inputs[1:])
-      ]
-    if node.is_primitive('buffer'):
-      return [(
-          0,
-          node.inputs[0],
-          self._refine_clock(node_clk, node.inputs[1], True),
-          'buffer input',
-      )]
-    return []
-
-  def _infer_node_clocks(self, node: Node) -> tuple[Clock, Clock]:
-    """Returns `(node_execution_clock, output_stream_clock)` for `node`."""
-    node_clk = self._unify_inputs(node.rate_inputs(), node)
-    if node.is_primitive('when', 'whennot'):
-      sel = (
-          WhenSelector(is_boolean=True, negated=True)
-          if node.op == 'whennot'
-          else node.kwargs.get('selector')
-      )
-      return node_clk, self._refine_by_selector(node_clk, node.inputs[0], sel)
-    for _, port_stream, expected_clk, _ in self._subclock_ports(node, node_clk):
-      if not self._graph.is_polymorphic_static(port_stream):
-        self._bind_or_lookup_stream_clock(port_stream, expected_clk)
-    if node.is_primitive('current') and len(node.inputs) >= 2:
-      i_stream = node.inputs[1]
-      if not self._graph.is_polymorphic_static(i_stream):
-        self._bind_or_lookup_stream_clock(i_stream, node_clk)
-    if node.is_primitive('buffer'):
-      return node_clk, self._refine_clock(node_clk, node.inputs[2], True)
-    return node_clk, node_clk
-
-  def _validate_node_clocks(self, node: Node) -> None:
-    """Validates all instantaneous, subclock, delayed, and reset clocks."""
-    if node.arms:
-      self._arm_prefix_clocks[node.id] = self._trace_arms_clock(node.arms)[1]
-    self._unify_inputs(node.rate_inputs(), node, validate=True)
-    node_clk = self._node_clocks[node.id]
-    for port_idx, port_stream, expected_clk, desc in self._subclock_ports(
-        node, node_clk
+      eff_clk = self._stream_clocks[stream.id]
+      if eff_clk != node_clk:
+        self._raise_mismatch(node_clk.steps, eff_clk.steps, node, None)
+    for port_idx, port_stream, expected_term, desc in self._subclock_port_terms(
+        node, self._node_terms[node.id]
     ):
+      expected_clk = self._materialize(expected_term)
       if expected_clk != node_clk:
         self._port_clocks[(node.id, port_idx)] = expected_clk
       if not self._graph.is_polymorphic_static(port_stream):
-        eff_clk = self._bind_or_lookup_stream_clock(port_stream, expected_clk)
+        eff_clk = self._stream_clocks[port_stream.id]
         if eff_clk != expected_clk:
-          raise ClockError(
-              f'{desc} {self._label(port_stream)} has clock '
-              f'{eff_clk}, expected {expected_clk}.',
-              node=node,
+          self._raise_mismatch(
+              eff_clk.steps, expected_clk.steps, node, (desc, port_stream)
           )
     if node.is_primitive('current') and len(node.inputs) >= 2:
       i_stream = node.inputs[1]
       if not self._graph.is_polymorphic_static(i_stream):
-        i_clk = self._bind_or_lookup_stream_clock(i_stream, node_clk)
+        i_clk = self._stream_clocks[i_stream.id]
         if not node_clk.is_prefix_of(i_clk):
           raise ClockError(
               f'current input {self._label(i_stream)} has clock {i_clk}, '
@@ -824,9 +940,13 @@ class _ClockAnalyzer:
     for r_idx, r_stream in enumerate(node.resets):
       if self._graph.is_polymorphic_static(r_stream):
         r_arms = node.arms_at_reset(r_idx)
-        r_clk = self._arms_clock(r_arms) if r_arms else BASE_CLOCK
+        r_clk = (
+            self._materialize(self._trace_arms_terms(r_arms)[0])
+            if r_arms
+            else BASE_CLOCK
+        )
       else:
-        r_clk = self._bind_or_lookup_stream_clock(r_stream)
+        r_clk = self._stream_clocks[r_stream.id]
       if not r_clk.is_prefix_of(node_clk):
         raise ClockError(
             f'reset stream {self._label(r_stream)} on clock {r_clk} is '

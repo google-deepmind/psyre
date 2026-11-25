@@ -35,7 +35,7 @@ from psyre.common import (
     when,
     whennot,
 )
-from equations import psyre_equations
+from psyre.equations import psyre_equations
 from psyre.match import case, match
 from psyre.stream import Stream
 from tests import pervasives_test

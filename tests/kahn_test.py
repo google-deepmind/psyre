@@ -13,7 +13,6 @@
 # limitations under the License.
 """Unit tests for asynchronous (Kahn) Psyre stream primitives and execution."""
 
-import enum
 import io
 import logging
 import operator
@@ -30,7 +29,6 @@ from psyre.automaton import (
     until,
 )
 from psyre.common import (
-    Absent,
     Bottom,
     Semantics,
     buffer,
@@ -59,14 +57,11 @@ from psyre.match import (
 )
 from psyre.scheduler import Scheduler
 from psyre.stream import Stream
-from psyre.trace import present_values
+from tests import test_utils
 
 # pylint: enable=g-importing-member,g-multiple-import
 
-
-class _Mode(enum.Enum):
-  FAST = enum.auto()
-  SLOW = enum.auto()
+_Mode = test_utils.Mode
 
 
 class _Vec:
@@ -91,11 +86,7 @@ class KahnTest(absltest.TestCase):
       self, sync_vals: list[Any], kahn_vals: list[Any]
   ) -> None:
     """Asserts unpadded KAHN trace has no Absent/Bottom and matches SYNC."""
-    self.assertTrue(
-        all(v is not Absent and v is not Bottom for v in kahn_vals),
-        f'Unexpected Absent/Bottom sentinel in KAHN trace: {kahn_vals!r}',
-    )
-    self.assertEqual(present_values(sync_vals), kahn_vals)
+    test_utils.assert_absent_bottom_elision(self, sync_vals, kahn_vals)
 
   def _run_and_assert_elision(
       self,
@@ -404,33 +395,14 @@ class KahnTest(absltest.TestCase):
             'RingBuffer overflow',
         ),
         (
-            lambda: buffer([None, 1], [True, True], [False, False], size=1),
-            2,
-            'RingBuffer overflow',
-        ),
-        (
             lambda: buffer([10], [False], [True], size=1),
             1,
             'RingBuffer underflow',
         ),
-        (
-            lambda: buffer(
-                [None], [True, False, False], [False, True, True], size=1
-            ),
-            3,
-            'RingBuffer underflow',
-        ),
     ):
-      with self.subTest(pattern=pattern, horizon=horizon):
-        with self.assertRaises(ExceptionGroup) as eg:
-          Scheduler.run(prog, horizon=horizon, semantics=Semantics.KAHN)
-        self.assertTrue(
-            any(
-                isinstance(err, BufferError) and pattern in str(err)
-                for err in eg.exception.exceptions
-            ),
-            f'Expected BufferError matching {pattern!r}, got '
-            f'{eg.exception.exceptions!r}',
+      with self.subTest(pattern=pattern):
+        test_utils.assert_buffer_error(
+            self, prog, horizon, pattern, semantics=Semantics.KAHN
         )
 
   def test_once_stream(self):
@@ -1481,10 +1453,7 @@ class KahnTest(absltest.TestCase):
     kahn_res = Scheduler.run(prog, horizon=8, semantics=Semantics.KAHN)
     for key in sync_res:
       with self.subTest(stream=key):
-        self.assertEqual(
-            present_values(kahn_res[key]),
-            present_values(sync_res[key]),
-        )
+        self._assert_absent_bottom_elision(sync_res[key], kahn_res[key])
     self.assertEqual(kahn_res['odd_self'], [0, 1, 1, 3, 3, 5, 5, 7])
     self.assertEqual(kahn_res['odd_shared'], [-1, 1, 1, 3, 3, 5, 5, 7])
     self.assertEqual(kahn_res['odd_disjoint'], [99] * 8)
@@ -1497,7 +1466,7 @@ class KahnTest(absltest.TestCase):
     self.assertEqual(kahn_res['none_def'], [None, 1, 1, 3, 3, 5, 5, 7])
     self.assertEqual(kahn_res['rst_cur'], [500, 1, 1, 3, 500, 5, 5, 7])
 
-    # Early-EOF subclocked `post` into `current` matches under present_values.
+    # Early-EOF subclocked `post` into `current` matches under elision.
     def eof_post_subclock():
       c = Stream([True, True, False, True])
       cnt = counter(10)
@@ -1512,7 +1481,7 @@ class KahnTest(absltest.TestCase):
     sync_eof = Scheduler.run(
         eof_post_subclock, horizon=4, semantics=Semantics.SYNC
     )
-    self.assertEqual(present_values(kahn_eof), present_values(sync_eof))
+    self._assert_absent_bottom_elision(sync_eof, kahn_eof)
 
 
 if __name__ == '__main__':

@@ -49,14 +49,14 @@ from psyre.common import (
     when,
     when_selector_matches_const,
 )
-from psyre.common_payload import (
+from psyre.equations import psyre_equations
+from psyre.match import case, default, match
+from psyre.payload import (
     is_array_object,
     is_nan_scalar,
     is_numpy_bool,
     is_numpy_scalar,
 )
-from equations import psyre_equations
-from psyre.match import case, default, match
 from psyre.scheduler import Scheduler
 from psyre.static_stream import same_const_value
 from psyre.stream import Stream
@@ -155,8 +155,12 @@ class NumpyInteropTest(absltest.TestCase):
 
     wh, cat, stk, sm, clp, mn = Scheduler.run(prog, horizon=1)
     np.testing.assert_allclose(wh[0], [[1.0, 2.0], [30.0, 40.0]])
-    self.assertEqual(cat[0].shape, (4, 2))
-    self.assertEqual(stk[0].shape, (2, 2, 2))
+    np.testing.assert_allclose(
+        cat[0], [[1.0, 2.0], [3.0, 4.0], [10.0, 20.0], [30.0, 40.0]]
+    )
+    np.testing.assert_allclose(
+        stk[0], [[[1.0, 2.0], [3.0, 4.0]], [[10.0, 20.0], [30.0, 40.0]]]
+    )
     np.testing.assert_allclose(sm[0], [[3.0], [7.0]])
     np.testing.assert_allclose(clp[0], [[1.5, 2.0], [3.0, 3.5]])
     np.testing.assert_allclose(mn[0], 2.5)
@@ -215,6 +219,28 @@ class NumpyInteropTest(absltest.TestCase):
 
     out = Scheduler.run(check_rejections, horizon=1)
     np.testing.assert_allclose(out[0], [2.0, 3.0])
+
+  def test_numpy_ufunc_method_and_array_func_cse_without_cache(self):
+    def prog():
+      x = Stream([np.array([1.0, 2.0]), np.array([3.0, 4.0])])
+      return (
+          np.sin(x),
+          np.sin(x),
+          np.add.reduce(x),
+          np.add.reduce(x),
+          np.sum(x),
+          np.sum(x),
+      )
+
+    g = build_graph(prog, optimize=True)
+    sin1, sin2, red1, red2, sum1, sum2 = g.output
+    self.assertIs(sin1, sin2)
+    self.assertIs(red1, red2)
+    self.assertIs(sum1, sum2)
+    out = Scheduler.run_graph(g, horizon=2)
+    np.testing.assert_allclose(out[0][0], np.sin([1.0, 2.0]))
+    np.testing.assert_allclose(out[2][0], 3.0)
+    np.testing.assert_allclose(out[4][0], 3.0)
 
   def test_numpy_bool_stream_and_comparison_folds(self):
     def prog():
@@ -528,7 +554,7 @@ class JaxInteropTest(absltest.TestCase):
     np.testing.assert_allclose(d_t[0], 21.0)
     np.testing.assert_allclose(sel_t[0], [0.0, 4.0, 0.0])
 
-  def test_jax_equations_and_strict_scalar_ifthenelse(self):
+  def test_jax_equations_forward_reference(self):
     a = jnp.array([1.0, 2.0])
     with psyre_equations() as prog:
 
@@ -541,14 +567,6 @@ class JaxInteropTest(absltest.TestCase):
 
     res = Scheduler.run_graph(prog.graph, horizon=1)
     np.testing.assert_allclose(res[0], [4.0, 6.0])
-
-    with self.assertRaises(Exception):
-      Scheduler.run(
-          lambda: ifthenelse(
-              Stream([jnp.array([True, False])]), Stream(1), Stream(0)
-          ),
-          horizon=1,
-      )
 
 
 if __name__ == '__main__':

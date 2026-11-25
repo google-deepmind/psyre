@@ -42,7 +42,6 @@ from psyre.common import (
     counter,
     fby,
     ifthenelse,
-    is_namedtuple,
     merge,
     post,
     prefix_stack,
@@ -73,28 +72,12 @@ DEFAULT_CHAINED_LR = 0.01
 DEFAULT_CHAINED_MAX_STEPS = 12
 
 
-def _triple[T](fn: Callable[[int], T]) -> tuple[T, T, T]:
+def triple[T](fn: Callable[[int], T]) -> tuple[T, T, T]:
   """Evaluates `fn(k)` for expert indices `0, 1, 2` as a typed 3-tuple."""
   return (fn(0), fn(1), fn(2))
 
 
-def _delay_tree(
-    template: Any,
-    get_tree: Callable[[], Any],
-    delay_fn: Callable[[Any, Callable[[], Stream]], Stream],
-) -> Any:
-  """Recursively delays every leaf of a NamedTuple/tuple parameter tree."""
-  if isinstance(template, tuple):
-
-    def child(idx: int) -> Any:
-      return _delay_tree(template[idx], lambda: get_tree()[idx], delay_fn)
-
-    items = tuple(child(i) for i in range(len(template)))
-    return type(template)(*items) if is_namedtuple(template) else items
-  return delay_fn(template, get_tree)
-
-
-def _validate_training_args(dataset: Sequence[Any], max_steps: int) -> None:
+def validate_training_args(dataset: Sequence[Any], max_steps: int) -> None:
   """Validates non-empty dataset and positive training step count."""
   if not dataset:
     raise ValueError('dataset must be non-empty.')
@@ -102,7 +85,7 @@ def _validate_training_args(dataset: Sequence[Any], max_steps: int) -> None:
     raise ValueError(f'max_steps must be >= 1, got {max_steps}.')
 
 
-def _dispatch_conds(
+def dispatch_conds(
     gates: tuple[Stream, Stream, Stream],
 ) -> tuple[Stream, Stream, Stream]:
   """Computes named boolean dispatch clocks `c_k = (g_k != 0.0)`."""
@@ -112,16 +95,16 @@ def _dispatch_conds(
     c_k.name = f'c{k + 1}'
     return c_k
 
-  return _triple(make_cond)
+  return triple(make_cond)
 
 
-def _combine_experts(
+def combine_experts(
     gates: tuple[Stream, Stream, Stream],
     conds: tuple[Stream, Stream, Stream],
     expert_outputs: tuple[Stream, Stream, Stream],
 ) -> tuple[Stream, tuple[Stream, Stream, Stream]]:
   """Merges subclock expert outputs back to base clock and forms gated sum."""
-  merged_os = _triple(
+  merged_os = triple(
       lambda k: merge(conds[k], expert_outputs[k], 0.0, name=f'm{k + 1}')
   )
   o = Stream.sum(*(gates[k] * merged_os[k] for k in range(NUM_EXPERTS)))
@@ -129,7 +112,7 @@ def _combine_experts(
   return o, merged_os
 
 
-def _lift_expert_grads[ExpT](
+def lift_expert_grads[ExpT](
     conds: tuple[Stream, Stream, Stream],
     dx_gate: Stream,
     dx_subs: tuple[Stream, Stream, Stream],
@@ -149,10 +132,10 @@ def _lift_expert_grads[ExpT](
       ),
   )
   dx.name = 'dx'
-  return dx, _triple(lift_dp)
+  return dx, triple(lift_dp)
 
 
-def _pass_coords(
+def pass_coords(
     dimension: int,
     in_pass: Stream | None = None,
     pass_reset: Stream | None = None,
@@ -181,8 +164,8 @@ class GateParams[T](NamedTuple):
   ) -> 'GateParams[U]':
     """Applies fn leaf-wise across self and any parallel GateParams."""
     return GateParams(
-        w=_triple(lambda k: fn(self.w[k], *(o.w[k] for o in others))),
-        b=_triple(lambda k: fn(self.b[k], *(o.b[k] for o in others))),
+        w=triple(lambda k: fn(self.w[k], *(o.w[k] for o in others))),
+        b=triple(lambda k: fn(self.b[k], *(o.b[k] for o in others))),
     )
 
 
@@ -197,7 +180,7 @@ class ScalarExpertParams[T](NamedTuple):
       self, fn: Callable[..., U], *others: 'ScalarExpertParams[Any]'
   ) -> 'ScalarExpertParams[U]':
     """Applies fn field-wise across self and parallel ScalarExpertParams."""
-    return ScalarExpertParams(*(fn(*col) for col in zip(self, *others)))
+    return rnn.map_fields(self, fn, *others)
 
 
 class GmoeParams[GateT, ExpT](NamedTuple):
@@ -212,7 +195,7 @@ class GmoeParams[GateT, ExpT](NamedTuple):
     """Applies fn leaf-wise across gate and all 3 expert parameter trees."""
     return GmoeParams(
         gate=self.gate.map(fn, *(o.gate for o in others)),
-        experts=_triple(
+        experts=triple(
             lambda k: self.experts[k].map(fn, *(o.experts[k] for o in others))
         ),
     )
@@ -295,7 +278,7 @@ def mixture_of_experts_demo() -> dict[str, Stream]:
   """Sparsely-gated Mixture of Experts with 3 experts (arXiv:2311.16977)."""
   x = Stream([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 4.0], name='x')
   gates = fixed_gating_network(x)
-  conds = _dispatch_conds(gates)
+  conds = dispatch_conds(gates)
 
   x_c1 = when(conds[0], x, name='x_c1')
   o1 = demo_expert1(x_c1)
@@ -304,7 +287,7 @@ def mixture_of_experts_demo() -> dict[str, Stream]:
   o2.name = 'o2'
   o3 = demo_expert3(when(conds[2], x, name='x_c3'))
   o3.name = 'o3'
-  o, _ = _combine_experts(gates, conds, (o1, o2, o3))
+  o, _ = combine_experts(gates, conds, (o1, o2, o3))
 
   # Time-modular stateful expert (§4.4): state advances only when `c1` is True.
   with match(conds[0]) as rec_e1:
@@ -368,7 +351,7 @@ def gating_network(
     x: Stream, gate: GateParams[Stream]
 ) -> tuple[Stream, Stream, Stream]:
   """Top-2 sparse softmax gating network over scalar input stream `x`."""
-  return _sparse_top2_softmax(*_triple(lambda k: gate.w[k] * x + gate.b[k]))
+  return _sparse_top2_softmax(*triple(lambda k: gate.w[k] * x + gate.b[k]))
 
 
 @psyre_node('grad_gating_network')
@@ -381,7 +364,7 @@ def grad_gating_network(
   """Reverse-mode backward pass of `gating_network`."""
   ds = _grad_sparse_top2_softmax(gates, dg)
   dx_gate = Stream.sum(*(ds[k] * gate.w[k] for k in range(NUM_EXPERTS)))
-  dgate = GateParams(w=_triple(lambda k: ds[k] * x), b=ds)
+  dgate = GateParams(w=triple(lambda k: ds[k] * x), b=ds)
   return dx_gate, dgate
 
 
@@ -421,21 +404,21 @@ def _scalar_forward(
 ]:
   """Shared forward pass for `gmoe_forward` and `grad_gmoe`."""
   gates = gating_network(x, params.gate)
-  conds = _dispatch_conds(gates)
+  conds = dispatch_conds(gates)
 
   def run_expert(k: int) -> tuple[Stream, ScalarExpertParams[Stream], Stream]:
     c_k = conds[k]
     x_k = when(c_k, x, name=f'x_c{k + 1}')
-    p_k = params.experts[k].map(lambda p: when(c_k, p))
+    p_k = rnn.sample_params(c_k, params.experts[k])
     o_k = scalar_expert(x_k, p_k, name=f'expert{k + 1}')
     o_k.name = f'o{k + 1}'
     return x_k, p_k, o_k
 
-  exp_triples = _triple(run_expert)
-  x_subs = _triple(lambda k: exp_triples[k][0])
-  p_subs = _triple(lambda k: exp_triples[k][1])
-  o_subs = _triple(lambda k: exp_triples[k][2])
-  o, merged_os = _combine_experts(gates, conds, o_subs)
+  exp_triples = triple(run_expert)
+  x_subs = triple(lambda k: exp_triples[k][0])
+  p_subs = triple(lambda k: exp_triples[k][1])
+  o_subs = triple(lambda k: exp_triples[k][2])
+  o, merged_os = combine_experts(gates, conds, o_subs)
   fwd = GmoeForwardOutput(o=o, gates=gates, conds=conds, expert_outputs=o_subs)
   return fwd, x_subs, p_subs, merged_os
 
@@ -475,7 +458,7 @@ def grad_gmoe(
   loss_val, do = rnn.grad_loss(fwd.o, y_true, 1.0)
   loss_val.name = 'loss'
 
-  dg = _triple(lambda k: do * merged_os[k])
+  dg = triple(lambda k: do * merged_os[k])
   dx_gate, dgate = grad_gating_network(x, params.gate, fwd.gates, dg)
 
   def run_backward(k: int) -> tuple[Stream, ScalarExpertParams[Stream]]:
@@ -484,12 +467,12 @@ def grad_gmoe(
         x_subs[k], p_subs[k], do_k, name=f'grad_expert{k + 1}'
     )
 
-  bwd = _triple(run_backward)
-  dx, dexperts = _lift_expert_grads(
+  bwd = triple(run_backward)
+  dx, dexperts = lift_expert_grads(
       fwd.conds,
       dx_gate,
-      _triple(lambda k: bwd[k][0]),
-      _triple(lambda k: bwd[k][1]),
+      triple(lambda k: bwd[k][0]),
+      triple(lambda k: bwd[k][1]),
   )
   return GmoeGradOutput(
       o=fwd.o,
@@ -518,25 +501,24 @@ def train_gmoe(
 ) -> GmoeTrainingOutput[ScalarExpertParams[Stream]]:
   """Trains the sparsely-gated scalar MoE with dynamic dispatch and SGD."""
   require_sync_semantics('train_gmoe')
-  _validate_training_args(dataset, max_steps)
+  validate_training_args(dataset, max_steps)
 
   x = Stream.periodic([], [float(item[0]) for item in dataset], name='x')
   y = Stream.periodic([], [float(item[1]) for item in dataset], name='y')
   active_step = Stream.periodic(repeat(True, max_steps), [False])
 
   next_params: ScalarGmoeParamStreams
-  prev_params = _delay_tree(
+  prev_params = rnn.delay_tree(
       initial_params,
       lambda: next_params,
       lambda init_val, src: fby(
-          rnn._to_param_float(init_val, 'initial_params'), src  # pylint: disable=protected-access
+          rnn.to_param_float(init_val, 'initial_params'), src
       ),
+      by_getter=True,
   )
   grad_out = grad_gmoe(x, y, prev_params)
   updated = prev_params.map(lambda p, g: p - lr * g, grad_out.grads)
-  next_params = updated.map(
-      lambda upd, old: ifthenelse(active_step, upd, old), prev_params
-  )
+  next_params = rnn.select_params(active_step, updated, prev_params)
   return GmoeTrainingOutput(
       params=next_params,
       loss=when(active_step, grad_out.loss, name='train_loss'),
@@ -551,7 +533,7 @@ def train_gmoe(
 # ---------------------------------------------------------------------------
 
 
-def _validate_expert_cells(
+def validate_expert_cells(
     expert_cells: Sequence[int], dimension: int
 ) -> tuple[int, int, int]:
   """Validates `expert_cells` has 3 entries in `[1, dimension]`."""
@@ -574,18 +556,18 @@ def normalize_chained_params(
 ) -> ChainedGmoeParamValues:
   """Validates and normalizes chained GMoE-RNN parameters."""
   gate = GateParams(
-      w=_triple(
-          lambda k: rnn._normalize_param_vector(  # pylint: disable=protected-access
+      w=triple(
+          lambda k: rnn.normalize_param_vector(
               params.gate.w[k], f'gate.w[{k}]', dimension=dimension
           )
       ),
-      b=_triple(
-          lambda k: rnn._normalize_param_scalar(  # pylint: disable=protected-access
+      b=triple(
+          lambda k: rnn.normalize_param_scalar(
               params.gate.b[k], f'gate.b[{k}]'
           )
       ),
   )
-  experts = _triple(
+  experts = triple(
       lambda k: rnn.normalize_params(params.experts[k], dimension=dimension)
   )
   return GmoeParams(gate=gate, experts=experts)
@@ -600,10 +582,10 @@ def _build_chained_param_streams(
   """Converts `ChainedGmoeParamValues` into streams using `vector_fn`."""
   norm = normalize_chained_params(params, dimension=dimension)
   gate = GateParams(
-      w=_triple(lambda k: vector_fn(norm.gate.w[k])),
-      b=_triple(lambda k: Stream(norm.gate.b[k])),
+      w=triple(lambda k: vector_fn(norm.gate.w[k])),
+      b=triple(lambda k: Stream(norm.gate.b[k])),
   )
-  experts = _triple(
+  experts = triple(
       lambda k: rnn.ModelParams(
           rnn=norm.experts[k].rnn.map(Stream),
           per=norm.experts[k].per.map(vector_fn),
@@ -621,12 +603,12 @@ def chained_param_streams(
   """Converts `ChainedGmoeParamValues` into pass-indexed parameter streams."""
   return _build_chained_param_streams(
       params,
-      lambda vec: rnn._vector_stream(in_pass, vec),  # pylint: disable=protected-access
+      lambda vec: rnn.vector_stream(in_pass, vec),
       dimension=dimension,
   )
 
 
-def _periodic_chained_param_streams(
+def periodic_chained_param_streams(
     params: ChainedGmoeParamValues,
     *,
     dimension: int = rnn.DIMENSION,
@@ -644,18 +626,18 @@ def extract_chained_params(
 ) -> ChainedGmoeParamValues:
   """Extracts the trailing full pass of chained GMoE-RNN parameters."""
   gate = GateParams(
-      w=_triple(
-          lambda k: rnn._extract_present_window(  # pylint: disable=protected-access
+      w=triple(
+          lambda k: rnn.extract_present_window(
               traces.gate.w[k], f'gate.w[{k}]', dimension=dimension
           )
       ),
-      b=_triple(
-          lambda k: rnn._extract_shared_scalar(  # pylint: disable=protected-access
+      b=triple(
+          lambda k: rnn.extract_shared_scalar(
               traces.gate.b[k], f'gate.b[{k}]', dimension=dimension
           )
       ),
   )
-  experts = _triple(
+  experts = triple(
       lambda k: rnn.extract_params(traces.experts[k], dimension=dimension)
   )
   return GmoeParams(gate=gate, experts=experts)
@@ -670,7 +652,7 @@ def pass_gating_network(
     pass_end: Stream | None = None,
 ) -> tuple[Stream, Stream, Stream]:
   """Pass-constant top-2 sparse softmax gating over sequence `x[0..D-1]`."""
-  scores = _triple(
+  scores = triple(
       lambda k: (
           rnn.sum_stream(x * gate.w[k], dimension=dimension, end=pass_end)
           + gate.b[k]
@@ -691,12 +673,12 @@ def grad_pass_gating_network(
 ) -> tuple[Stream, GateParams[Stream]]:
   """Reverse-mode backward pass of `pass_gating_network`."""
   ds = _grad_sparse_top2_softmax(gates, dg)
-  ds_total = _triple(
+  ds_total = triple(
       lambda k: rnn.sum_stream(ds[k], dimension=dimension, end=pass_end)
   )
   dx_gate = Stream.sum(*(ds_total[k] * gate.w[k] for k in range(NUM_EXPERTS)))
   dgate = GateParams(
-      w=_triple(lambda k: ds_total[k] * x),
+      w=triple(lambda k: ds_total[k] * x),
       b=ds_total,
   )
   return dx_gate, dgate
@@ -730,33 +712,33 @@ def chained_gmoe_forward(
     conditions, and subclock expert outputs.
   """
   require_sync_semantics('chained_gmoe_forward')
-  cells = _validate_expert_cells(expert_cells, dimension)
-  pos, rst, pass_final = _pass_coords(dimension, in_pass, pass_reset)
+  cells = validate_expert_cells(expert_cells, dimension)
+  pos, rst, pass_final = pass_coords(dimension, in_pass, pass_reset)
 
   with reset(rst):
     gates = pass_gating_network(
         x, params.gate, dimension=dimension, pass_end=pass_final
     )
-  conds = _dispatch_conds(gates)
+  conds = dispatch_conds(gates)
 
   def run_expert(k: int) -> Stream:
     c_k = conds[k]
     x_k = when(c_k, x, name=f'x_e{k + 1}')
     pos_k = when(c_k, pos, name=f'pos_e{k + 1}')
     rst_k = when(c_k, rst, name=f'rst_e{k + 1}')
-    p_k = params.experts[k].map(lambda s: when(c_k, s))
+    p_k = rnn.sample_params(c_k, params.experts[k])
     with push_prefix(f'expert{k + 1}'):
       with reset(rst_k):
         o_k = rnn.forward(x_k, p_k, num_cells=cells[k], in_pass=pos_k)
     o_k.name = f'o{k + 1}'
     return o_k
 
-  o_subs = _triple(run_expert)
-  o, _ = _combine_experts(gates, conds, o_subs)
+  o_subs = triple(run_expert)
+  o, _ = combine_experts(gates, conds, o_subs)
   return GmoeForwardOutput(o=o, gates=gates, conds=conds, expert_outputs=o_subs)
 
 
-def _make_subclock_shift_back(
+def make_subclock_shift_back(
     rst: Stream,
 ) -> Callable[[Stream], Callable[[Stream], Stream]]:
   """Builds a subclock lookahead `post` factory bound to base reset `rst`."""
@@ -817,15 +799,15 @@ def grad_chained_gmoe(
     gradients, gating weights, dispatch conditions, and subclock expert outputs.
   """
   require_sync_semantics('grad_chained_gmoe')
-  cells = _validate_expert_cells(expert_cells, dimension)
-  pos, rst, pass_final = _pass_coords(dimension, in_pass, pass_reset)
-  make_shift_back = _make_subclock_shift_back(rst)
+  cells = validate_expert_cells(expert_cells, dimension)
+  pos, rst, pass_final = pass_coords(dimension, in_pass, pass_reset)
+  make_shift_back = make_subclock_shift_back(rst)
 
   with reset(rst):
     gates = pass_gating_network(
         x, params.gate, dimension=dimension, pass_end=pass_final
     )
-  conds = _dispatch_conds(gates)
+  conds = dispatch_conds(gates)
 
   do_subs: tuple[Stream, Stream, Stream]
 
@@ -834,7 +816,7 @@ def grad_chained_gmoe(
     x_k = when(c_k, x, name=f'x_e{k + 1}')
     pos_k = when(c_k, pos, name=f'pos_e{k + 1}')
     rst_k = when(c_k, rst, name=f'rst_e{k + 1}')
-    p_k = params.experts[k].map(lambda s: when(c_k, s))
+    p_k = rnn.sample_params(c_k, params.experts[k])
     with push_prefix(f'expert{k + 1}'):
       with reset(rst_k):
         o_k, dx_k, dp_k = rnn.grad_rnn_perceptron(
@@ -849,24 +831,24 @@ def grad_chained_gmoe(
     o_k.name = f'o{k + 1}'
     return o_k, dx_k, dp_k
 
-  exp_results = _triple(run_expert)
-  o_subs = _triple(lambda k: exp_results[k][0])
-  dx_subs = _triple(lambda k: exp_results[k][1])
-  dp_subs = _triple(lambda k: exp_results[k][2])
-  o, merged_os = _combine_experts(gates, conds, o_subs)
+  exp_results = triple(run_expert)
+  o_subs = triple(lambda k: exp_results[k][0])
+  dx_subs = triple(lambda k: exp_results[k][1])
+  dp_subs = triple(lambda k: exp_results[k][2])
+  o, merged_os = combine_experts(gates, conds, o_subs)
 
   loss_val, do = rnn.grad_loss(o, y_true, ifthenelse(pass_final, 1.0, 0.0))
   loss_val.name = 'loss'
 
-  dg = _triple(lambda k: do * merged_os[k])
+  dg = triple(lambda k: do * merged_os[k])
   with reset(rst):
     dx_gate, dgate = grad_pass_gating_network(
         x, params.gate, gates, dg, dimension=dimension, pass_end=pass_final
     )
-  do_subs = _triple(
+  do_subs = triple(
       lambda k: when(conds[k], do * gates[k], name=f'do{k + 1}')
   )
-  dx, dexperts = _lift_expert_grads(conds, dx_gate, dx_subs, dp_subs)
+  dx, dexperts = lift_expert_grads(conds, dx_gate, dx_subs, dp_subs)
   return GmoeGradOutput(
       o=o,
       loss=loss_val,
@@ -889,7 +871,7 @@ def apply_chained_gmoe_grads(
   """Applies one gradient descent step to gate and 3 RNN+perceptron experts."""
   return GmoeParams(
       gate=params.gate.map(lambda p, g: p - lr * g, grads.gate),
-      experts=_triple(
+      experts=triple(
           lambda k: rnn.apply_grads(
               params.experts[k],
               grads.experts[k],
@@ -912,10 +894,10 @@ def eval_chained_gmoe(
   require_sync_semantics('eval_chained_gmoe')
   if not dataset:
     raise ValueError('dataset must be non-empty.')
-  x_word, y_word = rnn._dataset_words(dataset, dimension=dimension)  # pylint: disable=protected-access
+  x_word, y_word = rnn.dataset_words(dataset, dimension=dimension)
   in_pass = Stream.periodic([], list(range(dimension)))
-  pass_reset = Stream.periodic([], rnn._pass_reset_word(dimension))  # pylint: disable=protected-access
-  p_streams = _periodic_chained_param_streams(params, dimension=dimension)
+  pass_reset = Stream.periodic([], rnn.pass_reset_word(dimension))
+  p_streams = periodic_chained_param_streams(params, dimension=dimension)
   fwd = chained_gmoe_forward(
       Stream.periodic(x_word, [0.0]),
       p_streams,
@@ -925,7 +907,7 @@ def eval_chained_gmoe(
       pass_reset=pass_reset,
   )
   emit = Stream.periodic(
-      repeat(rnn._pass_end_word(dimension), len(dataset)), [False]  # pylint: disable=protected-access
+      repeat(rnn.pass_end_word(dimension), len(dataset)), [False]
   )
   return when(
       emit,
@@ -945,22 +927,23 @@ def train_chained_gmoe(
 ) -> GmoeTrainingOutput[rnn.ParamStreams]:
   """Multi-pass BPTT training automaton for the chained GMoE-RNN model."""
   require_sync_semantics('train_chained_gmoe')
-  _validate_training_args(dataset, max_steps)
-  _validate_expert_cells(expert_cells, dimension)
+  validate_training_args(dataset, max_steps)
+  validate_expert_cells(expert_cells, dimension)
   norm_init = normalize_chained_params(initial_params, dimension=dimension)
-  x_word, y_word = rnn._dataset_words(dataset, dimension=dimension)  # pylint: disable=protected-access
+  x_word, y_word = rnn.dataset_words(dataset, dimension=dimension)
 
   with automaton(
       init=GmoeTrainingState.INIT_LOAD, name='gmoe_train'
   ) as train:
-    prev = _delay_tree(
+    prev = rnn.delay_tree(
         norm_init,
         lambda: train.params,
         lambda _, src: last(src, init=0.0, n=dimension),
+        by_getter=True,
     )
     with state(GmoeTrainingState.INIT_LOAD):
       until(Stream.once(dimension - 1), GmoeTrainingState.GRAD_DESCENT)
-      train.params = _periodic_chained_param_streams(
+      train.params = periodic_chained_param_streams(
           norm_init, dimension=dimension
       )
       train.loss = 0.0
@@ -970,8 +953,8 @@ def train_chained_gmoe(
       train.merged_outputs = (0.0, 0.0, 0.0)
     with state(GmoeTrainingState.GRAD_DESCENT):
       in_pass = Stream.periodic([], list(range(dimension)))
-      pass_reset = Stream.periodic([], rnn._pass_reset_word(dimension))  # pylint: disable=protected-access
-      pass_final = Stream.periodic([], rnn._pass_end_word(dimension))  # pylint: disable=protected-access
+      pass_reset = Stream.periodic([], rnn.pass_reset_word(dimension))
+      pass_final = Stream.periodic([], rnn.pass_end_word(dimension))
       sample_x = Stream.periodic([], x_word)
       sample_y = Stream.periodic([], y_word)
       active_step = Stream.periodic(
@@ -995,16 +978,14 @@ def train_chained_gmoe(
             dimension=dimension,
             pass_end=pass_final,
         )
-      train.params = updated.map(
-          lambda upd, old: ifthenelse(active_step, upd, old), prev
-      )
+      train.params = rnn.select_params(active_step, updated, prev)
       train.loss = grad_out.loss
       train.emit_loss = Stream.periodic(
-          repeat(rnn._pass_end_word(dimension), max_steps), [False]  # pylint: disable=protected-access
+          repeat(rnn.pass_end_word(dimension), max_steps), [False]
       )
       train.gates = grad_out.gates
       train.conds = grad_out.conds
-      train.merged_outputs = _triple(
+      train.merged_outputs = triple(
           lambda k: merge(grad_out.conds[k], grad_out.expert_outputs[k], 0.0)
       )
 
@@ -1013,7 +994,7 @@ def train_chained_gmoe(
       loss=when(train.emit_loss, train.loss, name='train_loss'),
       gates=train.gates,
       conds=train.conds,
-      expert_outputs=_triple(
+      expert_outputs=triple(
           lambda k: when(
               train.conds[k], train.merged_outputs[k], name=f'o{k + 1}'
           )

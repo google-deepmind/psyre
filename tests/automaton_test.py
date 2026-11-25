@@ -49,19 +49,12 @@ from psyre.match import (
 )
 from psyre.scheduler import Scheduler
 from psyre.stream import Stream
+from tests import test_utils
 
 # pylint: enable=g-importing-member,g-multiple-import
 
-
-class _Mode(enum.Enum):
-  FAST = enum.auto()
-  SLOW = enum.auto()
-
-
-class _TriMode(enum.Enum):
-  IDLE = enum.auto()
-  RUN = enum.auto()
-  STOP = enum.auto()
+_Mode = test_utils.Mode
+_TriMode = test_utils.TriMode
 
 
 class AutomatonTest(absltest.TestCase):
@@ -517,8 +510,9 @@ class AutomatonTest(absltest.TestCase):
       expected_regex: str,
       semantics: Semantics = Semantics.SYNC,
   ):
-    with self.assertRaisesRegex(expected_exc_type, expected_regex):
-      Scheduler.run(main_fn, horizon=1, semantics=semantics)
+    test_utils.assert_psyre_error(
+        self, main_fn, expected_exc_type, expected_regex, semantics=semantics
+    )
 
   def test_automaton_validation_and_context_errors(self):
     def missing_bool():
@@ -1273,21 +1267,17 @@ class AutomatonTest(absltest.TestCase):
     with self.assertRaisesRegex(ValueError, 'NaN'):
       build_graph(nan_state)
 
-    class _FakeArray:
-      shape = (1,)
-      dtype = 'bool'
-
     def array_cond():
       with automaton() as a:
         with state('A'):
-          until(_FakeArray(), 'A')
+          until(test_utils.FakeArray(), 'A')
           a.y = 1
       return a.y
 
     def array_reset():
       with automaton() as a:
         with state('A'):
-          until(False, 'A', reset=_FakeArray())
+          until(False, 'A', reset=test_utils.FakeArray())
           a.y = 1
       return a.y
 

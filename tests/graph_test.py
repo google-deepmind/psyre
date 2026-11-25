@@ -1864,7 +1864,7 @@ class GraphTest(absltest.TestCase):
     self.assertFalse(hasattr(optimization, 'dce'))
     self.assertFalse(hasattr(clock, 'infer_clocks'))
 
-  def test_p1_regressions_step_identity_mux_and_graph_hygiene(self):
+  def test_user_op_identity_mux_and_graph_hygiene(self):
     # 1. User @psyre_comb named like builtin ops must not collide in CSE,
     #    algebraic folding, or is_stateful; user @psyre_loop async generators
     #    are detected as stateful and resettable.
@@ -1973,6 +1973,7 @@ class GraphTest(absltest.TestCase):
 
     opt_dict_g = build_graph(dict_of_stream_prog, optimize=True)
     self.assertTrue(opt_dict_g.is_finalized)
+    self.assertLen([n for n in opt_dict_g.nodes if n.op == 'ifthenelse'], 1)
 
     def match_dict_of_stream_prog():
       sel = Stream([True, False])
@@ -2074,13 +2075,45 @@ class GraphTest(absltest.TestCase):
     self.assertIsInstance(merged_rep, RepeatWord)
     self.assertEqual(merged_rep.count_n, 9)
     self.assertEqual(merged_rep, repeat(False, 9))
+    self.assertEqual(StaticWord(0) + 0 + repeat(0, 3), repeat(0, 5))
     self.assertEqual(
-        [True] + repeat(False, 2), StaticWord([True, False, False])
+        [True, False, False] + repeat(False, 3), [True] + repeat(False, 5)
     )
-    self.assertEqual(
-        True + repeat(False, 2), StaticWord([True, False, False])
-    )
+    self.assertEqual([True] + repeat(False, 2), True + repeat(False, 2))
+    self.assertEqual(list([True] + repeat(False, 2)), [True, False, False])
     self.assertEqual(concat(), EMPTY_WORD)
+
+    # Concatenation is strictly associative across literals, single/multi-atom
+    # repeats, nested repeats, concats, signed zeros, and mutable references.
+    mut_atom = [1]
+    assoc_pool = (
+        EMPTY_WORD,
+        StaticWord(0),
+        StaticWord(1),
+        StaticWord([0, 1]),
+        StaticWord([0, 1, 2]),
+        StaticWord(0.0),
+        StaticWord(-0.0),
+        StaticWord.atom(mut_atom),
+        repeat(0, 2),
+        repeat(2, 2),
+        repeat([0, 1], 2),
+        repeat(repeat(0, 2) + 1, 2),
+        repeat(0, 2) + [1],
+        [1] + repeat(0, 2),
+    )
+    for wa in assoc_pool:
+      for wb in assoc_pool:
+        for wc in assoc_pool:
+          lhs = (wa + wb) + wc
+          rhs = wa + (wb + wc)
+          self.assertEqual(lhs, rhs)
+          self.assertEqual(lhs, concat(wa, wb, wc))
+    shared_nan_rep = repeat(StaticWord(float('nan')), 2)
+    self.assertEqual(
+        (shared_nan_rep + shared_nan_rep) + shared_nan_rep,
+        shared_nan_rep + (shared_nan_rep + shared_nan_rep),
+    )
 
     # Symbolic slicing, indexing, negative indexing, and O(|AST|) `in`.
     big = 10**8
@@ -2195,11 +2228,11 @@ class GraphTest(absltest.TestCase):
         self.assertEqual(m_tr, [0, 1, 2, 3, 4])
         self.assertEqual(r_tr, [False] * 5)
 
-  def test_static_word_symbolic_eq_and_slice_bounds(self):
+  def test_static_word_structural_eq_and_slice_bounds(self):
     n = 10**9
 
-    # Symbolic equality handles mismatched AST splits, common divisors, and
-    # rotated repeat phases without expanding elements.
+    # Boundary peeling normalizes adjacent single-atom runs before structural
+    # equality; differently structured ASTs remain structurally distinct.
     self.assertEqual(
         repeat(False, n - 1) + [False, True], repeat(False, n) + True
     )
@@ -2208,20 +2241,51 @@ class GraphTest(absltest.TestCase):
         StaticSequence.once(n),
         StaticSequence.from_parts(repeat(False, n - 1) + [False, True], False),
     )
-    self.assertEqual(repeat([1, 2], 2 * 10**8), repeat([1, 2, 1, 2], 10**8))
-    self.assertNotEqual(repeat([1, 2, 1, 1, 2], 6), repeat([1, 2, 1], 10))
-    self.assertEqual(
+    self.assertNotEqual(repeat([1, 2], 2 * 10**8), repeat([1, 2, 1, 2], 10**8))
+    self.assertNotEqual(
         repeat([0, 1], 10**8),
         concat([0], repeat([1, 0], 10**8 - 1), [1]),
     )
-    self.assertNotEqual(
-        repeat([0, 1], 10**8),
-        concat([0], repeat([1, 0], 10**8 - 1), [2]),
+    self.assertEqual(
+        list(concat([0], repeat([1, 0], 10**8 - 1), [1])[:6]),
+        [0, 1, 0, 1, 0, 1],
     )
+
+    # Mutable containers compare by identity; immutable tuples/frozensets
+    # preserve exact type and signed zeros.
     a_mut, b_mut = [1], [1]
-    self.assertEqual(StaticWord([a_mut, a_mut]), StaticWord([a_mut, b_mut]))
+    self.assertEqual(StaticWord([a_mut, a_mut]), StaticWord([a_mut, a_mut]))
+    self.assertNotEqual(StaticWord([a_mut, a_mut]), StaticWord([a_mut, b_mut]))
+    self.assertFalse(
+        same_stream_or_const(Stream.constant(a_mut), Stream.constant(b_mut))
+    )
+    self.assertTrue(
+        same_stream_or_const(Stream.constant(a_mut), Stream.constant(a_mut))
+    )
+    self.assertFalse(static_stream_lib.same_const_value({'a': 1}, {'a': 1}))
+    self.assertFalse(static_stream_lib.same_const_value({1}, {1}))
+    self.assertTrue(
+        static_stream_lib.same_const_value(
+            frozenset({1, 0.0}), frozenset({1, 0.0})
+        )
+    )
+    self.assertFalse(
+        static_stream_lib.same_const_value(frozenset({1}), frozenset({True}))
+    )
+    self.assertFalse(
+        static_stream_lib.same_const_value(
+            frozenset({0.0}), frozenset({-0.0})
+        )
+    )
     self.assertNotEqual(repeat(float('nan'), n), repeat(float('nan'), n))
     self.assertFalse(static_stream_lib.same_const_value((1, 0.0), (1, -0.0)))
+
+    # Stream.periodic matches Stream(prefix, period=...) on tuple payloads.
+    self.assertEqual(
+        Stream.periodic([], (1, 2)).trace(3),
+        Stream([], period=(1, 2)).trace(3),
+    )
+    self.assertEqual(Stream.periodic([], (1, 2)).trace(3), [(1, 2)] * 3)
 
     # Strided/negative slicing and lengths exceeding 2**31 - 1 are rejected.
     word = StaticWord([1, 2, 3, 4])
@@ -2237,40 +2301,29 @@ class GraphTest(absltest.TestCase):
     with self.assertRaisesRegex(ValueError, 'exceeds limit'):
       concat(repeat(False, static_stream_lib.MAX_WORD_LENGTH), True)
 
-  def test_static_word_eq_polynomial_on_nested_repeats_and_dags(self):
-    # Both expand identically to `[0, 1] * 125_829_114` (`len = 251_658_228`).
-    a = concat([0], repeat([1, 0], 2), [1])
-    b = concat([0], repeat([1, 0], 3), [1])
-    for _ in range(23):
-      a = concat([0, 1], repeat(a, 2), [0, 1])
-      b = concat([0, 1], repeat(b, 2), [0, 1])
-    lhs = repeat(a, 3)
-    pad = (lhs.length - 2 * b.length) // 2
-    rhs = concat(repeat(b, 2), repeat([0, 1], pad))
-    self.assertEqual(lhs.length, rhs.length)
-    self.assertEqual(lhs, rhs)
-    self.assertNotEqual(lhs, concat(rhs[:-1], [2]))
-
+  def test_static_word_dag_structural_eq_and_memoized_traversal(self):
     # Identical deep RepeatWord/ConcatWord DAGs with distinct node identities
-    # (`len ~ 10**8`, `O(depth)` AST nodes). Note bare `concat(lit, lit)`
-    # flattens literals, so `repeat(..., 2)` keeps AST size logarithmic.
+    # (`len ~ 10**8`, `O(depth)` AST nodes).
     u, v = StaticWord([0, 1]), StaticWord([0, 1])
     for idx in range(1, 25):
       u = concat([idx], repeat(u, 2), [idx + 1])
       v = concat([idx], repeat(v, 2), [idx + 1])
     self.assertGreater(u.length, 5 * 10**7)
     self.assertEqual(u, v)
+    self.assertNotEqual(concat(u, [0], u), concat(v, [1], v))
 
-    # Non-periodic deep symbolic words (`len > 10**8`) with different AST splits
-    # (`_struct_eq` fails immediately, exercising SLP recompression directly).
-    self.assertEqual(
-        repeat(u, 3),
-        concat(v[:7], v[7:], repeat(v, 2)),
-    )
-    self.assertNotEqual(
-        concat(u, [0], u),
-        concat(v, [1], v),
-    )
+    # Shared ConcatWord/RepeatWord DAG (`2**13` paths) stays O(|DAG|) under
+    # iter_atoms(), uniform_value(), `in`, and StaticSequence trailing trim.
+    dag: StaticWord = StaticWord([False, False, False])
+    mid = repeat([False, False], 2)
+    for _ in range(13):
+      rep = repeat(dag, 2)
+      dag = concat(rep, mid, rep)
+    self.assertGreater(dag.length, 10**8)
+    self.assertLen(list(dag.iter_atoms()), 5)
+    self.assertEqual(dag.uniform_value(), (True, False))
+    self.assertNotIn(True, dag)
+    self.assertTrue(StaticSequence(dag, StaticWord(False)).is_one_periodic)
 
     # Signed complex zeros, non-reflexive NaN tuples, and shared NaN leaves.
     self.assertNotEqual(
@@ -2320,9 +2373,8 @@ class GraphTest(absltest.TestCase):
       sel = Stream.periodic([], [bad])
       return merge(sel, {good: Stream(10)})
 
-    graph = build_graph(prog, semantics=Semantics.SYNC)
-    optimization.optimize_graph(graph)
-    self.assertIsNotNone(graph)
+    graph = build_graph(prog, semantics=Semantics.SYNC, optimize=True)
+    self.assertLen([n for n in graph.nodes if n.op == 'merge'], 1)
 
   def test_repeated_non_one_periodic_pattern_sync_kahn_and_reset(self):
     def pattern_prog():
@@ -2609,12 +2661,15 @@ class GraphTest(absltest.TestCase):
           tag_info(x, tags=frozenset({1.0})),
           tag_info(x, tags=frozenset({0.0})),
           tag_info(x, tags=frozenset({-0.0})),
-          tag_info(x, tags=frozenset({0.0 + 0.0j})),
-          tag_info(x, tags=frozenset({-0.0 + 0.0j})),
+          tag_info(x, tags=frozenset({complex(0.0, 0.0)})),
+          tag_info(x, tags=frozenset({complex(-0.0, 0.0)})),
+          tag_info(x, tags=frozenset({complex(0.0, -0.0)})),
           tag_info(x, tags=frozenset({(1, 0.0)})),
           tag_info(x, tags=frozenset({(True, -0.0)})),
       )
 
+    distinct_opt = build_graph(distinct_prog, optimize=True)
+    self.assertLen(distinct_opt.nodes, 11)
     self.assertEqual(
         Scheduler.run(distinct_prog, horizon=2, optimize=True),
         Scheduler.run(distinct_prog, horizon=2, optimize=False),
@@ -2743,6 +2798,32 @@ class GraphTest(absltest.TestCase):
     self.assertEqual(
         Scheduler.run_graph(tg, horizon=4),
         Scheduler.run(tagged_prog, horizon=4, optimize=False),
+    )
+
+  def test_clone_streams_resolves_aliases_and_preserves_arm_identity(self):
+    def prog():
+      flag = Stream([True, False, True, False], period=[True, False])
+      sel = ~~flag
+      with match(sel) as m:
+        with case(True):
+          a = fby(1, 2)
+          m.out = a + 3
+        with case(False):
+          m.out = Stream(0)
+      return m.out
+
+    opt_g = build_graph(prog, semantics=Semantics.SYNC, optimize=True)
+    cloned, smap = opt_g.clone_streams()
+    for node in opt_g.nodes:
+      cloned.copy_node_into(node, smap)
+    cloned.set_output(smap[opt_g.output.id])
+    cloned.mark_finalized()
+    arm_nodes = [n for n in cloned.nodes if n.arms]
+    self.assertGreaterEqual(len(arm_nodes), 2)
+    self.assertIs(arm_nodes[0].arms[0], arm_nodes[1].arms[0])
+    self.assertEqual(
+        Scheduler.run_graph(cloned, horizon=4, clocks=check_clocks(cloned)),
+        [4, 0, 5, 0],
     )
 
 

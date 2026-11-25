@@ -38,6 +38,7 @@ from psyre.common import (
     MergeSelector,
     TagKey,
     WhenSelector,
+    activate_block_context,
     active_block,
     arm_stack,
     emit_when as emit_when_node,
@@ -54,13 +55,13 @@ from psyre.common import (
     tag_key,
     when,
 )
-from psyre.common_payload import (
+from psyre.graph import Graph, Node
+from psyre.payload import (
     contains_stream_or_thunk,
     is_nan_scalar,
     is_numpy_bool,
     reject_callable,
 )
-from psyre.graph import Graph, Node
 from psyre.stream import Stream, resolve_stream, same_stream_or_const
 
 # pylint: enable=g-importing-member,g-multiple-import
@@ -150,30 +151,123 @@ def _lower_arms(graph: Graph) -> None:
     scope.cond = resolve_stream(scope.cond)
     return scope.cond
 
-  def selector_step(
-      sel_s: Stream, selector: WhenSelector | None, *, op: str = 'when'
-  ) -> _StepKey | None:
-    norm = graph.normalize_when_selector(sel_s, selector, op=op)
-    if graph.is_always_active_when(sel_s, selector, op=op, norm=norm):
-      return None
-    return (sel_s.id, *norm)
+  def _steps_prefix(
+      a: tuple[_StepKey, ...], b: tuple[_StepKey, ...]
+  ) -> bool:
+    return len(a) <= len(b) and b[: len(a)] == a
 
-  def arm_step(scope: ArmScope) -> _StepKey | None:
-    return selector_step(resolve_scope_cond(scope), scope.selector)
+  def selector_step(
+      sel_s: Stream,
+      selector: WhenSelector | None,
+      *,
+      op: str = 'when',
+      base_steps: tuple[_StepKey, ...] = (),
+  ) -> _StepKey | None:
+    def can_unwrap_when(prod: Node) -> bool:
+      payload = prod.inputs[1]
+      prod_steps = stream_steps.get(prod.output.id)
+      return (
+          prod_steps is not None
+          and _steps_prefix(prod_steps, base_steps)
+          and (
+              not graph.is_polymorphic_static(payload)
+              or payload.is_one_periodic
+          )
+      )
+
+    def can_unwrap_node(prod: Node) -> bool:
+      prod_steps = stream_steps.get(prod.output.id)
+      return prod_steps is not None and _steps_prefix(prod_steps, base_steps)
+
+    def can_unwrap_poly(sel: Stream, prod: Node) -> bool:
+      return (
+          stream_steps.get(prod.output.id) == base_steps
+          or not graph.is_polymorphic_static(sel)
+          or sel.is_one_periodic
+      )
+
+    resolved = graph.resolve_clock_selector_step(
+        sel_s,
+        selector,
+        op=op,
+        can_unwrap_when=can_unwrap_when,
+        can_unwrap_node=can_unwrap_node,
+        can_unwrap_poly=can_unwrap_poly,
+    )
+    if resolved is None:
+      return None
+    canon_s, norm, _ = resolved
+    return (canon_s.id, *norm)
 
   def scopes_to_steps(scopes: Sequence[ArmScope]) -> tuple[_StepKey, ...]:
-    steps = [arm_step(scope) for scope in scopes]
-    return tuple(step for step in steps if step is not None)
+    acc: list[_StepKey] = []
+    for scope in scopes:
+      step = selector_step(
+          resolve_scope_cond(scope), scope.selector, base_steps=tuple(acc)
+      )
+      if step is not None:
+        acc.append(step)
+    return tuple(acc)
 
-  stream_steps: dict[int, tuple[_StepKey, ...]] = {
-      node.output.id: scopes_to_steps(node.arms) for node in graph.nodes
-  }
+  def compute_node_steps(
+      node: Node,
+      inputs: Sequence[Stream],
+      resets: Sequence[Stream],
+  ) -> tuple[_StepKey, ...]:
+    # Zero-input stateless nodes (e.g., `random_stream()`) carry no input to
+    # emit `Absent`, so they run on `BASE_CLOCK` and are sampled downstream.
+    base_steps = (
+        scopes_to_steps(node.arms) if (node.is_stateful or inputs) else ()
+    )
+    has_concrete_input = False
+    for h in node.rate_inputs():
+      if not graph.is_polymorphic_static(h):
+        has_concrete_input = True
+        h_steps = stream_steps.get(h.id, ())
+        if len(h_steps) > len(base_steps):
+          base_steps = h_steps
+    if not has_concrete_input and node.inherits_reset_clock() and resets:
+      rst_steps = [
+          r_steps
+          for r in resets
+          if not graph.is_polymorphic_static(r)
+          and len(r_steps := stream_steps.get(r.id, ())) > len(base_steps)
+          and r_steps[: len(base_steps)] == base_steps
+      ]
+      if rst_steps:
+        base_steps = max(rst_steps, key=len)
+    extra_step: _StepKey | None = None
+    if node.is_primitive('when', 'whennot') and inputs:
+      extra_step = selector_step(
+          inputs[0],
+          node.kwargs.get('selector'),
+          op=node.op,
+          base_steps=base_steps,
+      )
+    elif node.is_primitive('buffer') and len(inputs) >= 3:
+      extra_step = selector_step(inputs[2], None, base_steps=base_steps)
+    return base_steps if extra_step is None else base_steps + (extra_step,)
+
+  initial_nodes = list(graph.nodes)
+  stream_steps: dict[int, tuple[_StepKey, ...]] = {}
+  # Pass 0: propagate `stream_steps` across all `rate_inputs()` (including
+  # delayed `fby`/`pre` edges) to a fixed point so forward-thunk subclocked
+  # state nodes created before their producers get exact steps before Pass 1.
+  for _ in range(len(initial_nodes) + 2):
+    steps_changed = False
+    for node in initial_nodes:
+      nxt = compute_node_steps(node, node.inputs, node.resets)
+      if stream_steps.get(node.output.id) != nxt:
+        stream_steps[node.output.id] = nxt
+        steps_changed = True
+    if not steps_changed:
+      break
+
   when_cache: dict[
       tuple[int, tuple[_StepKey, ...]],
       list[tuple[Any, Stream, tuple[str, ...], Stream]],
   ] = {}
   base_false: Stream | None = None
-  initial_nodes = list(graph.nodes)
   visited: set[int] = set()
 
   def visit_stream(s: Stream) -> None:
@@ -220,17 +314,21 @@ def _lower_arms(graph: Graph) -> None:
       return stream
     visit_stream(stream)
     steps = stream_steps.get(stream.id, ())
-    active_arms = [
-        (idx, arm, step)
-        for idx, arm in enumerate(target_arms)
-        if (step := arm_step(arm)) is not None
-    ]
-    target_steps = tuple(step for _, _, step in active_arms)
+    active_arms: list[tuple[int, ArmScope, _StepKey]] = []
+    acc_steps: list[_StepKey] = []
+    for idx, arm in enumerate(target_arms):
+      step = selector_step(
+          resolve_scope_cond(arm), arm.selector, base_steps=tuple(acc_steps)
+      )
+      if step is not None:
+        acc_steps.append(step)
+        active_arms.append((idx, arm, step))
+    target_steps = tuple(acc_steps)
     d = len(steps)
     if d < len(target_steps) and target_steps[:d] == steps:
       prod = graph.producer(stream)
       prod_pfxs = prod.prefixes if prod is not None else ()
-      for idx, arm, step in active_arms[d:]:
+      for idx, arm, _ in active_arms[d:]:
         # Keep the synthetic `when` node placed inside the narrowest enclosing
         # visualization hierarchy shared by the consumer (`raw_pfxs`) and either
         # the arm or producer (`prod_pfxs`).
@@ -242,9 +340,11 @@ def _lower_arms(graph: Graph) -> None:
             and raw_pfxs[: len(prod_pfxs)] == prod_pfxs
         ):
           arm_pfxs = prod_pfxs
+        raw_cond = resolve_scope_cond(arm)
+        norm_arm = graph.normalize_when_selector(raw_cond, arm.selector)
         stream = emit_when(
             arm,
-            (step[1], step[2], step[3]),
+            norm_arm,
             stream,
             target_arms[:idx],
             arm_pfxs,
@@ -306,38 +406,8 @@ def _lower_arms(graph: Graph) -> None:
           node, inputs=tuple(new_inputs), resets=tuple(new_resets)
       )
 
-    # Zero-input stateless nodes (e.g., `random_stream()`) carry no input to
-    # emit `Absent`, so they run on `BASE_CLOCK` and are sampled downstream.
-    base_steps = (
-        scopes_to_steps(node_arms) if (node.is_stateful or node.inputs) else ()
-    )
-    has_concrete_input = False
-    for h in node.rate_inputs():
-      if not graph.is_polymorphic_static(h):
-        has_concrete_input = True
-        h_steps = stream_steps.get(h.id, ())
-        if len(h_steps) >= len(base_steps):
-          base_steps = h_steps
-          break
-    if not has_concrete_input and node.inherits_reset_clock() and new_resets:
-      rst_steps = [
-          r_steps
-          for r in new_resets
-          if not graph.is_polymorphic_static(r)
-          and len(r_steps := stream_steps.get(r.id, ())) > len(base_steps)
-          and r_steps[: len(base_steps)] == base_steps
-      ]
-      if rst_steps:
-        base_steps = max(rst_steps, key=len)
-    extra_step: _StepKey | None = None
-    if node.is_primitive('when', 'whennot') and orig_inputs:
-      extra_step = selector_step(
-          orig_inputs[0], node.kwargs.get('selector'), op=node.op
-      )
-    elif node.is_primitive('buffer') and len(orig_inputs) >= 3:
-      extra_step = selector_step(orig_inputs[2], None)
-    stream_steps[node.output.id] = (
-        base_steps if extra_step is None else base_steps + (extra_step,)
+    stream_steps[node.output.id] = compute_node_steps(
+        node, orig_inputs, new_resets
     )
 
   # Pass 1: lower instantaneous inputs/resets in topological-like DFS order.
@@ -668,12 +738,8 @@ def match(selector: Any) -> Iterator[BlockHandle]:
       enclosing_env=enclosing_env,
       active_selector=_deferred_selector(selector, enclosing_env),
   )
-  handle = BlockHandle(ctx)
-  block_token = active_block.set(ctx)
-  try:
+  with activate_block_context(ctx) as handle:
     yield handle
-  finally:
-    active_block.reset(block_token)
 
   if not ctx.arm_records:
     raise ValueError('match() requires at least one case().')
@@ -692,15 +758,14 @@ def case(*tags: Any) -> Iterator[Stream]:
   if not tags:
     arm = MatchArm(values=(), is_wildcard=True)
     excluded = tuple(ctx.claimed_tags)
-    ctx.has_wildcard = True
-  else:
     unclaimed: list[Any] = []
+  else:
+    unclaimed = []
     for tag in tags:
       validate_discrete_tag(tag, 'case()')
       if any(matches_tag(tag, c) for c in (*ctx.claimed_tags, *unclaimed)):
         raise ValueError(f'Duplicate case tag {tag!r} in match().')
       unclaimed.append(tag)
-    ctx.claimed_tags.extend(unclaimed)
     arm = MatchArm(values=tuple(unclaimed), is_wildcard=False)
     excluded = ()
 
@@ -719,6 +784,10 @@ def case(*tags: Any) -> Iterator[Stream]:
       yield sampled
   finally:
     ctx.active_arm = None
+  if arm.is_wildcard:
+    ctx.has_wildcard = True
+  else:
+    ctx.claimed_tags.extend(unclaimed)
   ctx.arm_records.append(arm_record)
 
 

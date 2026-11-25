@@ -174,6 +174,24 @@ def _rect_pts(x0: float, y0: float, x1: float, y1: float) -> str:
   return _format_pts([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
 
 
+def _rounded_rect_path(
+    x0: float, y0: float, x1: float, y1: float, radius: float = 12.0
+) -> str:
+  """Formats a rounded axis-aligned rectangle as an SVG `<path d>` string."""
+  r = max(0.0, min(radius, 0.5 * (x1 - x0), 0.5 * (y1 - y0)))
+  return (
+      f'M{x0 + r:.2f},{y0:.2f} '
+      f'L{x1 - r:.2f},{y0:.2f} '
+      f'Q{x1:.2f},{y0:.2f} {x1:.2f},{y0 + r:.2f} '
+      f'L{x1:.2f},{y1 - r:.2f} '
+      f'Q{x1:.2f},{y1:.2f} {x1 - r:.2f},{y1:.2f} '
+      f'L{x0 + r:.2f},{y1:.2f} '
+      f'Q{x0:.2f},{y1:.2f} {x0:.2f},{y1 - r:.2f} '
+      f'L{x0:.2f},{y0 + r:.2f} '
+      f'Q{x0:.2f},{y0:.2f} {x0 + r:.2f},{y0:.2f} Z'
+  )
+
+
 def _svg_el(
     tag: str, attrs: Mapping[str, str], text: str | None = None
 ) -> ET.Element:
@@ -484,7 +502,7 @@ def _shorten_static_stream_edges(
     static_edge_to_node: Mapping[str, str],
     group_by_id: Mapping[str, ET.Element],
     node_by_key: Mapping[str, ET.Element],
-    cluster_polys: Sequence[tuple[ET.Element, list[float]]],
+    cluster_shapes: Sequence[tuple[ET.Element, list[float]]],
 ) -> None:
   """Shortens inline stream arrows and places their label at the arrow tail."""
   for e_dom, c_dom in static_edge_to_node.items():
@@ -516,10 +534,24 @@ def _shorten_static_stream_edges(
       if dst_g is not None:
         dst_poly = dst_g.find(f'.//{{{_SVG_NS}}}polygon')
         if dst_poly is not None and (dst_pts := dst_poly.get('points')):
-          dx0, dy0, dx1, _ = _parse_polygon_bounds(dst_pts)
+          dst_pts_list = _parse_polygon_points(dst_pts)
+          dx0, dy0, dx1, _ = _points_bounds(dst_pts_list)
           tip_x = 0.5 * (dx0 + dx1)
+          # LR `when`/`whennot`/`merge` polygons have a slanted top edge
+          # connecting `pts[0]` and `pts[1]`, whose midpoint is `0.5*(y0+y1)`
+          # rather than `min(ys)`.
+          if (
+              dst_poly.get('data-psyre-shape')
+              in ('selector-trapezoid', 'mux-trapezoid')
+              and len(dst_pts_list) == 4
+          ):
+            top_y = 0.5 * (dst_pts_list[0][1] + dst_pts_list[1][1])
+          else:
+            top_y = dy0
           tip_y = (
-              (dy0 - 6.4) if dst_g.get('data-psyre-kind') == 'whennot' else dy0
+              (top_y - 6.4)
+              if dst_g.get('data-psyre-kind') == 'whennot'
+              else top_y
           )
       ux, uy = 0.0, 1.0
       arrow_len = 5.5
@@ -581,7 +613,7 @@ def _shorten_static_stream_edges(
       txt_str = ''.join(text_el.itertext()).strip()
       est_w = max(12.0, 6.8 * len(txt_str))
       left_edge = float(text_el.get('x', '0')) - est_w - 6.0
-      for c_poly, bounds in cluster_polys:
+      for c_shape, bounds in cluster_shapes:
         bx0, by0, bx1, by1 = bounds
         if (
             bx0 - 2.0 <= tip_x <= bx1 + 2.0
@@ -589,7 +621,10 @@ def _shorten_static_stream_edges(
             and left_edge < bx0
         ):
           bounds[0] = left_edge
-          c_poly.set('points', _rect_pts(left_edge, by0, bx1, by1))
+          if c_shape.tag == f'{{{_SVG_NS}}}path':
+            c_shape.set('d', _rounded_rect_path(left_edge, by0, bx1, by1))
+          else:
+            c_shape.set('points', _rect_pts(left_edge, by0, bx1, by1))
     for edge_text_el in edge_g.findall(f'{{{_SVG_NS}}}text'):
       edge_text_el.set('x', f'{0.5 * (start_x + base_x) - uy * 6.5:.2f}')
       edge_text_el.set(
@@ -642,6 +677,24 @@ def _expand_svg_viewbox(root: ET.Element) -> None:
       if not pts:
         continue
       px0, py0, px1, py1 = _points_bounds(pts)
+      include(
+          px0 + gx - stroke_pad,
+          py0 + gy - stroke_pad,
+          px1 + gx + stroke_pad,
+          py1 + gy + stroke_pad,
+      )
+  for cluster_g in root.iter(f'{{{_SVG_NS}}}g'):
+    if cluster_g.get('class') != 'cluster':
+      continue
+    c_path = cluster_g.find(f'{{{_SVG_NS}}}path')
+    if c_path is None or not (d_attr := c_path.get('d', '')):
+      continue
+    path_pts = [
+        (float(m.group(1)), float(m.group(2)))
+        for m in _PATH_COORD_RE.finditer(d_attr)
+    ]
+    if path_pts:
+      px0, py0, px1, py1 = _points_bounds(path_pts)
       include(
           px0 + gx - stroke_pad,
           py0 + gy - stroke_pad,
@@ -735,7 +788,7 @@ def render_view_svg(view: SchematicView) -> str:
   collect_static = bool(view.static_edge_to_node)
   group_by_id: dict[str, ET.Element] = {}
   node_by_key: dict[str, ET.Element] = {}
-  cluster_polys: list[tuple[ET.Element, list[float]]] = []
+  cluster_shapes: list[tuple[ET.Element, list[float]]] = []
   for group in root.iter(f'{{{_SVG_NS}}}g'):
     dom_id = group.get('id', '')
     group_cls = group.get('class', '')
@@ -745,7 +798,18 @@ def render_view_svg(view: SchematicView) -> str:
       if group_cls == 'cluster':
         c_poly = group.find(f'{{{_SVG_NS}}}polygon')
         if c_poly is not None and (pts_attr := c_poly.get('points', '')):
-          cluster_polys.append((c_poly, list(_parse_polygon_bounds(pts_attr))))
+          cluster_shapes.append(
+              (c_poly, list(_parse_polygon_bounds(pts_attr)))
+          )
+        else:
+          c_path = group.find(f'{{{_SVG_NS}}}path')
+          if c_path is not None and (d_attr := c_path.get('d', '')):
+            path_pts = [
+                (float(m.group(1)), float(m.group(2)))
+                for m in _PATH_COORD_RE.finditer(d_attr)
+            ]
+            if path_pts:
+              cluster_shapes.append((c_path, list(_points_bounds(path_pts))))
     title_el = group.find(f'{{{_SVG_NS}}}title')
     raw_key = (title_el.text or '').strip() if title_el is not None else ''
     if group_cls == 'node' and raw_key:
@@ -780,7 +844,7 @@ def render_view_svg(view: SchematicView) -> str:
       _apply_custom_glyph(group, spec, view.rankdir)
   if collect_static:
     _shorten_static_stream_edges(
-        view.static_edge_to_node, group_by_id, node_by_key, cluster_polys
+        view.static_edge_to_node, group_by_id, node_by_key, cluster_shapes
     )
   _expand_svg_viewbox(root)
   return ET.tostring(root, encoding='unicode')
@@ -1153,9 +1217,22 @@ def _wrap_interactive_html(
       }});
       let switchSeq = 0;
       const expandedSet = new Set();
+      function encodeStateKey(prefixes) {{
+        return Array.from(new Set(prefixes))
+          .sort()
+          .map((p) => p.replace(/%/g, "%25").replace(/\\|/g, "%7C"))
+          .join("|");
+      }}
+      function decodeStateKey(key) {{
+        if (!key) return [];
+        return key
+          .split("|")
+          .filter(Boolean)
+          .map((p) => p.replace(/%7C/g, "|").replace(/%25/g, "%"));
+      }}
       function setExpandedFromKey(key) {{
         expandedSet.clear();
-        if (key) key.split("|").filter(Boolean).forEach((p) => expandedSet.add(p));
+        decodeStateKey(key).forEach((p) => expandedSet.add(p));
       }}
       setExpandedFromKey({initial_key_json});
 
@@ -1346,15 +1423,15 @@ def _wrap_interactive_html(
         const ancs = ancestorPrefixes(pfx, true);
         const candidate = new Set(expandedSet);
         ancs.forEach((a) => candidate.add(a));
-        let nextKey = Array.from(candidate).sort().join("|");
+        let nextKey = encodeStateKey(candidate);
         if (!availableKeySet.has(nextKey)) {{
-          nextKey = ancs.slice().sort().join("|");
+          nextKey = encodeStateKey(ancs);
         }}
         if (!availableKeySet.has(nextKey)) {{
-          let bestKey = allPrefixes.slice().sort().join("|");
+          let bestKey = encodeStateKey(allPrefixes);
           let bestLen = Infinity;
           availableKeys.forEach((k) => {{
-            const ks = k ? k.split("|") : [];
+            const ks = decodeStateKey(k);
             if (ancs.every((a) => ks.includes(a)) && ks.length < bestLen) {{
               bestKey = k;
               bestLen = ks.length;
@@ -1372,9 +1449,9 @@ def _wrap_interactive_html(
         const candidate = Array.from(expandedSet).filter(
           (item) => item !== pfx && !item.startsWith(pfx + "/")
         );
-        let nextKey = candidate.sort().join("|");
+        let nextKey = encodeStateKey(candidate);
         if (!availableKeySet.has(nextKey)) {{
-          nextKey = ancestorPrefixes(pfx, false).sort().join("|");
+          nextKey = encodeStateKey(ancestorPrefixes(pfx, false));
         }}
         if (!availableKeySet.has(nextKey)) {{
           nextKey = "";
@@ -1537,7 +1614,7 @@ def _wrap_interactive_html(
             ty = Math.max(12, (rect.height - h) * 0.5);
             applyTransform();
           }} else if (act === "expand-all") {{
-            const nextKey = Array.from(new Set(allPrefixes)).sort().join("|");
+            const nextKey = encodeStateKey(allPrefixes);
             switchView(nextKey, "Expanded all automata");
           }} else if (act === "collapse-all") {{
             switchView("", "Collapsed all automata");
@@ -1582,6 +1659,28 @@ def _wrap_interactive_html(
         }}
         const g = rawTarget.closest("g.node");
         if (!g) {{
+          const edgeEl = rawTarget.closest("g.edge");
+          if (edgeEl) {{
+            const svg = activeSvg();
+            if (!svg) return;
+            const allNodes = Array.from(svg.querySelectorAll("g.node"));
+            const allEdges = Array.from(svg.querySelectorAll("g.edge"));
+            const src = edgeEl.getAttribute("data-psyre-src") || "";
+            const dst = edgeEl.getAttribute("data-psyre-dst") || "";
+            lockedInfo =
+              edgeEl.getAttribute("data-psyre-info") || `${{src}} -> ${{dst}}`;
+            infoEl.textContent = lockedInfo;
+            root.classList.add("has-selection");
+            const keepNodes = new Set([src, dst].filter(Boolean));
+            allNodes.forEach((n) => {{
+              const k = n.getAttribute("data-psyre-key") || "";
+              n.classList.toggle("dimmed", !keepNodes.has(k));
+            }});
+            allEdges.forEach((e) => {{
+              e.classList.toggle("dimmed", e !== edgeEl);
+            }});
+            return;
+          }}
           const fsmCluster = rawTarget.closest("g.cluster[data-psyre-fsm-cluster]");
           if (fsmCluster) {{
             const pfx = fsmCluster.getAttribute("data-psyre-fsm-cluster");
@@ -1724,8 +1823,13 @@ class GraphVisualization:
     return _write_export_text(self.svg, path, suffix='.svg')
 
   def save_html(self, path: str | None = None) -> str:
-    """Writes interactive HTML to `path` (or a temporary file if `None`)."""
-    return _write_export_text(self.html, path, suffix='.html')
+    """Writes standalone UTF-8 interactive HTML to `path` (or a temp file)."""
+    doc = (
+        self.html
+        if self.html.lstrip().startswith('<!DOCTYPE')
+        else f'<!DOCTYPE html>\n<meta charset="utf-8">\n{self.html}'
+    )
+    return _write_export_text(doc, path, suffix='.html')
 
 
 def build_visualization(bundle: SchematicBundle) -> GraphVisualization:

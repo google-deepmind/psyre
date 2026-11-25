@@ -166,38 +166,46 @@ class SystolicOutputs(NamedTuple):
   accumulators: StreamGrid
 
 
-def to_fp32(value: Any) -> Any:
-  """Rounds a numeric value or nested sequence of values to IEEE-754 fp32."""
+def _quantize_recursive(
+    value: Any,
+    scalar_fn: Callable[[float], float],
+    label: str,
+) -> Any:
+  """Applies scalar rounding `scalar_fn` recursively across nested sequences."""
   if isinstance(value, (str, bytes, bytearray)):
     raise TypeError(
-        'to_fp32 expects a number or sequence of numbers, not '
+        f'{label} expects a number or sequence of numbers, not '
         f'{type(value).__name__}.'
     )
   if isinstance(value, Sequence):
-    return [to_fp32(item) for item in value]
+    return [_quantize_recursive(item, scalar_fn, label) for item in value]
   if isinstance(value, bool):
-    raise TypeError(f'to_fp32 expects a numeric value, not bool ({value!r}).')
-  return struct.unpack('<f', struct.pack('<f', float(value)))[0]
+    raise TypeError(f'{label} expects a numeric value, not bool ({value!r}).')
+  return scalar_fn(float(value))
 
 
-def to_bf16(value: Any) -> Any:
-  """Rounds a numeric value or nested sequence of values to IEEE-754 bf16."""
-  if isinstance(value, (str, bytes, bytearray)):
-    raise TypeError(
-        'to_bf16 expects a number or sequence of numbers, not '
-        f'{type(value).__name__}.'
-    )
-  if isinstance(value, Sequence):
-    return [to_bf16(item) for item in value]
-  if isinstance(value, bool):
-    raise TypeError(f'to_bf16 expects a numeric value, not bool ({value!r}).')
-  bits = struct.unpack('<I', struct.pack('<f', float(value)))[0]
+def _round_fp32_scalar(val: float) -> float:
+  return struct.unpack('<f', struct.pack('<f', val))[0]
+
+
+def _round_bf16_scalar(val: float) -> float:
+  bits = struct.unpack('<I', struct.pack('<f', val))[0]
   if (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0:
     bf16_bits = (bits | 0x00400000) & 0xFFFF0000
   else:
     rounding_bias = 0x00007FFF + ((bits >> 16) & 1)
     bf16_bits = (bits + rounding_bias) & 0xFFFF0000
   return struct.unpack('<f', struct.pack('<I', bf16_bits))[0]
+
+
+def to_fp32(value: Any) -> Any:
+  """Rounds a numeric value or nested sequence of values to IEEE-754 fp32."""
+  return _quantize_recursive(value, _round_fp32_scalar, 'to_fp32')
+
+
+def to_bf16(value: Any) -> Any:
+  """Rounds a numeric value or nested sequence of values to IEEE-754 bf16."""
+  return _quantize_recursive(value, _round_bf16_scalar, 'to_bf16')
 
 
 @psyre_comb(pure=True)
@@ -587,6 +595,7 @@ def systolic_array(
     reload_weights: Stream | None = None,
     accumulate: Stream | None = None,
     reset_stream: Stream | None = None,
+    pe_fn: Callable[..., PEOutputs] | None = None,
 ) -> SystolicOutputs:
   """Builds the 4x4 systolic array with distributed per-PE control.
 
@@ -602,6 +611,7 @@ def systolic_array(
       of multiplication products into PE accumulators.
     reset_stream: Boolean `Stream` for global single-cycle synchronous reset of
       the global orchestrator and all 4x4 PEs.
+    pe_fn: Optional PE constructor overriding `systolic_pe`.
 
   Returns:
     `SystolicOutputs` containing global mode/load_weights, per-PE states and
@@ -620,6 +630,7 @@ def systolic_array(
         f'col_inputs must have length {ARRAY_SIZE}, got {len(col_inputs)}.'
     )
 
+  build_pe = systolic_pe if pe_fn is None else pe_fn
   acc_s = Stream(True) if accumulate is None else accumulate
   rst_s = Stream(False) if reset_stream is None else reset_stream
   with reset(rst_s):
@@ -638,7 +649,7 @@ def systolic_array(
         col_in = col_inputs[j] if i == 0 else pe_grid[i - 1][j].col_out
         wave_west = Stream(True) if j == 0 else pe_row[j - 1].wave_out
         wave_north = Stream(True) if i == 0 else pe_grid[i - 1][j].wave_out
-        pe_out = systolic_pe(
+        pe_out = build_pe(
             row_in,
             col_in,
             mode=ctrl.mode,

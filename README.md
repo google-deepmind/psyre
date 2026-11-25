@@ -60,23 +60,40 @@ reactive stream programs.
 - **Tests** (`tests/` and `examples/tests/`): Unit test suites covering
   semantics, lowering, static analyses, optimization, visualization, and all
   examples.
-- **Equations** (`equations/` — *experimental*): An opt-in, lambda-free
-  declarative syntax for recursive stream equations (`equations.py`,
-  `equations/tests/`, `equations/examples/src/`, and
-  `equations/examples/tests/`). Everything under the `equations/` subdirectory
-  is experimental (APIs, semantics, and internals may change without notice)
-  and kept separate from the core package.
+- **Equations** (`psyre.equations` — *experimental*): An opt-in, lambda-free
+  declarative syntax for recursive stream equations (`equations.py`, plus its
+  dedicated `tests/` and `examples/{src,tests}/` inside the `equations/`
+  subpackage — exported under `src/psyre/equations/` on GitHub). APIs,
+  semantics, and internals may change without notice.
+- **NumPy Lifting** (`psyre.numpy` — *optional*): Standalone optional stream-level
+  lifting proxy for `numpy` ufuncs, array functions, `linalg`/`fft`/`random`
+  submodules, `stack_streams`/`unstack_stream`/`batch_streams`, and eager
+  pointwise `vmap` (requires NumPy; core `psyre` stays pure Python stdlib).
+- **JAX & `lax` Lifting** (`psyre.jax` — *optional*):
+  Optional subpackage lifting pure `jax.lax` (`psyre.jax.lax`), `jax.numpy`
+  (`pjax.jnp`), `jax.nn`, `jax.random`, and `jax.scipy` operations onto
+  `Stream`s with canonical JAX `Primitive` metadata, plus lifting-time
+  transformations (`vmap` over both single lifted ops and composite stateful
+  Psyre subgraphs, `stack_streams`, `unstack_stream`, `batch_streams`, and
+  `rewrite_dtype`), plus `psyre.jax.jit` (lazy compilation, maximal same-clock
+  convex island fusion via `fuse_jit_islands`, and opt-in Stage-1 `Jaxpr`
+  expansion gated behind `trace_jaxpr=True` with explicit `ShapeDtypeStruct`
+  hints).
 
 ## Installation
 
 Psyre requires **Python >= 3.12**. Install the core package in editable mode,
-with optional extras for Graphviz visualization (`viz`) or the full test suite
-(`test`, which includes visualization dependencies):
+with optional extras for NumPy (`numpy`), JAX + `lax` (`jax`), Graphviz
+visualization (`viz`), or the full test suite (`test`, which includes
+visualization dependencies):
 
 ```bash
 pip install -e .          # core runtime (pure Python stdlib)
+pip install -e ".[numpy]" # + optional psyre.numpy stream-lifting module
+pip install -e ".[jax]"   # + optional psyre.jax (including psyre.jax.lax)
 pip install -e ".[viz]"   # + Graphviz/pydot schematic visualization
 pip install -e ".[test]"  # + pytest / absl-py test suite (includes [viz])
+pip install -e ".[test,jax]" # + full optional NumPy / JAX test suites
 ```
 
 Rendering interactive schematics also requires the Graphviz `dot` binary on your

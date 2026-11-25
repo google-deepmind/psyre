@@ -76,10 +76,6 @@ from psyre.common import (
     when,
     whennot,
 )
-from psyre.common_payload import (
-    register_pytree_node,
-    unregister_pytree_node,
-)
 from psyre.graph import Graph, Node
 from psyre.math import (
     exp,
@@ -91,6 +87,10 @@ from psyre.optimization import (
     find_dead_nodes,
     find_live_nodes,
     optimize_graph,
+)
+from psyre.payload import (
+    register_pytree_node,
+    unregister_pytree_node,
 )
 from psyre.scheduler import Scheduler
 from psyre.static_stream import (

@@ -34,7 +34,7 @@ See `psyre.clock` for full details on polymorphic clock instantiation.
 """
 
 import asyncio
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 import functools
 import logging
 import operator
@@ -50,27 +50,28 @@ from psyre.common import (
     UNSET,
     active_builder,
     active_scheduler,
+    emit_comb_node,
     force_thunk,
     format_tag,
     is_thunk,
     logger,
     make_comb_step_func,
     psyre_comb,
-    require_builder,
     reset_stack,
     validate_non_negative_int,
 )
-from psyre.common_payload import (
+from psyre.math import random_stream
+from psyre.payload import (
     BUILTIN_SCALAR_TYPES,
     NUMPY_UFUNC_METHODS,
-    contains_stream_or_thunk,
     is_pure_numpy_func,
     partition_comb_args,
     reject_callable,
     reject_numpy_inplace_ufunc,
     reject_numpy_mutating_func,
+    strip_null_out,
+    ufunc_nout,
 )
-from psyre.math import random_stream
 from psyre.static_stream import (
     EMPTY_WORD,
     StaticSequence,
@@ -83,56 +84,19 @@ from psyre.static_stream import (
 _DEBUG = logging.DEBUG
 
 
-def _lru_fallback(fn: Callable[..., Any]) -> Callable[..., Any]:
-  """Caches `fn` via `lru_cache`, falling back on unhashable arguments."""
-  cached = functools.lru_cache(maxsize=512)(fn)
-
-  def wrapper(*args: Any) -> Any:
-    try:
-      return cached(*args)
-    except TypeError:
-      return fn(*args)
-
-  return wrapper
-
-
-@_lru_fallback
-def _get_ufunc_step(ufunc: Any, method: str) -> Callable[..., Any]:
-  """Constructs a pure combinational `step_func` for a NumPy ufunc."""
-  uname = getattr(ufunc, '__name__', 'ufunc')
-  target = ufunc if method == '__call__' else getattr(ufunc, method)
-  op_name = uname if method == '__call__' else f'{uname}.{method}'
-  return make_comb_step_func(target, name=op_name, pure=True)
-
-
-@_lru_fallback
-def _get_array_func_step(func: Any) -> Callable[..., Any]:
-  """Constructs a combinational `step_func` for a NumPy array function."""
-  fname = getattr(func, '__name__', 'numpy_func')
-  return make_comb_step_func(
-      func, name=fname, pure=is_pure_numpy_func(func)
-  )
-
-
 def _lift_numpy_op(
     step_func: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
+    *,
+    nout: int = 1,
 ) -> Any:
   """Instantiates a Stage-1 lifted node for NEP-13/NEP-18 dispatch."""
-  builder = require_builder()
-  clean_kwargs = (
-      {k: v for k, v in kwargs.items() if k != 'out'}
-      if 'out' in kwargs
-      else kwargs
-  )
   dyn_inputs, node_kwargs = partition_comb_args(
-      args, clean_kwargs, static_literals=True
+      args, strip_null_out(kwargs), static_literals=True
   )
-  return builder.add_loop_node(
-      step_func,
-      _prepare=lambda *_, **__: (dyn_inputs, node_kwargs),
-      name=step_func.__name__,
+  return emit_comb_node(
+      step_func, dyn_inputs, node_kwargs, name=step_func.__name__, nout=nout
   )
 
 
@@ -336,6 +300,13 @@ class Stream:
       builder.add_static_stream_node(self, source, name=self.name)
     else:
       builder.add_stream(self)
+
+  @classmethod
+  def _new_detached(cls, *, name: str = '') -> 'Stream':
+    """Creates an unregistered dynamic `Stream` without touching active builder."""
+    stream = super().__new__(cls)
+    stream._init_fields(name=name, spec=None)
+    return stream
 
   @classmethod
   def _from_static_sequence(
@@ -563,14 +534,8 @@ class Stream:
       raise TypeError(
           'Bottom cannot be pushed; only used to pad traces to horizon.'
       )
-    if value is not Absent:
-      if type(value) not in BUILTIN_SCALAR_TYPES:
-        reject_callable(value, label='Stream value')
-        if contains_stream_or_thunk(value):
-          raise TypeError(
-              'Stream value cannot contain a Stream instance; Psyre streams '
-              'are first-order.'
-          )
+    if value is not Absent and type(value) not in BUILTIN_SCALAR_TYPES:
+      reject_callable(value, label='Stream value', reject_streams=True)
     # Note: stream payload immutability is intentionally not checked or
     # enforced at runtime; the behavior of mutating values on streams is
     # unspecified.
@@ -640,13 +605,12 @@ class Stream:
   @classmethod
   def periodic(
       cls,
-      prefix: StaticWord | Sequence[Any],
-      period: StaticWord | Sequence[Any],
+      prefix: Any,
+      period: Any,
       name: str = '',
   ) -> 'Stream':
     """Returns a static periodic stream with the given prefix and period."""
-    spec = StaticSequence.from_parts(prefix, period, accept_sequence=True)
-    return cls(spec, name=name)
+    return cls(StaticSequence.from_parts(prefix, period), name=name)
 
   @classmethod
   def once(cls, k: int, *, name: str = '') -> 'Stream':
@@ -716,14 +680,18 @@ class Stream:
     if any(
         isinstance(arg, LazyThunk)
         and getattr(type(arg), '__array_ufunc__', None) is not None
-        for arg in inputs
+        for arg in (*inputs, *kwargs.values())
     ):
       return NotImplemented
-    raw_out = _lift_numpy_op(_get_ufunc_step(ufunc, method), inputs, kwargs)
-    nout = getattr(ufunc, 'nout', 1) if method == '__call__' else 1
-    if nout > 1:
-      return tuple(raw_out[i] for i in range(nout))
-    return raw_out
+    uname = getattr(ufunc, '__name__', 'ufunc')
+    target = ufunc if method == '__call__' else getattr(ufunc, method)
+    op_name = uname if method == '__call__' else f'{uname}.{method}'
+    return _lift_numpy_op(
+        make_comb_step_func(target, name=op_name, pure=True),
+        inputs,
+        kwargs,
+        nout=ufunc_nout(ufunc, method),
+    )
 
   def __array_function__(
       self,
@@ -740,7 +708,12 @@ class Stream:
         for t in types_arg
     ):
       return NotImplemented
-    return _lift_numpy_op(_get_array_func_step(func), args, kwargs)
+    fname = getattr(func, '__name__', 'numpy_func')
+    return _lift_numpy_op(
+        make_comb_step_func(func, name=fname, pure=is_pure_numpy_func(func)),
+        args,
+        kwargs,
+    )
 
   __add__ = _make_stream_binop('__add__', operator.add)
   __radd__ = _make_stream_binop('__radd__', operator.add, reflected=True)
