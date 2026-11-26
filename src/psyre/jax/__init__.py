@@ -51,9 +51,11 @@ from psyre.jax.ops import (
 from psyre.jax.transforms import (
     BatchError,
     batch_streams,
+    grad,
     rewrite_dtype,
     stack_streams,
     unstack_stream,
+    value_and_grad,
     vmap,
 )
 from psyre.payload import LiftedNamespace
@@ -72,6 +74,7 @@ __all__ = (
     'expand_jaxpr',
     'fuse_jit_islands',
     'get_primitive',
+    'grad',
     'is_jax_step_func',
     'jit',
     'jit_graph',
@@ -88,5 +91,6 @@ __all__ = (
     'to_jax',
     'to_numpy',
     'unstack_stream',
+    'value_and_grad',
     'vmap',
 )

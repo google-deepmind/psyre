@@ -43,7 +43,6 @@ import contextlib
 import dataclasses
 import functools
 import math
-import operator
 from typing import Any
 
 # pylint: disable=g-import-not-at-top
@@ -62,7 +61,6 @@ from psyre.common import (
     callable_name,
     emit_comb_node,
     is_pure_step_func,
-    make_comb_step_func,
     push_prefix,
     require_builder,
     unwrap_inst_func,
@@ -71,12 +69,13 @@ from psyre.common import (
 from psyre.graph import Graph, Node, iter_output_leaves, map_output_leaves
 from psyre.jax.ops import (
     attach_wrapper_meta,
+    emit_jax_comb_node,
     is_jax_step_func,
     make_jax_step_func,
+    make_proj_step_func,
     read_wrapper_nout_spec,
 )
 from psyre.payload import (
-    CALL_PLAN_KWARG,
     is_callable_target,
     is_dynamic_leaf,
     is_nan_scalar,
@@ -195,7 +194,7 @@ _EQN_STEP_CACHE: collections.OrderedDict[Any, Callable[..., Any]] = (
     collections.OrderedDict()
 )
 _EQN_STEP_CACHE_MAX = 2048
-_NON_TRACED_STREAM_OPS = frozenset({'max', 'min'})
+_NON_TRACED_STREAM_OPS = frozenset({'__getitem__', 'max', 'min'})
 
 
 def _freeze_param(val: Any) -> Any:
@@ -296,22 +295,6 @@ def _eqn_step_func(eqn: Any) -> Callable[..., Any]:
 
 def _as_dynamic_stream(val: Any) -> Stream:
   return val if is_dynamic_leaf(val) else Stream.constant(val)
-
-
-@functools.lru_cache(maxsize=128)
-def _proj_step_func(
-    index: int, *, jax_tagged: bool = True
-) -> Callable[..., Any]:
-  """Returns a cached tuple-projection `step_func` for multi-output nodes."""
-  def _proj(bundle: Any) -> Any:
-    return operator.getitem(bundle, index)
-
-  label = f'island_out_{index}'
-  _proj.__name__ = label
-  if jax_tagged:
-    return make_jax_step_func(_proj, name=label, pure=True)
-  # Non-JAX-tagged projection keeps multi-exit `fuse_jit_islands` idempotent.
-  return make_comb_step_func(_proj, name=label, pure=True)
 
 
 def _literal_cache_key(atom: Any) -> Any:
@@ -423,7 +406,7 @@ def _expand_eqns(
       for out_idx, ovar in enumerate(eqn.outvars):
         if not _is_drop_var(ovar):
           env[ovar] = emit_comb_node(
-              _proj_step_func(out_idx, jax_tagged=True),
+              make_proj_step_func(out_idx, jax_tagged=True),
               (raw_out,),
               {},
               name=f'{prim.name}[{out_idx}]',
@@ -670,6 +653,16 @@ def jit(
 
   if not trace_jaxpr:
     label = f'jit({scope_name})'
+    rebind_grad = (
+        None if nout is not None else getattr(fn, '_psyre_rebind_grad', None)
+    )
+    if rebind_grad is not None:
+      return rebind_grad(
+          jitted_fn,
+          label=label,
+          static_argnums=argnums,
+          static_argnames=argnames,
+      )
     step_func = make_jax_step_func(jitted_fn, name=label, pure=True)
 
     @functools.wraps(raw_fn)
@@ -683,7 +676,7 @@ def jit(
       )
       if not dyn_inputs:
         return jitted_fn(*args, **kwargs)
-      return emit_comb_node(
+      return emit_jax_comb_node(
           step_func,
           dyn_inputs,
           node_kwargs,
@@ -789,14 +782,6 @@ def _is_island_eligible(node: Node, include_stream_ops: bool) -> bool:
     return True
   if not include_stream_ops:
     return False
-  if node.op == '__getitem__':
-    # Only static-index / slice projections (`len(node.inputs) == 1`) trace
-    # safely inside `jax.jit` (e.g. `top_k(x, k)[0]`, constant `x[1:3]`).
-    return (
-        node.is_stream_op('__getitem__')
-        and len(node.inputs) == 1
-        and CALL_PLAN_KWARG in node.kwargs
-    )
   if node.op in _NON_TRACED_STREAM_OPS:
     return False
   return node.is_stream_op()
@@ -1136,7 +1121,7 @@ def fuse_jit_islands(
             op=f'island_out_{out_idx}',
             name=f'{scoped_name}[{out_idx}]',
             output=stream_map[exit_s.id],
-            step_func=_proj_step_func(out_idx, jax_tagged=False),
+            step_func=make_proj_step_func(out_idx, jax_tagged=False),
             kwargs={},
             is_stateful=False,
             arms=remapped_arms,

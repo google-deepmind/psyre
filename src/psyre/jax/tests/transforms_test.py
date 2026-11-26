@@ -646,6 +646,215 @@ class JaxTransformsTest(absltest.TestCase):
     np.testing.assert_allclose(kahn_out[0], [0.0, 0.0])
     np.testing.assert_allclose(kahn_out[1], [2.0, 3.0])
 
+  def test_grad_and_value_and_grad_on_pure_jax_nodes_and_pytrees(self):
+    # Eager mode (outside Stage 1) delegates directly to `jax.grad`.
+    self.assertAlmostEqual(
+        float(pjax.grad(lambda x: x * x * x)(jnp.array(3.0))), 27.0, places=5
+    )
+
+    # Higher-order differentiation (`pjax.grad(pjax.grad(f))`) and lifted ops.
+    d2_cube = pjax.grad(pjax.grad(lambda x: x**3))
+    d_sin = pjax.grad(pjax.jnp.sin)
+    out = Scheduler.run(
+        lambda: (
+            d2_cube(Stream([jnp.array(2.0), jnp.array(4.0)])),
+            d_sin(Stream([jnp.array(0.0), jnp.array(0.5)])),
+        ),
+        horizon=2,
+    )
+    np.testing.assert_allclose(out[0], [12.0, 24.0], rtol=1e-5)
+    np.testing.assert_allclose(out[1], [1.0, np.cos(0.5)], rtol=1e-5)
+
+    # PyTree of `Stream`s + `has_aux=True` + `fuse_jit_islands` composition.
+    def quad_loss(params, x, y):
+      pred = jnp.dot(x, params['w']) + params['b']
+      err = pred - y
+      return 0.5 * jnp.sum(err * err), pred
+
+    vg = pjax.value_and_grad(quad_loss, argnums=0, has_aux=True)
+
+    def prog():
+      w = fby(jnp.array([1.0, -1.0]), lambda: w_next)
+      b = fby(jnp.array(0.5), lambda: b_next)
+      x = Stream([jnp.array([2.0, 3.0]), jnp.array([-1.0, 2.0])])
+      y = Stream([jnp.array(1.0), jnp.array(0.0)])
+      (loss, pred), grads = vg({'w': w, 'b': b}, x, y)
+      w_next = pjax.jnp.subtract(w, pjax.jnp.multiply(0.1, grads['w']))
+      b_next = pjax.jnp.subtract(b, pjax.jnp.multiply(0.1, grads['b']))
+      return {'loss': loss, 'pred': pred, 'w': w, 'b': b, 'gw': grads['w']}
+
+    g_eager = build_graph(prog, semantics=Semantics.SYNC, optimize=True)
+    g_jit, islands = pjax.fuse_jit_islands(g_eager)
+    self.assertLen(islands, 1)
+    t_eager = Scheduler.run_graph(g_eager, horizon=3)
+    t_jit = Scheduler.run_graph(g_jit, horizon=3)
+    for k in ('loss', 'pred', 'w', 'b', 'gw'):
+      for t in range(3):
+        np.testing.assert_allclose(t_jit[k][t], t_eager[k][t], atol=1e-5)
+    # Tick 0: pred = 2*1 + 3*(-1) + 0.5 = -0.5, err = -1.5, gw = [-3.0, -4.5].
+    np.testing.assert_allclose(t_eager['pred'][0], -0.5, atol=1e-5)
+    np.testing.assert_allclose(t_eager['gw'][0], [-3.0, -4.5], atol=1e-5)
+
+    # Single `Stream` carrying a dict PyTree (uses `treedef.flatten_up_to`).
+    def single_stream_pytree_prog():
+      p_s = Stream([{'w': jnp.array([1.0, -1.0]), 'b': jnp.array(0.5)}])
+      x_s = Stream([jnp.array([2.0, 3.0])])
+      y_s = Stream([jnp.array(1.0)])
+      (loss, pred), g_s = vg(p_s, x_s, y_s)
+      return {'loss': loss, 'pred': pred, 'g': g_s}
+
+    ts_single = Scheduler.run(single_stream_pytree_prog, horizon=1)
+    np.testing.assert_allclose(ts_single['g'][0]['w'], [-3.0, -4.5], atol=1e-5)
+    np.testing.assert_allclose(ts_single['g'][0]['b'], -1.5, atol=1e-5)
+
+    # Multi-argument `argnums=(0, 1)` + `vmap(grad(...))` + `jit(grad(...))`.
+    g_both = pjax.grad(lambda a, b: jnp.sum(a * b * b), argnums=(0, 1))
+    ga, gb = Scheduler.run(
+        lambda: g_both(
+            Stream([jnp.array([2.0, 3.0])]), Stream([jnp.array([4.0, 5.0])])
+        ),
+        horizon=1,
+    )
+    np.testing.assert_allclose(ga[0], [16.0, 25.0], atol=1e-5)
+    np.testing.assert_allclose(gb[0], [16.0, 30.0], atol=1e-5)
+
+    j_grad = pjax.jit(pjax.grad(lambda x: jnp.sum(x * x)))
+    v_grad = pjax.vmap(pjax.grad(lambda x: x * x))
+    jg_out, vg_out = Scheduler.run(
+        lambda: (
+            j_grad(Stream([jnp.array([1.0, 2.0, 3.0])])),
+            v_grad(Stream([jnp.array([1.0, 2.0, 3.0])])),
+        ),
+        horizon=1,
+    )
+    np.testing.assert_allclose(jg_out[0], [2.0, 4.0, 6.0], atol=1e-5)
+    np.testing.assert_allclose(vg_out[0], [2.0, 4.0, 6.0], atol=1e-5)
+
+    # `jit` and `vmap` preserve multi-arg, `has_aux`, and PyTree unpacking.
+    j_both = pjax.jit(g_both)
+    v_both = pjax.vmap(g_both)
+    jv_both = pjax.jit(v_both)
+    (jga, jgb), (vga, vgb), (jvga, jvgb) = Scheduler.run(
+        lambda: (
+            j_both(
+                Stream([jnp.array([2.0, 3.0])]),
+                Stream([jnp.array([4.0, 5.0])]),
+            ),
+            v_both(
+                Stream([jnp.array([[2.0], [3.0]])]),
+                Stream([jnp.array([[4.0], [5.0]])]),
+            ),
+            jv_both(
+                Stream([jnp.array([[2.0], [3.0]])]),
+                Stream([jnp.array([[4.0], [5.0]])]),
+            ),
+        ),
+        horizon=1,
+    )
+    np.testing.assert_allclose(jga[0], [16.0, 25.0], atol=1e-5)
+    np.testing.assert_allclose(jgb[0], [16.0, 30.0], atol=1e-5)
+    np.testing.assert_allclose(vga[0], [[16.0], [25.0]], atol=1e-5)
+    np.testing.assert_allclose(vgb[0], [[16.0], [30.0]], atol=1e-5)
+    np.testing.assert_allclose(jvga[0], [[16.0], [25.0]], atol=1e-5)
+    np.testing.assert_allclose(jvgb[0], [[16.0], [30.0]], atol=1e-5)
+
+    j_vg = pjax.jit(vg)
+    v_vg = pjax.vmap(vg, in_axes=(None, 0, 0))
+    ((jl, jp), jg), ((vl, vp), vgr) = Scheduler.run(
+        lambda: (
+            j_vg(
+                {
+                    'w': Stream([jnp.array([1.0, -1.0])]),
+                    'b': Stream([jnp.array(0.5)]),
+                },
+                Stream([jnp.array([2.0, 3.0])]),
+                Stream([jnp.array(1.0)]),
+            ),
+            v_vg(
+                {
+                    'w': Stream([jnp.array([1.0, -1.0])]),
+                    'b': Stream([jnp.array(0.5)]),
+                },
+                Stream([jnp.array([[2.0, 3.0], [-1.0, 2.0]])]),
+                Stream([jnp.array([1.0, 0.0])]),
+            ),
+        ),
+        horizon=1,
+    )
+    np.testing.assert_allclose(jl[0], 1.125, atol=1e-5)
+    np.testing.assert_allclose(jp[0], -0.5, atol=1e-5)
+    np.testing.assert_allclose(jg['w'][0], [-3.0, -4.5], atol=1e-5)
+    np.testing.assert_allclose(jg['b'][0], -1.5, atol=1e-5)
+    self.assertEqual(vl[0].shape, (2,))
+    self.assertEqual(vp[0].shape, (2,))
+    np.testing.assert_allclose(vgr['w'][0][0], [-3.0, -4.5], atol=1e-5)
+
+    # `grad(..., has_aux=True)` and `value_and_grad(..., has_aux=False)`.
+    g_aux = pjax.grad(lambda x: (x * x, x + 1.0), has_aux=True)
+    vg_no_aux = pjax.value_and_grad(lambda x: x * x)
+    (gx_a, aux_v), (val_v, gx_v) = Scheduler.run(
+        lambda: (
+            g_aux(Stream([jnp.array(3.0)])),
+            vg_no_aux(Stream([jnp.array(3.0)])),
+        ),
+        horizon=1,
+    )
+    np.testing.assert_allclose(gx_a[0], 6.0, atol=1e-5)
+    np.testing.assert_allclose(aux_v[0], 4.0, atol=1e-5)
+    np.testing.assert_allclose(val_v[0], 9.0, atol=1e-5)
+    np.testing.assert_allclose(gx_v[0], 6.0, atol=1e-5)
+
+    # Identical `grad` calls deduplicate under `optimize_graph` CSE.
+    g_sq = pjax.grad(lambda x: x * x)
+
+    def cse_prog():
+      s = Stream([jnp.array(2.0)])
+      return g_sq(s), g_sq(s)
+
+    self.assertLen(build_graph(cse_prog, optimize=True).nodes, 1)
+
+    # User `Stream.__getitem__` stays outside JIT islands while multi-output
+    # JAX ops fuse via JAX-tagged `jax_out_*` projections.
+    def slice_prog():
+      x = Stream([jnp.array([1.0, 2.0, 3.0])])
+      y = pjax.jnp.add(x, 1.0)
+      return pjax.jnp.multiply(y[1:3], 2.0)
+
+    _, slice_islands = pjax.fuse_jit_islands(
+        build_graph(slice_prog, optimize=True)
+    )
+    self.assertEmpty(slice_islands)
+
+    # Reject stateful, non-pure (including impure `vmap`), and host-NumPy fns.
+    @psyre_sequ
+    def stateful_node(x):
+      acc = 0.0
+      while True:
+        acc += x
+        x = yield acc
+
+    with self.assertRaisesRegex(TypeError, 'stateful'):
+      pjax.grad(stateful_node)
+    with self.assertRaises(TypeError):
+      pjax.grad(pjax.lift(lambda x: x, pure=False))
+    with self.assertRaises(TypeError):
+      pjax.grad(pjax.vmap(pjax.lift(lambda x: x * x, pure=False)))
+    with self.assertRaises(TypeError):
+      pjax.grad(np.sin)
+    with self.assertRaises(TypeError):
+      pjax.grad(lambda x: x, argnums=True)  # type: ignore[arg-type]
+    # Stage-1 builder is cleared while `jax.grad` traces even on eager calls.
+    with self.assertRaises(RuntimeError):
+      build_graph(lambda: pjax.grad(lambda x: fby(0.0, x))(jnp.array(1.0)))
+    with self.assertRaises(ExceptionGroup) as eg:
+      Scheduler.run(
+          lambda: pjax.grad(lambda x: fby(0.0, x))(Stream([jnp.array(1.0)])),
+          horizon=1,
+      )
+    self.assertTrue(
+        any(isinstance(e, RuntimeError) for e in eg.exception.exceptions)
+    )
+
 
 if __name__ == '__main__':
   absltest.main()

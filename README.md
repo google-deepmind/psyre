@@ -38,6 +38,10 @@ reactive stream programs.
 
 ## Repository Layout
 
+- **Documentation** (`docs/`): Per-module architecture and public API reference
+  covering the core language, visualization, experimental `psyre.equations`, and
+  optional `psyre.numpy` / `psyre.jax` packages—start at
+  [docs/README.md](docs/README.md).
 - **Core package**: Stream representation, Stage-1 graph construction and pure
   dataflow IR, synchronous and Kahn primitives, pattern matching and
   hierarchical automata lowering, static causality and clock analyses,
@@ -67,18 +71,21 @@ reactive stream programs.
   semantics, and internals may change without notice.
 - **NumPy Lifting** (`psyre.numpy` — *optional*): Standalone optional stream-level
   lifting proxy for `numpy` ufuncs, array functions, `linalg`/`fft`/`random`
-  submodules, `stack_streams`/`unstack_stream`/`batch_streams`, and eager
-  pointwise `vmap` (requires NumPy; core `psyre` stays pure Python stdlib).
+  submodules, `stack_streams`/`unstack_stream`/`batch_streams`, eager
+  pointwise `vmap`, and a stride-group MNIST CNN example under
+  `psyre.numpy.examples` (requires NumPy; core `psyre` stays pure Python
+  stdlib).
 - **JAX & `lax` Lifting** (`psyre.jax` — *optional*):
   Optional subpackage lifting pure `jax.lax` (`psyre.jax.lax`), `jax.numpy`
   (`pjax.jnp`), `jax.nn`, `jax.random`, and `jax.scipy` operations onto
-  `Stream`s with canonical JAX `Primitive` metadata, plus lifting-time
+  `Stream`s with canonical JAX `Primitive` metadata, lifting-time
   transformations (`vmap` over both single lifted ops and composite stateful
-  Psyre subgraphs, `stack_streams`, `unstack_stream`, `batch_streams`, and
-  `rewrite_dtype`), plus `psyre.jax.jit` (lazy compilation, maximal same-clock
-  convex island fusion via `fuse_jit_islands`, and opt-in Stage-1 `Jaxpr`
-  expansion gated behind `trace_jaxpr=True` with explicit `ShapeDtypeStruct`
-  hints).
+  Psyre subgraphs, instantaneous `grad` / `value_and_grad`, `stack_streams`,
+  `unstack_stream`, `batch_streams`, and `rewrite_dtype`), `psyre.jax.jit`
+  (lazy compilation, maximal same-clock convex island fusion via
+  `fuse_jit_islands`, and opt-in Stage-1 `Jaxpr` expansion gated behind
+  `trace_jaxpr=True` with explicit `ShapeDtypeStruct` hints), and an eager and
+  JIT-compiled MNIST CNN example under `psyre.jax.examples`.
 
 ## Installation
 

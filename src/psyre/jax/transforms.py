@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lifting-time JAX transformations (`vmap`, `batch_streams`, `rewrite_dtype`).
+"""Lifting-time JAX transformations (`vmap`, `grad`, `value_and_grad`, etc.).
 
 Implements Stage-1 transformations over lifted `psyre.jax` / `psyre.jax.lax`
 callables and composite Psyre `Graph` subprograms **without** requiring
@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 import dataclasses
 import functools
 import operator
-from typing import Any
+from typing import Any, NamedTuple
 
 # pylint: disable=g-import-not-at-top
 try:
@@ -51,6 +51,7 @@ from psyre.common import (
     emit_when,
     fby,
     is_pure_step_func,
+    is_stateful_step_func,
     prefix_stack,
     push_prefix,
     remap_arm_scopes,
@@ -62,6 +63,7 @@ from psyre.common import (
 from psyre.graph import Graph, Node, map_output_leaves
 from psyre.jax.ops import (
     attach_wrapper_meta,
+    emit_jax_comb_node,
     get_primitive,
     is_jax_step_func,
     make_jax_step_func,
@@ -73,6 +75,7 @@ from psyre.payload import (
     is_array_object,
     is_callable_target,
     is_dynamic_leaf,
+    is_from_package,
     is_int_axis,
     is_namedtuple,
     is_numpy_scalar,
@@ -83,6 +86,7 @@ from psyre.payload import (
     map_tree_with_axes,
     materialize_comb_call,
     normalize_arg_axes,
+    partition_comb_args,
     resolve_nout,
     validate_optional_axis,
 )
@@ -278,6 +282,7 @@ def _vmap_single_comb(
   )
   is_pure = bool(getattr(fn, '_psyre_pure', False))
   nout_spec = read_wrapper_nout_spec(fn)
+  grad_spec: _GradSpec | None = getattr(fn, '_psyre_grad_spec', None)
   label = name or f'vmap({callable_name(raw_fn, "fn")})'
 
   def _wrap_vm(inner: Callable[..., Any], mapped_axes: Any) -> Any:
@@ -379,14 +384,42 @@ def _vmap_single_comb(
       return raw_fn(*call_args, **call_kwargs)
 
     vmapped = _wrap_vm(_inner, tuple(dyn_axes))
+    if grad_spec is not None:
+      target_treedef, n_leaves, target_is_leaf = _extract_grad_target(
+          args, grad_spec
+      )
+      prefix_count, total_nout = _grad_output_counts(grad_spec, n_leaves)
+      if total_nout == 0:
+        return target_treedef.unflatten(())
+
+      def _eval_vmapped_grad(*flat_vals: Any) -> Any:
+        return _pack_grad_result(
+            vmapped(*flat_vals),
+            target_treedef,
+            n_leaves,
+            target_is_leaf,
+            grad_spec,
+        )
+
+      _eval_vmapped_grad.__name__ = label
+      step_func = make_jax_step_func(
+          _eval_vmapped_grad, name=label, pure=is_pure
+      )
+      emitted = emit_jax_comb_node(
+          step_func, tuple(dyn_streams), {}, name=label, nout=total_nout
+      )
+      return _unpack_grad_streams(
+          emitted, target_treedef, total_nout, prefix_count, grad_spec
+      )
+
     vmapped.__name__ = label
     step_func = make_jax_step_func(vmapped, name=label, pure=is_pure)
     out_arity = resolve_nout(nout_spec, args, kwargs)
-    return emit_comb_node(
+    return emit_jax_comb_node(
         step_func, tuple(dyn_streams), {}, name=label, nout=out_arity
     )
 
-  return attach_wrapper_meta(
+  wrapped = attach_wrapper_meta(
       wrapper,
       inst_func=_eager_vmap,
       pure=is_pure,
@@ -394,6 +427,9 @@ def _vmap_single_comb(
       static_argnames=static_argnames,
       nout_spec=nout_spec,
   )
+  if grad_spec is not None:
+    _attach_grad_meta(wrapped, grad_spec, raw_fn)
+  return wrapped
 
 
 def _merge_batched_axes(axes: Sequence[int | None]) -> int | None:
@@ -1373,3 +1409,349 @@ def rewrite_dtype(
     )
   new_graph.mark_finalized()
   return new_graph
+
+
+def _validate_grad_argnums(argnums: int | Sequence[int]) -> bool:
+  """Validates `argnums` and returns True when it is a single integer index."""
+  if isinstance(argnums, bool):
+    raise TypeError('argnums must be an int or sequence of ints, not bool.')
+  if isinstance(argnums, int):
+    return True
+  if isinstance(argnums, Sequence) and not isinstance(argnums, (str, bytes)):
+    for idx in argnums:
+      if isinstance(idx, bool) or not isinstance(idx, int):
+        raise TypeError(
+            f'argnums entries must be ints, got {type(idx).__name__}.'
+        )
+    return False
+  raise TypeError(
+      'argnums must be an int or sequence of ints, got '
+      f'{type(argnums).__name__}.'
+  )
+
+
+class _GradSpec(NamedTuple):
+  """Output-unpacking spec shared by `grad`, `jit(grad)`, and `vmap(grad)`."""
+
+  with_value: bool
+  argnums: int | tuple[int, ...]
+  argnums_is_int: bool
+  has_aux: bool
+
+
+def _extract_grad_target(
+    args: tuple[Any, ...], spec: _GradSpec
+) -> tuple[Any, int, bool]:
+  """Flattens differentiated argument(s) treating dynamic `Stream`s as leaves."""
+  if spec.argnums_is_int:
+    target = args[spec.argnums]  # type: ignore[index]
+  else:
+    target = tuple(args[i] for i in spec.argnums)  # type: ignore[union-attr]
+  target_is_leaf = is_dynamic_leaf(target)
+  target_leaves, target_treedef = jax.tree_util.tree_flatten(
+      target, is_leaf=is_dynamic_leaf
+  )
+  return target_treedef, len(target_leaves), target_is_leaf
+
+
+def _grad_output_counts(spec: _GradSpec, n_leaves: int) -> tuple[int, int]:
+  prefix_count = (1 if spec.with_value else 0) + (1 if spec.has_aux else 0)
+  return prefix_count, prefix_count + n_leaves
+
+
+def _pack_grad_result(
+    res: Any,
+    treedef: Any,
+    n_leaves: int,
+    target_is_leaf: bool,
+    spec: _GradSpec,
+) -> Any:
+  """Flattens `jax.grad`/`jax.value_and_grad` output for `nout` projection."""
+  if not spec.with_value and not spec.has_aux:
+    if n_leaves == 0:
+      return ()
+    if n_leaves == 1:
+      return res if target_is_leaf else treedef.flatten_up_to(res)[0]
+    return tuple(treedef.flatten_up_to(res))
+  if not spec.with_value and spec.has_aux:
+    g, aux = res
+    flat_g = treedef.flatten_up_to(g)
+    return aux if n_leaves == 0 else (aux, *flat_g)
+  if spec.with_value and not spec.has_aux:
+    val, g = res
+    flat_g = treedef.flatten_up_to(g)
+    return val if n_leaves == 0 else (val, *flat_g)
+  (val, aux), g = res
+  flat_g = treedef.flatten_up_to(g)
+  return (val, aux, *flat_g)
+
+
+def _unpack_grad_streams(
+    emitted: Any,
+    treedef: Any,
+    total_nout: int,
+    prefix_count: int,
+    spec: _GradSpec,
+) -> Any:
+  """Rebuilds `(val?, aux?), grad_tree` from projected output `Stream`s."""
+  out_streams = (emitted,) if total_nout == 1 else emitted
+  grad_tree = treedef.unflatten(out_streams[prefix_count:])
+  if not spec.with_value and not spec.has_aux:
+    return grad_tree
+  if not spec.with_value and spec.has_aux:
+    return (grad_tree, out_streams[0])
+  if spec.with_value and not spec.has_aux:
+    return (out_streams[0], grad_tree)
+  return ((out_streams[0], out_streams[1]), grad_tree)
+
+
+def _attach_grad_meta(
+    wrapper: Any, spec: _GradSpec, wraps_fn: Callable[..., Any]
+) -> Any:
+  """Attaches `_psyre_grad_spec` and `_psyre_rebind_grad` for `jit`/`vmap`."""
+
+  def _rebind(
+      new_inst: Callable[..., Any],
+      *,
+      label: str,
+      static_argnums: frozenset[int] = frozenset(),
+      static_argnames: frozenset[str] = frozenset(),
+  ) -> Any:
+    return _build_grad_emitter(
+        new_inst,
+        spec=spec,
+        label=label,
+        static_argnums=static_argnums,
+        static_argnames=static_argnames,
+        wraps_fn=wraps_fn,
+    )
+
+  setattr(wrapper, '_psyre_grad_spec', spec)
+  setattr(wrapper, '_psyre_rebind_grad', _rebind)
+  return wrapper
+
+
+def _build_grad_emitter(
+    inst_grad: Callable[..., Any],
+    *,
+    spec: _GradSpec,
+    label: str,
+    static_argnums: frozenset[int] = frozenset(),
+    static_argnames: frozenset[str] = frozenset(),
+    wraps_fn: Callable[..., Any],
+) -> Callable[..., Any]:
+  """Builds a Stage-1/eager lifted wrapper around `inst_grad` with CSE cache."""
+  step_cache: dict[tuple[Any, int, bool], Callable[..., Any]] = {}
+
+  def _get_step_func(
+      treedef: Any, n_leaves: int, target_is_leaf: bool
+  ) -> Callable[..., Any]:
+    key = (treedef, n_leaves, target_is_leaf)
+    cached = step_cache.get(key)
+    if cached is not None:
+      return cached
+
+    def _eval_grad(*a: Any, **kw: Any) -> Any:
+      res = inst_grad(*a, **kw) if kw else inst_grad(*a)
+      return _pack_grad_result(res, treedef, n_leaves, target_is_leaf, spec)
+
+    _eval_grad.__name__ = label
+    step_fn = make_jax_step_func(_eval_grad, name=label, pure=True)
+    step_cache[key] = step_fn
+    return step_fn
+
+  @functools.wraps(wraps_fn)
+  def wrapper(*args: Any, **kwargs: Any) -> Any:
+    dyn_inputs, node_kwargs = partition_comb_args(
+        args,
+        kwargs,
+        static_argnums=static_argnums,
+        static_argnames=static_argnames,
+        static_literals=True,
+    )
+    if not dyn_inputs:
+      return inst_grad(*args, **kwargs) if kwargs else inst_grad(*args)
+
+    target_treedef, n_leaves, target_is_leaf = _extract_grad_target(args, spec)
+    prefix_count, total_nout = _grad_output_counts(spec, n_leaves)
+    if total_nout == 0:
+      return target_treedef.unflatten(())
+    step_fn = _get_step_func(target_treedef, n_leaves, target_is_leaf)
+    emitted = emit_jax_comb_node(
+        step_fn, dyn_inputs, node_kwargs, name=label, nout=total_nout
+    )
+    return _unpack_grad_streams(
+        emitted, target_treedef, total_nout, prefix_count, spec
+    )
+
+  nout_spec = 2 if (spec.with_value or spec.has_aux) else None
+  wrapped = attach_wrapper_meta(
+      wrapper,
+      inst_func=inst_grad,
+      pure=True,
+      static_argnums=static_argnums,
+      static_argnames=static_argnames,
+      nout_spec=nout_spec,
+  )
+  return _attach_grad_meta(wrapped, spec, wraps_fn)
+
+
+def _validate_differentiable_jax_fn(
+    fun: Callable[..., Any], transform_name: str
+) -> Callable[..., Any]:
+  """Checks that `fun` is an instantaneous pure JAX callable and unwraps it."""
+  if not is_callable_target(fun):
+    raise TypeError(
+        f'psyre.jax.{transform_name} expects a callable, got {type(fun)}.'
+    )
+  step_fn = getattr(fun, '_psyre_step_func', None)
+  if is_stateful_step_func(fun) or (
+      step_fn is not None and is_stateful_step_func(step_fn)
+  ):
+    raise TypeError(
+        f'psyre.jax.{transform_name} only differentiates instantaneous pure '
+        'JAX functions, not stateful Psyre nodes.'
+    )
+  if (step_fn is not None and not is_pure_step_func(step_fn)) or (
+      hasattr(fun, '_psyre_pure') and not is_pure_step_func(fun)
+  ):
+    raise TypeError(
+        f'psyre.jax.{transform_name} requires a pure instantaneous JAX '
+        'function.'
+    )
+  raw_fn = unwrap_inst_func(fun)
+  if is_from_package(raw_fn, 'numpy'):
+    raise TypeError(
+        f'psyre.jax.{transform_name} only differentiates pure JAX functions, '
+        'not host NumPy callables.'
+    )
+  return raw_fn
+
+
+def _make_grad_wrapper(
+    fun: Callable[..., Any],
+    *,
+    with_value: bool,
+    argnums: int | Sequence[int] = 0,
+    has_aux: bool = False,
+    holomorphic: bool = False,
+    allow_int: bool = False,
+    name: str = '',
+) -> Callable[..., Any]:
+  """Shared implementation for `psyre.jax.grad` and `psyre.jax.value_and_grad`."""
+  tname = 'value_and_grad' if with_value else 'grad'
+  argnums_is_int = _validate_grad_argnums(argnums)
+  norm_argnums: int | tuple[int, ...] = (
+      int(argnums)  # type: ignore[arg-type]
+      if argnums_is_int
+      else tuple(int(i) for i in argnums)  # type: ignore[union-attr]
+  )
+  raw_fn = _validate_differentiable_jax_fn(fun, tname)
+  label = name or f'{tname}({callable_name(raw_fn, "fn")})'
+
+  def _pure_jax_target(*a: Any, **kw: Any) -> Any:
+    # Ensure `fun` cannot emit Psyre nodes into an enclosing Stage-1 builder.
+    if active_builder.get() is None:
+      return raw_fn(*a, **kw) if kw else raw_fn(*a)
+    tok = active_builder.set(None)
+    try:
+      return raw_fn(*a, **kw) if kw else raw_fn(*a)
+    finally:
+      active_builder.reset(tok)
+
+  jax_transform = jax.value_and_grad if with_value else jax.grad
+  raw_grad = jax_transform(
+      _pure_jax_target,
+      argnums=norm_argnums,
+      has_aux=has_aux,
+      holomorphic=holomorphic,
+      allow_int=allow_int,
+  )
+  spec = _GradSpec(
+      with_value=with_value,
+      argnums=norm_argnums,
+      argnums_is_int=argnums_is_int,
+      has_aux=has_aux,
+  )
+  return _build_grad_emitter(raw_grad, spec=spec, label=label, wraps_fn=raw_fn)
+
+
+def grad(
+    fun: Callable[..., Any],
+    argnums: int | Sequence[int] = 0,
+    has_aux: bool = False,
+    holomorphic: bool = False,
+    allow_int: bool = False,
+    *,
+    name: str = '',
+) -> Callable[..., Any]:
+  """Lifts `jax.grad` onto instantaneous pure JAX nodes and Psyre `Stream`s.
+
+  Differentiates instantaneous, pure JAX functions (not stateful or clocked
+  Psyre constructs). Accepts plain JAX arrays outside Stage 1, or `Stream`s
+  and PyTrees of `Stream`s inside Stage 1, returning gradient `Stream`s with
+  the same PyTree structure as the differentiated argument(s). Emitted nodes
+  are pure JAX-tagged combinational nodes that compose with `psyre.jax.jit`,
+  `psyre.jax.jit_graph`, `psyre.jax.fuse_jit_islands`, and `psyre.jax.vmap`.
+
+  Args:
+    fun: Pure instantaneous JAX callable returning a scalar (or `(scalar, aux)`
+      when `has_aux=True`).
+    argnums: Positional argument index or sequence of indices to differentiate.
+    has_aux: Whether `fun` returns `(value, aux)`.
+    holomorphic: Forwarded to `jax.grad`.
+    allow_int: Forwarded to `jax.grad`.
+    name: Optional Stage-1 node name.
+
+  Returns:
+    Lifted gradient callable.
+  """
+  return _make_grad_wrapper(
+      fun,
+      with_value=False,
+      argnums=argnums,
+      has_aux=has_aux,
+      holomorphic=holomorphic,
+      allow_int=allow_int,
+      name=name,
+  )
+
+
+def value_and_grad(
+    fun: Callable[..., Any],
+    argnums: int | Sequence[int] = 0,
+    has_aux: bool = False,
+    holomorphic: bool = False,
+    allow_int: bool = False,
+    *,
+    name: str = '',
+) -> Callable[..., Any]:
+  """Lifts `jax.value_and_grad` onto instantaneous pure JAX nodes and `Stream`s.
+
+  Returns `(value, grads)` (or `((value, aux), grads)` when `has_aux=True`),
+  matching `jax.value_and_grad` in both eager mode and Stage-1 Psyre `Stream`
+  graphs. When differentiated arguments are PyTrees of `Stream`s, `grads` is
+  unpacked into a matching PyTree of `Stream`s that fuses cleanly under
+  `psyre.jax.fuse_jit_islands` / `psyre.jax.jit_graph`.
+
+  Args:
+    fun: Pure instantaneous JAX callable returning a scalar (or `(scalar, aux)`
+      when `has_aux=True`).
+    argnums: Positional argument index or sequence of indices to differentiate.
+    has_aux: Whether `fun` returns `(value, aux)`.
+    holomorphic: Forwarded to `jax.value_and_grad`.
+    allow_int: Forwarded to `jax.value_and_grad`.
+    name: Optional Stage-1 node name.
+
+  Returns:
+    Lifted value-and-gradient callable.
+  """
+  return _make_grad_wrapper(
+      fun,
+      with_value=True,
+      argnums=argnums,
+      has_aux=has_aux,
+      holomorphic=holomorphic,
+      allow_int=allow_int,
+      name=name,
+  )

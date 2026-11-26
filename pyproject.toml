@@ -64,6 +64,8 @@ testpaths = [
     "examples/tests",
     "src/psyre/equations/tests",
     "src/psyre/equations/examples/tests",
+    "src/psyre/jax/examples",
     "src/psyre/jax/tests",
+    "src/psyre/numpy/examples",
     "src/psyre/numpy/tests",
 ]

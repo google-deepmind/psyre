@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 import functools
+import operator
 import types
 from typing import Any
 
@@ -177,6 +178,47 @@ def make_jax_step_func(
   return step_func
 
 
+@functools.lru_cache(maxsize=128)
+def make_proj_step_func(
+    index: int, *, jax_tagged: bool = True
+) -> Callable[..., Any]:
+  """Returns a cached tuple-projection `step_func` for multi-output nodes."""
+  def _proj(bundle: Any) -> Any:
+    return operator.getitem(bundle, index)
+
+  label = f'jax_out_{index}' if jax_tagged else f'island_out_{index}'
+  _proj.__name__ = label
+  if jax_tagged:
+    return make_jax_step_func(_proj, name=label, pure=True)
+  # Non-JAX-tagged projection keeps multi-exit `fuse_jit_islands` idempotent.
+  return make_comb_step_func(_proj, name=label, pure=True)
+
+
+def emit_jax_comb_node(
+    step_func: Callable[..., Any],
+    dyn_inputs: tuple[Any, ...],
+    node_kwargs: Mapping[str, Any],
+    *,
+    name: str,
+    nout: int = 1,
+) -> Any:
+  """Emits a JAX combinational node, unpacking `nout > 1` via JAX projections."""
+  raw_out = emit_comb_node(
+      step_func, dyn_inputs, node_kwargs, name=name, nout=1
+  )
+  if nout <= 1:
+    return raw_out
+  return tuple(
+      emit_comb_node(
+          make_proj_step_func(i, jax_tagged=True),
+          (raw_out,),
+          {},
+          name=f'{name}[{i}]',
+      )
+      for i in range(nout)
+  )
+
+
 def lift(
     fn: Callable[..., Any],
     *,
@@ -295,7 +337,7 @@ def lift_with_nout_spec(
           'psyre.jax.to_jax(...) or psyre.jax.stack_streams(...) instead.'
       )
     out_arity = resolve_nout(nout_spec, args, clean_kwargs)
-    return emit_comb_node(
+    return emit_jax_comb_node(
         step_func, dyn_inputs, node_kwargs, name=op_name, nout=out_arity
     )
 
